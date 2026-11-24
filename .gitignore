@@ -1,0 +1,19 @@
+# Local secrets and environment
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Code maps produced by local analysis tooling
+.belief_map.sexp
+belief_map.sexp
+
+# Editors
+.idea/
+.vscode/
+.belief_map_cache.json

@@ -1,0 +1,64 @@
+# Local development environment: PostgreSQL 17 (persistent volume) and the API.
+#
+#   cp .env.example .env        # set POSTGRES_PASSWORD
+#   docker compose build
+#   docker compose up -d
+#   docker compose run --rm api alembic upgrade head
+#
+# PostgreSQL does not publish a port: only containers on this network reach it.
+# The API is published on localhost only.
+
+name: mtl-horizon
+
+x-api-environment: &api-environment
+  MTL_HORIZON_DATABASE_URL: postgresql+psycopg://mtl_horizon:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/mtl_horizon
+  MTL_HORIZON_NETWORK_PASSPHRASE: ${MTL_HORIZON_NETWORK_PASSPHRASE:-Public Global Stellar Network ; September 2015}
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: mtl_horizon
+      POSTGRES_USER: mtl_horizon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mtl_horizon -d mtl_horizon"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      target: runtime
+    environment:
+      <<: *api-environment
+      MTL_HORIZON_API_HOST: 0.0.0.0
+      MTL_HORIZON_API_PORT: "8000"
+    ports:
+      - "127.0.0.1:${MTL_HORIZON_API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Not started by `docker compose up`. Runs the test suite against a fresh
+  # scratch database on the same PostgreSQL server:
+  #   docker compose --profile test run --rm tests
+  tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      <<: *api-environment
+      MTL_HORIZON_TEST_DATABASE_URL: postgresql+psycopg://mtl_horizon:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/ignored
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
