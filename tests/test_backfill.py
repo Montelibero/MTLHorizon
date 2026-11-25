@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
+from fractions import Fraction
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -19,7 +20,7 @@ from app.backfill.jobs import StreamJob, stream_jobs
 from app.backfill.loader import Backfill, Limits, StreamReport, Window
 from app.sources.horizon_cursors import after_ledger
 from app.storage import coverage
-from tests.fake_horizon import A, B, C, D, EUR, ISSUER, RECT, S, T0, FakeHorizon
+from tests.fake_horizon import A, B, C, D, EUR, ISSUER, RECT, S, T0, FakeHorizon, sale
 
 SOURCE = "horizon:horizon.test"
 WINDOW = Window(100, 130)
@@ -93,10 +94,13 @@ class Pilot:
         page_size: int = 200,
         concurrency: int = 1,
         stop_after: int | None = None,
+        context: str = "full",
         **limits: Any,
     ) -> list[StreamReport]:
         limits_ = Limits(requests=lambda: self.fake.client.stats.requests, **limits)
-        with Backfill(self.fake.client, self.engine, source=SOURCE, page_size=page_size, limits=limits_) as backfill:
+        with Backfill(
+            self.fake.client, self.engine, source=SOURCE, page_size=page_size, limits=limits_, context=context
+        ) as backfill:
             if stop_after is not None:
                 first_request = self.fake.client.stats.requests
 
@@ -578,7 +582,47 @@ def test_the_stored_market_sums_to_what_the_source_aggregates(pilot: Pilot) -> N
     bucket = checking.compare_aggregations(pilot.fake.client, pilot.engine, EUR, RECT, first_day, 1)[0]
 
     assert bucket.matches
-    assert bucket.source == {"trades": 2, "base_volume": 2 * 231829549, "counter_volume": 2 * 49325436}
+    # Both trades were made at the offer price 10/47: that is every price of
+    # the bucket. The average is the volumes' ratio, printed with seven decimals.
+    at = Fraction(10, 47)
+    assert bucket.source == {
+        "trades": 2, "base_volume": 2 * 231829549, "counter_volume": 2 * 49325436, "avg": "0.2127660",
+        **{name: at for name in ("high", "low", "open", "close")},
+    }
+    assert bucket.as_dict()["source"]["open"] == "0.2127660"
+
+
+def test_aggregations_are_compared_bucket_by_bucket_with_the_extreme_prices(pilot: Pilot) -> None:
+    from app.backfill.verify import _seven_decimals
+
+
+    pilot.run()
+    day = int(T0.timestamp() * 1000)
+    assert checking.whole_buckets(pilot.fake.client, WINDOW, 3_600_000) == (day, 0)  # the day is not whole in the window
+    # Hour by hour over the whole day the fake's history lies in.
+    buckets = checking.compare_aggregations(pilot.fake.client, pilot.engine, EUR, RECT, day, 24, 3_600_000)
+    with_trades = [bucket for bucket in buckets if bucket.stored["trades"]]
+    assert [bucket.start for bucket in with_trades] == ["2026-01-01T00:00:00Z"]  # the whole history lies in its first hour
+    assert all(bucket.matches for bucket in buckets)
+    assert _seven_decimals(Fraction(1, 3)) == "0.3333333" and _seven_decimals(Fraction(1, 2)) == "0.5000000"
+    assert _seven_decimals(Fraction(1, 2 * 10**7)) == "0.0000001"  # a tie goes away from zero, as the source rounds
+
+
+def test_a_differing_price_is_named(pilot: Pilot) -> None:
+    pilot.run()
+    day = int(T0.timestamp() * 1000)
+    with pilot.engine.begin() as connection:  # one stored trade gets another amount than it was made at
+        connection.execute(
+            text("UPDATE history_trades SET counter_amount = 2 * counter_amount WHERE id = :id"),
+            {"id": f"{T7_FIRST_OPERATION}-0"},
+        )
+
+    bucket = checking.compare_aggregations(pilot.fake.client, pilot.engine, EUR, RECT, day, 1)[0]
+
+    assert not bucket.matches
+    # The volume and the average moved; the prices the trades were made at did
+    # not: they are stored apart from the amounts.
+    assert bucket.differs_in == ["avg", "base_volume"]
 
 
 # -- a page and its checkpoint stand or fall together ---------------------------
@@ -613,3 +657,81 @@ def test_a_signal_stops_the_run_between_requests(pilot: Pilot) -> None:
     assert {report.status for report in reports} == {"stopped"}
     assert pilot.coverage_of(f"account {A} / transactions") == [("complete", 111, 130, None), ("pending", 100, 110, None)]
     assert pilot.rows("SELECT cursor_ledger FROM sync_state") == [(110,)]  # the page and its checkpoint, together
+
+
+# -- parents only: the account's own history without the context of its transactions
+
+
+ACCOUNT_HISTORY = (
+    "SELECT 'transaction', id::text FROM history_transactions t WHERE EXISTS ("
+    "  SELECT 1 FROM history_transaction_participants p WHERE p.transaction_id = t.id AND p.account_id IN (:a, :b)) "
+    "UNION ALL SELECT 'operation', id::text FROM history_operations o WHERE EXISTS ("
+    "  SELECT 1 FROM history_operation_participants p WHERE p.operation_id = o.id AND p.account_id IN (:a, :b)) "
+    "UNION ALL SELECT 'effect', id FROM history_effects WHERE account_id IN (:a, :b) "
+    "UNION ALL SELECT 'trade', id FROM history_trades WHERE base_account_id IN (:a, :b) OR counter_account_id IN (:a, :b) "
+    "ORDER BY 1, 2"
+)
+
+
+def test_parents_only_stores_the_same_account_history_with_far_fewer_requests(make_database: Callable[[], str]) -> None:
+    full, parents = Pilot(make_database()), Pilot(make_database())
+    try:
+        for pilot in (full, parents):
+            pilot.fake.close(sale(120, offer_owner=B), latest=130)  # B's offer is taken by S's operation
+        assert {report.status for report in full.run()} == {"verified"}
+        assert {report.status for report in parents.run(context="parents")} == {"verified"}
+
+        history = {
+            pilot: pilot.rows(ACCOUNT_HISTORY, a=A, b=B) for pilot in (full, parents)
+        }
+        assert len(history[parents]) > 20
+        assert history[parents] == history[full]
+        # What the streams do not bring — the rest of the transactions met — is not claimed.
+        assert parents.rows("SELECT count(*) FROM history_transactions WHERE cardinality(context_loaded) > 0") == [(0,)]
+        assert full.rows("SELECT count(*) FROM history_transactions WHERE cardinality(context_loaded) = 3") != [(0,)]
+        # The history here is small, so the saving is small too: the pages are the same, only the context is not fetched.
+        assert parents.fake.client.stats.requests < full.fake.client.stats.requests
+
+        # The passive offer: the trade came in B's trades stream, its operation is S's.
+        operation_id = (120 << 32) | 1
+        assert parents.rows("SELECT source_account FROM history_operations WHERE id = :id", id=operation_id) == [(S,)]
+        assert parents.rows("SELECT count(*) FROM history_trades WHERE operation_id = :id", id=operation_id) == [(1,)]
+    finally:
+        full.close()
+        parents.close()
+
+
+def test_parents_only_needs_the_operation_and_the_transaction_of_a_trade_and_nothing_more(pilot: Pilot) -> None:
+    pilot.fake.close(sale(120), latest=130)  # a market trade between two accounts that are not tracked
+
+    assert {report.status for report in pilot.run(Window(119, 130), subjects=["market"], context="parents")} == {"verified"}
+
+    operation_id = (120 << 32) | 1
+    assert pilot.rows("SELECT count(*) FROM history_trades WHERE operation_id = :id", id=operation_id) == [(1,)]
+    assert pilot.rows("SELECT context_loaded FROM history_transactions WHERE ledger_sequence = 120") == [([],)]
+    paths = [path for path, _ in pilot.fake.requests]
+    assert f"/operations/{operation_id}" in paths
+    assert not any("/transactions/" in path and path.rsplit("/", 1)[-1] in ("operations", "effects") for path in paths)
+
+
+# -- what a run asks of the source besides its pages ---------------------------
+
+
+def _root_requests(pilot: Pilot) -> int:
+    return sum(1 for path, _ in pilot.fake.requests if path == "/")
+
+
+def test_the_source_is_asked_about_itself_only_where_its_history_could_be_reached(make_database: Callable[[], str]) -> None:
+    """Closing a range asks the source for its oldest ledger — unless the
+    range lies far above the one already known, further than it moves in an
+    hour."""
+    near, far = Pilot(make_database()), Pilot(make_database())
+    try:
+        assert {report.status for report in near.run()} == {"verified"}  # the window starts at the oldest ledger kept
+        assert _root_requests(near) == 9  # once at the end of every stream: two accounts and the market
+
+        assert {report.status for report in far.run(Window(1000, 1030))} == {"verified"}
+        assert _root_requests(far) == 1  # once for the whole run
+    finally:
+        near.close()
+        far.close()

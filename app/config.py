@@ -43,6 +43,12 @@ class Settings:
     # Requests in flight at once. Irrelevant below a few requests per second;
     # kept because latency, not rate, is the limit once the pace is raised.
     horizon_concurrency: int = 1
+    # Live collection: one cycle every so many seconds.
+    collector_interval_seconds: float = 900.0
+    # What one cycle may cost at most. What it does not reach is read in the
+    # next cycle. The time budget is None for nine tenths of the interval.
+    collector_max_requests: int = 2000
+    collector_max_seconds: float | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -61,6 +67,9 @@ class Settings:
             horizon_url=env.get(f"{ENV_PREFIX}URL", "").strip() or "https://horizon.stellar.org",
             horizon_requests_per_second=_positive_number(env, "REQUESTS_PER_SECOND", 1.0),
             horizon_concurrency=int(_positive_number(env, "CONCURRENCY", 1.0)),
+            collector_interval_seconds=_positive_number(env, "COLLECTOR_INTERVAL", 900.0),
+            collector_max_requests=int(_positive_number(env, "COLLECTOR_MAX_REQUESTS", 2000.0)),
+            collector_max_seconds=_optional_positive_number(env, "COLLECTOR_MAX_SECONDS"),
         )
 
 
@@ -75,3 +84,10 @@ def _positive_number(env: Mapping[str, str], name: str, default: float) -> float
     if value <= 0 or value != value:
         raise ConfigError(f"{ENV_PREFIX}{name} must be positive, got {raw!r}")
     return value
+
+
+def _optional_positive_number(env: Mapping[str, str], name: str) -> float | None:
+    """A positive number, or None when the variable is not set or empty."""
+    if not env.get(f"{ENV_PREFIX}{name}", "").strip():
+        return None
+    return _positive_number(env, name, 0.0)

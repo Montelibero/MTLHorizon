@@ -9,6 +9,18 @@ the rest is still pending.
 Coverage is only claimed for what was read. What the source no longer keeps
 — it answered 410, or its history moved up through ledgers not read yet —
 becomes ``unverifiable``, never ``complete``.
+
+Two ways of getting what a record needs before it can be stored
+(``context``):
+
+* ``full`` — the whole context of every transaction met: all its operations,
+  effects and trades, fetched once and then known to be stored;
+* ``parents`` — only what is missing: the transaction of an operation, the
+  operation and transaction of an effect or a trade. Nothing is then known
+  about the rest of the transaction, and ``context_loaded`` stays empty.
+
+The stream reading here is backwards; :mod:`app.collector` reads forward with
+the same pieces.
 """
 
 from __future__ import annotations
@@ -36,6 +48,15 @@ from app.storage.writer import HistoryWriter
 logger = logging.getLogger(__name__)
 
 CONTEXT_STREAMS = frozenset(records.CONTEXT_STREAMS)
+# What is fetched for a record before it is stored: the whole context of its
+# transaction, or only the parents it cannot be stored without.
+FULL = "full"
+PARENTS = "parents"
+CONTEXT_MODES = (FULL, PARENTS)
+# How far the oldest ledger the source keeps moves in an hour, and how long
+# what the source said about itself is taken as current.
+ELDER_SLACK = 720
+ELDER_MAX_AGE = 900.0
 
 _CONTEXT_STATE = text(
     "SELECT transaction_hash, context_loaded FROM history_transactions "
@@ -162,6 +183,10 @@ class ContextFetcher:
         self._aliases: dict[str, str] = {}
         self._stored: set[str] = set()
         self._parents: dict[int, str] = {}
+        # Operations fetched one by one for records that need them as parents,
+        # not stored yet; and the ones known to be stored.
+        self._operations: dict[int, Mapping[str, Any]] = {}
+        self._stored_operations: set[int] = set()
         self._locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
         self._local = threading.local()
@@ -180,10 +205,44 @@ class ContextFetcher:
                 found = self._lookup(transaction_hash)
                 if found is not None and CONTEXT_STREAMS <= found[1]:
                     self._stored.add(found[0])
+                    self._aliases[transaction_hash] = found[0]
                     self.reused += 1
                 else:
                     self._fetch(transaction_hash, transaction, found[1] if found else frozenset())
         self._prepared().append(self._aliases.get(transaction_hash, transaction_hash))
+
+    def ensure_transaction(self, transaction_hash: str) -> None:
+        """Make sure the row of the transaction is stored with the page this
+        thread is preparing.
+
+        The transaction alone is fetched when the database has no row for
+        it. Nothing is then known about the rest of its context.
+        """
+        with self._lock:
+            lock = self._locks.setdefault(transaction_hash, threading.Lock())
+        with lock:
+            if self._is_stored(transaction_hash):
+                self.reused += 1
+            else:
+                found = self._lookup(transaction_hash)
+                if found is None:
+                    self._fetch_transaction(transaction_hash)
+                else:
+                    self._stored.add(found[0])
+                    self._aliases[transaction_hash] = found[0]
+                    self.reused += 1
+        self._prepared().append(self._aliases.get(transaction_hash, transaction_hash))
+
+    def ensure_operation(self, operation_id: int) -> str:
+        """Make sure the operation and its transaction are stored with the
+        page this thread is preparing; return the transaction's hash.
+
+        The operation alone is fetched when the database has no row for it.
+        """
+        transaction_hash = self.transaction_hash_of(operation_id)
+        self._operations_of_page().append(operation_id)
+        self.ensure_transaction(transaction_hash)
+        return transaction_hash
 
     def transaction_hash_of(self, operation_id: int) -> str:
         """The transaction an operation belongs to: from memory, from the
@@ -191,9 +250,12 @@ class ContextFetcher:
         known = self._parents.get(operation_id)
         if known is None:
             known = self._lookup_operation(operation_id)
+            if known is not None:
+                self._stored_operations.add(operation_id)
         if known is None:
             operation = self._client.get(f"/operations/{operation_id}")
             known = records.transaction_hash(operation)
+            self._operations[operation_id] = operation
         self._parents[operation_id] = known
         return known
 
@@ -209,21 +271,46 @@ class ContextFetcher:
             bundles.append(bundle)
         return bundles
 
+    def pending_operations(self) -> list[Mapping[str, Any]]:
+        """The operations this thread's page has to store, fetched one by one."""
+        found = []
+        for operation_id in dict.fromkeys(self._operations_of_page()):
+            if operation_id in self._stored_operations:
+                continue
+            operation = self._operations.get(operation_id)
+            if operation is None:
+                raise StreamFailed(f"operation {operation_id} was looked up, but its record is gone")
+            found.append(operation)
+        return found
+
     def committed(self) -> None:
         """This thread's page is stored, so its bundles are in the database."""
         self._stored.update(self._prepared())
         for transaction_hash in self._prepared():
             self._bundles.pop(transaction_hash, None)
         self._prepared().clear()
+        for operation_id in self._operations_of_page():
+            self._stored_operations.add(operation_id)
+            self._operations.pop(operation_id, None)
+        self._operations_of_page().clear()
 
     def discarded(self) -> None:
+        """This thread's page is not stored. What was fetched for it stays
+        here for whichever page needs it next."""
         self._prepared().clear()
+        self._operations_of_page().clear()
 
     def _prepared(self) -> list[str]:
         prepared = getattr(self._local, "prepared", None)
         if prepared is None:
             prepared = self._local.prepared = []
         return prepared
+
+    def _operations_of_page(self) -> list[int]:
+        operations = getattr(self._local, "operations", None)
+        if operations is None:
+            operations = self._local.operations = []
+        return operations
 
     def _is_stored(self, transaction_hash: str) -> bool:
         transaction_hash = self._aliases.get(transaction_hash, transaction_hash)
@@ -237,12 +324,7 @@ class ContextFetcher:
     ) -> None:
         if transaction is None:
             transaction = self._client.get(f"/transactions/{transaction_hash}")
-        key, values = records.transaction_values(transaction)
-        outer = values["transaction_hash"]
-        if values["inner_transaction_hash"]:
-            self._aliases[values["inner_transaction_hash"]] = outer
-        if transaction_hash not in (outer, values["inner_transaction_hash"]):
-            raise records.RecordError(f"/transactions/{transaction_hash[:8]} answered with another transaction")
+        key, outer = self._identify(transaction_hash, transaction)
 
         # Operations are read again only to tell whether the transaction can
         # have trades; they are not stored again.
@@ -262,8 +344,29 @@ class ContextFetcher:
             CONTEXT_STREAMS - loaded,
         )
         for operation in operations or []:
-            self._parents[int(operation["id"])] = outer
+            operation_id = int(operation["id"])
+            self._parents[operation_id] = outer
+            self._operations.pop(operation_id, None)  # the bundle brings it
         self.fetched += 1
+
+    def _fetch_transaction(self, transaction_hash: str) -> None:
+        """The transaction and nothing of its context."""
+        transaction = self._client.get(f"/transactions/{transaction_hash}")
+        key, outer = self._identify(transaction_hash, transaction)
+        self._bundles[outer] = ContextBundle(transaction, key["id"], None, None, None, frozenset())
+        self.fetched += 1
+
+    def _identify(
+        self, transaction_hash: str, transaction: Mapping[str, Any]
+    ) -> tuple[Mapping[str, Any], str]:
+        """The key of the transaction answered, and its outer hash."""
+        key, values = records.transaction_values(transaction)
+        outer = values["transaction_hash"]
+        if values["inner_transaction_hash"]:
+            self._aliases[values["inner_transaction_hash"]] = outer
+        if transaction_hash not in (outer, values["inner_transaction_hash"]):
+            raise records.RecordError(f"/transactions/{transaction_hash[:8]} answered with another transaction")
+        return key, outer
 
     def _trades_of(self, transaction_id: int) -> list[Mapping[str, Any]]:
         """The trades of a transaction: the global stream read from the
@@ -290,8 +393,37 @@ class ContextFetcher:
         return found
 
 
+class ContextIndex:
+    """Answers, without waiting for a writer, what the database already has:
+    the row of a transaction and the parts of its context stored, and the
+    transaction of a stored operation."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._lock = threading.Lock()
+        self._reader: Connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+    def close(self) -> None:
+        self._reader.close()
+
+    def transaction(self, transaction_hash: str) -> tuple[str, frozenset[str]] | None:
+        """The transaction's own hash and the context streams stored for it,
+        or None when it has no row."""
+        with self._lock, Session(self._reader) as session:
+            row = session.execute(_CONTEXT_STATE, {"hash": transaction_hash}).first()
+        return None if row is None else (row[0], frozenset(row[1]))
+
+    def operation_parent(self, operation_id: int) -> str | None:
+        """The hash of the transaction of an operation, when the operation is stored."""
+        with self._lock, Session(self._reader) as session:
+            return session.execute(_OPERATION_PARENT, {"id": operation_id}).scalar()
+
+
 class Backfill:
-    """Reads a ledger window for the given streams and stores it."""
+    """Reads a ledger window for the given streams and stores it.
+
+    ``context`` says what is fetched for a record before it is stored:
+    ``full`` or ``parents`` (see the module).
+    """
 
     def __init__(
         self,
@@ -301,22 +433,29 @@ class Backfill:
         source: str,
         page_size: int = 200,
         limits: Limits | None = None,
+        context: str = FULL,
     ) -> None:
+        if context not in CONTEXT_MODES:
+            raise ValueError(f"unknown context mode {context!r}")
         self.client = client
         self.source = source
         self.page_size = page_size
+        self.context = context
         self.limits = limits if limits is not None else Limits(requests=client_stats(client))
         client.before_request = self.limits.check
         self.writer = HistoryWriter(engine)
         self._read_lock = threading.Lock()
         self._reader: Connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
-        self.contexts = ContextFetcher(client, self._context_state, self._operation_parent)
-        # The oldest ledger the source still answers for, as last seen.
+        self._index = ContextIndex(engine)
+        self.contexts = ContextFetcher(client, self._index.transaction, self._index.operation_parent)
+        # The oldest ledger the source still answers for, as last seen, and when.
         self.elder: int | None = None
         self._latest: int | None = None
+        self._elder_read_at = float("-inf")
 
     def close(self) -> None:
         self._reader.close()
+        self._index.close()
 
     def __enter__(self) -> "Backfill":
         return self
@@ -408,11 +547,11 @@ class Backfill:
             last_ledger = inside_ledgers[-1] if inside_ledgers else None
             # The source's history may have moved up past ledgers of this range
             # that were never read: an empty page does not tell.
-            elder = self._source_elder() if finished else None
+            elder = self._elder_if_reachable(lower) if finished else None
             try:
                 with self.writer.transaction() as session:
                     self._store_page(
-                        session, job, inside, inside_ledgers, lower, upper, last_ledger, elder, segment_has_records
+                        session, job, inside, inside_ledgers, lower, upper, last_ledger, elder, segment_has_records, finished
                     )
             except Exception:
                 self.contexts.discarded()
@@ -456,15 +595,7 @@ class Backfill:
         return following
 
     def _prepare(self, inside: Sequence[Mapping[str, Any]], job: StreamJob) -> None:
-        for record in inside:
-            if job.stream == "transactions":
-                _, values = records.transaction_values(record)
-                self.contexts.prepare(values["transaction_hash"], record)
-            elif job.stream == "operations":
-                self.contexts.prepare(records.transaction_hash(record))
-            else:
-                operation_id = int(records.paging_token(record).split("-", 1)[0])
-                self.contexts.prepare(self.contexts.transaction_hash_of(operation_id))
+        prepare(self.contexts, inside, job, self.context)
 
     def _store_page(
         self,
@@ -477,19 +608,20 @@ class Backfill:
         last_ledger: int | None,
         elder: int | None,
         segment_has_records: bool,
+        finished: bool,
     ) -> None:
-        """Store the page; ``elder`` is set when the range is read to its end."""
-        for bundle in self.contexts.bundles():
-            store.store_context(session, bundle, bundle.completes)
+        """Store the page. ``finished``: it ends the range. ``elder``: the
+        oldest ledger the source keeps, when the range could reach it."""
+        store.store_prepared(session, self.contexts)
         for record in inside:
-            self._store_record(session, job, record)
+            store.store_stream_record(session, job, record, parents_only=self.context == PARENTS)
 
-        if elder is not None:
+        if finished:
             has_records = segment_has_records or bool(inside)
-            kept_from = max(lower, elder)  # the elder ledger is not the start of the window
+            kept_from = max(lower, elder) if elder is not None else lower  # the elder is not the start of the window
             verified = coverage.complete(kept_from, upper) if has_records else coverage.empty(kept_from, upper)
             pieces = [verified]
-            if lower < elder:
+            if elder is not None and lower < elder:
                 pieces.insert(0, coverage.unverifiable(lower, elder - 1, self._history_note()))
             coverage.replace(session, job.key, self.source, lower, upper, pieces)
             return
@@ -508,23 +640,6 @@ class Backfill:
             cursor=records.paging_token(inside[-1]),
             cursor_ledger=last_ledger,
         )
-
-    def _store_record(self, session: Session, job: StreamJob, record: Mapping[str, Any]) -> None:
-        """Store a record of the stream and the participation Horizon stated
-        by returning it in this account's stream."""
-        if job.stream == "transactions":
-            transaction_id = store.store_transaction(session, record)
-            if job.participant:
-                store.link_transaction(session, transaction_id, [job.participant])
-        elif job.stream == "operations":
-            operation_id = store.store_operation(session, record)
-            if job.participant:
-                store.link_operation(session, operation_id, [job.participant])
-                store.link_transaction(session, records.transaction_of(record), [job.participant])
-        elif job.stream == "effects":
-            store.store_effect(session, record)
-        else:
-            store.store_trade(session, record)
 
     # -- resuming, the end of history and reads -------------------------------
 
@@ -587,10 +702,28 @@ class Backfill:
     def _source_elder(self) -> int:
         """The oldest ledger the source still answers for, as of now. A request."""
         root = self.client.root()
+        self._elder_read_at = time.monotonic()
         elder = int(root["history_elder_ledger"])
         self.elder = elder if self.elder is None else max(self.elder, elder)
         self._latest = root.get("history_latest_ledger")
         return elder
+
+    def _elder_if_reachable(self, lower: int) -> int | None:
+        """The oldest ledger the source keeps, when a range ending at
+        ``lower`` could reach it; None when it cannot.
+
+        Asking the source about itself is a request. It says nothing new for
+        a range that lies more than an hour above the oldest ledger seen —
+        that ledger moves 720 an hour — and nothing new twice in a quarter of
+        an hour.
+        """
+        if (
+            self.elder is not None
+            and lower > self.elder + ELDER_SLACK
+            and time.monotonic() - self._elder_read_at < ELDER_MAX_AGE
+        ):
+            return None
+        return self._source_elder()
 
     def _history_note(self) -> str:
         return f"source keeps history from ledger {self.elder} (history_latest_ledger {self._latest})"
@@ -603,16 +736,28 @@ class Backfill:
                 session, job.key, self.source, lower, upper, [coverage.unverifiable(lower, upper, note)]
             )
 
-    def _operation_parent(self, operation_id: int) -> str | None:
-        """The transaction of an operation, when the operation is stored."""
-        with self._read_lock, Session(self._reader) as session:
-            return session.execute(_OPERATION_PARENT, {"id": operation_id}).scalar()
 
-    def _context_state(self, transaction_hash: str) -> tuple[str, frozenset[str]] | None:
-        """What the database has of a transaction's context."""
-        with self._read_lock, Session(self._reader) as session:
-            row = session.execute(_CONTEXT_STATE, {"hash": transaction_hash}).first()
-        return None if row is None else (row[0], frozenset(row[1]))
+def prepare(contexts: ContextFetcher, inside: Sequence[Mapping[str, Any]], job: StreamJob, context: str) -> None:
+    """Fetch what the records of a page need from the source before the page
+    can be stored: their transaction's context, or only their parents."""
+    if context == PARENTS:
+        # A transaction record is stored as it is; the others need their parents.
+        for record in inside:
+            if job.stream == "operations":
+                contexts.ensure_transaction(records.transaction_hash(record))
+            elif job.stream != "transactions":
+                operation_id = int(records.paging_token(record).split("-", 1)[0])
+                contexts.ensure_operation(operation_id)
+        return
+    for record in inside:
+        if job.stream == "transactions":
+            _, values = records.transaction_values(record)
+            contexts.prepare(values["transaction_hash"], record)
+        elif job.stream == "operations":
+            contexts.prepare(records.transaction_hash(record))
+        else:
+            operation_id = int(records.paging_token(record).split("-", 1)[0])
+            contexts.prepare(contexts.transaction_hash_of(operation_id))
 
 
 def client_stats(client: HorizonClient) -> Callable[[], int]:

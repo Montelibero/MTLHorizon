@@ -586,3 +586,61 @@ class SyncState(Base, Timestamped):
     cursor_ledger: Mapped[int | None] = mapped_column(BigInteger)
 
     __table_args__ = (CheckConstraint("direction IN ('asc', 'desc')", name="direction_known"),)
+
+
+class CollectorSource(Base, Timestamped):
+    """What the collector last saw of its source: one row per source.
+
+    Written at the start of every cycle, so a collector that stopped leaves
+    the time of its last cycle here for ``status`` to show.
+    """
+
+    __tablename__ = "collector_source"
+
+    # Where the history comes from, e.g. "horizon:horizon.stellar.org".
+    source: Mapped[str] = mapped_column(Text, primary_key=True)
+    # history_latest_ledger and history_elder_ledger of the last cycle.
+    latest_ledger: Mapped[int | None] = mapped_column(BigInteger)
+    elder_ledger: Mapped[int | None] = mapped_column(BigInteger)
+    latest_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cycles: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_cycle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Why the last cycle ended early, when it did.
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (CheckConstraint("cycles >= 0", name="cycles_not_negative"),)
+
+
+class CollectorStream(Base, Timestamped):
+    """The live frontier of one stream of the watch list.
+
+    ``start_ledger`` is fixed once, when the stream is first seen (L0): live
+    history begins at ``start_ledger + 1``; what lies before it is for a
+    backfill to plan. ``frontier_ledger`` is the last ledger read to its end.
+    It only moves in the transaction that stores the records, the coverage
+    and the checkpoint up to it, so it never claims what is not stored.
+    """
+
+    __tablename__ = "collector_stream"
+
+    source: Mapped[str] = mapped_column(Text, primary_key=True)
+    resource_type: Mapped[str] = mapped_column(Text, primary_key=True)
+    stream_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    start_ledger: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    frontier_ledger: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # The upper ledger of the last cycle the stream was read in. The lag of
+    # the stream is this minus the frontier.
+    latest_ledger: Mapped[int | None] = mapped_column(BigInteger)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Cycles the stream failed in, one after the other. The next attempt
+    # waits longer with each of them, so a stream the source cannot serve is
+    # not asked for again and again.
+    failures: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("frontier_ledger >= start_ledger", name="frontier_after_start"),
+        CheckConstraint("failures >= 0", name="failures_not_negative"),
+    )
+

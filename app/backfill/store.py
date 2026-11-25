@@ -26,7 +26,8 @@ from app.storage.models import (
 from app.storage.upsert import mark_context, upsert_row, upsert_trade
 
 if TYPE_CHECKING:
-    from app.backfill.loader import ContextBundle
+    from app.backfill.jobs import StreamJob
+    from app.backfill.loader import ContextBundle, ContextFetcher
 
 
 def asset_parts(asset_id: str) -> dict[str, str]:
@@ -131,6 +132,54 @@ def store_context(session: Session, context: "ContextBundle", completes: Iterabl
             store_trade(session, record)
         loaded.append("trades")
     mark_context(session, transaction_id, *completes)
+
+
+def store_stream_record(
+    session: Session, job: "StreamJob", record: Mapping[str, Any], *, parents_only: bool
+) -> None:
+    """Store one record of a stream, and the participation Horizon states by
+    returning the record in this account's stream.
+
+    When whole contexts are fetched, the participants the operation bodies
+    name are linked with the context. With ``parents_only`` there is no
+    context, so they are linked here for the record itself.
+    """
+    if job.stream == "transactions":
+        transaction_id = store_transaction(session, record)
+        accounts = {job.participant} if job.participant else set()
+        if parents_only:
+            accounts |= records.transaction_participants(record, {})
+        link_transaction(session, transaction_id, accounts)
+    elif job.stream == "operations":
+        operation_id = store_operation(session, record)
+        stated = {job.participant} if job.participant else set()
+        named = records.operation_participants([record]).get(operation_id, set()) if parents_only else set()
+        link_operation(session, operation_id, stated | named)
+        link_transaction(session, records.transaction_of(record), stated | named)
+    elif job.stream == "effects":
+        store_effect(session, record)
+    else:
+        store_trade(session, record)
+
+
+def store_operation_alone(session: Session, record: Mapping[str, Any]) -> int:
+    """Store one operation that was fetched on its own, for a record that
+    needs it as a parent, with the participants its body names."""
+    operation_id = store_operation(session, record)
+    named = records.operation_participants([record]).get(operation_id, set())
+    link_operation(session, operation_id, named)
+    link_transaction(session, records.transaction_of(record), named)
+    return operation_id
+
+
+def store_prepared(session: Session, contexts: "ContextFetcher") -> None:
+    """Store what was fetched for the records of a page: the transactions
+    with the parts of their context that came with them, then the operations
+    fetched one by one. The records of the page itself follow."""
+    for bundle in contexts.bundles():
+        store_context(session, bundle, bundle.completes)
+    for record in contexts.pending_operations():
+        store_operation_alone(session, record)
 
 
 def ensure_accounts(session: Session, accounts: Iterable[str]) -> None:

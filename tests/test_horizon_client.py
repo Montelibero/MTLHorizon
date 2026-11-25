@@ -412,3 +412,25 @@ def test_stats_are_reported_as_plain_data() -> None:
         "requests": 2, "retries": 1, "responses_by_status": {200: 1, 503: 1}, "waited_seconds": 0.0,
         "rate_limited": 0, "abandoned": 0,
     }
+
+
+def test_the_same_request_is_refused_only_within_one_reading_sequence() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return hal({})
+
+    horizon, _ = client(handler, requests_per_second=1000)
+    for _ in range(3):
+        horizon.get("/")
+    horizon.forget_answered()  # a collector's next cycle is a sequence of its own
+    for _ in range(3):
+        horizon.get("/")
+    assert len(calls) == 6
+    horizon.forget_answered()
+    for _ in range(3):
+        horizon.get("/")
+    with pytest.raises(MalformedResponse, match="asked for over and over"):
+        horizon.get("/")
+    assert len(calls) == 10

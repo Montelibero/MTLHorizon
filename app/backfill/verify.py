@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from fractions import Fraction
 from typing import Any
 
 from sqlalchemy import Engine, text
@@ -14,7 +16,7 @@ from app.backfill.loader import Window
 from app.sources import horizon_records as records
 from app.sources.horizon import HorizonClient
 from app.sources.horizon_cursors import after_ledger
-from app.sources.horizon_format import amount_to_stroops
+from app.sources.horizon_format import amount_to_stroops, stroops_to_amount
 
 DAY_MS = 86_400_000
 
@@ -225,29 +227,63 @@ def _stored_ids(engine: Engine, job: StreamJob, window) -> list[str]:
 
 @dataclass
 class BucketComparison:
-    day: str
-    source: dict[str, int]
-    stored: dict[str, int]
+    """One bucket of the market: what the source aggregates, and the same
+    over the stored trades of the pair.
+
+    The source counts trades and sums both volumes, takes the average price
+    as counter volume over base volume printed with seven decimals, and
+    takes high, low, open and close from the prices the trades were made at
+    — the offer prices, not the ratios of the amounts. Open and close are
+    the prices of the first and the last trade of the bucket.
+
+    Volumes are in stroops. Prices are exact fractions (counter per base)
+    where the source serves them as ``*_r``, and seven-decimal strings where
+    it does not.
+    """
+
+    start: str
+    source: dict[str, Any]
+    stored: dict[str, Any]
 
     @property
     def matches(self) -> bool:
         return self.source == self.stored
 
+    @property
+    def differs_in(self) -> list[str]:
+        return sorted(name for name in set(self.source) | set(self.stored) if self.source.get(name) != self.stored.get(name))
+
     def as_dict(self) -> dict[str, Any]:
-        return {"day": self.day, "source": self.source, "stored": self.stored, "matches": self.matches}
+        return {
+            "start": self.start,
+            "source": _shown(self.source),
+            "stored": _shown(self.stored),
+            "matches": self.matches,
+        }
 
 
-def whole_days(client: HorizonClient, window: Window) -> tuple[int, int]:
-    """The whole UTC days inside a ledger window: the first one and how many.
+PRICE_FIELDS = ("high", "low", "open", "close")
+VOLUME_FIELDS = ("trades", "base_volume", "counter_volume")
+AVG = "avg"
 
-    A ledger window does not start at midnight. Days a ledger of the window
-    closes in are not whole, and are left out.
+
+def whole_buckets(client: HorizonClient, window: Window, resolution_ms: int) -> tuple[int, int]:
+    """The whole buckets of ``resolution_ms`` inside a ledger window: when
+    the first begins (in ms since the epoch) and how many there are.
+
+    A ledger window does not start on a bucket's edge. Buckets a ledger of
+    the window closes in are not whole, and are left out.
     """
     first = _closed_ms(client, window.from_ledger)
     last = _closed_ms(client, window.to_ledger)
-    first_day = -(-first // DAY_MS) * DAY_MS
-    last_day = last // DAY_MS * DAY_MS
-    return first_day, max(0, (last_day - first_day) // DAY_MS)
+    first_bucket = -(-first // resolution_ms) * resolution_ms
+    last_bucket = last // resolution_ms * resolution_ms
+    return first_bucket, max(0, (last_bucket - first_bucket) // resolution_ms)
+
+
+def whole_days(client: HorizonClient, window: Window) -> tuple[int, int]:
+    """The whole UTC days inside a ledger window: the first one and how many."""
+    return whole_buckets(client, window, DAY_MS)
 
 
 def _closed_ms(client: HorizonClient, sequence: int) -> int:
@@ -257,63 +293,156 @@ def _closed_ms(client: HorizonClient, sequence: int) -> int:
 
 
 def compare_aggregations(
-    client: HorizonClient, engine: Engine, base: str, counter: str, first_day_ms: int, days: int
+    client: HorizonClient, engine: Engine, base: str, counter: str, first_ms: int, buckets: int, resolution_ms: int = DAY_MS
 ) -> list[BucketComparison]:
-    """Per UTC day: trade count and both volumes as the source aggregates
-    them, against the same sums over the stored trades of the pair.
-
-    The stored trades are added on the side they were stored, base or
-    counter, which is the orientation of the source's answer and not of this
-    request; the sums are turned around where needed.
-    """
-    buckets: dict[int, dict[str, int]] = {}
-    for offset in range(0, days, 200):
+    """Per bucket of ``resolution_ms`` from ``first_ms`` on: the stored
+    trades of the pair against what the source aggregates for them."""
+    records: list[Mapping[str, Any]] = []
+    for offset in range(0, buckets, 200):
         body = client.get(
             "/trade_aggregations",
-            start_time=first_day_ms,
-            end_time=first_day_ms + days * DAY_MS,
-            resolution=DAY_MS,
-            limit=min(200, days - offset),
+            start_time=first_ms,
+            end_time=first_ms + buckets * resolution_ms,
+            resolution=resolution_ms,
+            limit=min(200, buckets - offset),
             offset=offset,
             **asset_params("base_", base),
             **asset_params("counter_", counter),
         )
-        for record in body.get("_embedded", {}).get("records", []):
-            buckets[int(record["timestamp"])] = {
-                "trades": int(record["trade_count"]),
-                "base_volume": amount_to_stroops(record["base_volume"]),
-                "counter_volume": amount_to_stroops(record["counter_volume"]),
-            }
-    zero = {"trades": 0, "base_volume": 0, "counter_volume": 0}
-    comparisons = []
+        records.extend(body.get("_embedded", {}).get("records", []))
+    return compare_bucket_records(records, engine, base, counter, first_ms, buckets, resolution_ms)
+
+
+# A stored trade of the pair in the orientation asked for:
+# (base and counter amount in stroops, the price as numerator and
+# denominator, the operation id and the order inside it).
+Trade = tuple[int, int, int, int, int, int]
+
+
+def compare_bucket_records(
+    records: Sequence[Mapping[str, Any]],
+    engine: Engine,
+    base: str,
+    counter: str,
+    first_ms: int,
+    buckets: int,
+    resolution_ms: int,
+) -> list[BucketComparison]:
+    """The same comparison over buckets the source has already answered: its
+    records as they came, one per bucket with trades."""
+    served: dict[int, dict[str, Any]] = {}
+    exact_prices: set[int] = set()  # buckets whose prices the source serves as fractions
+    for record in records:
+        start = int(record["timestamp"])
+        served[start] = _bucket_values(record)
+        if all(f"{name}_r" in record for name in PRICE_FIELDS):
+            exact_prices.add(start)
+    grouped: dict[int, list[Trade]] = defaultdict(list)
     with engine.connect() as connection:
-        for day in range(first_day_ms, first_day_ms + days * DAY_MS, DAY_MS):
-            trades, base_volume, counter_volume = connection.execute(
-                text(_MARKET_DAY),
-                {
-                    "base": base,
-                    "counter": counter,
-                    "start": datetime.fromtimestamp(day / 1000, UTC),
-                    "end": datetime.fromtimestamp((day + DAY_MS) / 1000, UTC),
-                },
-            ).one()
-            comparisons.append(
-                BucketComparison(
-                    datetime.fromtimestamp(day / 1000, UTC).strftime("%Y-%m-%d"),
-                    buckets.get(day, zero),
-                    {"trades": trades, "base_volume": int(base_volume or 0), "counter_volume": int(counter_volume or 0)},
-                )
+        rows = connection.execute(
+            text(_PAIR_TRADES),
+            {
+                "base": base,
+                "counter": counter,
+                "start": datetime.fromtimestamp(first_ms / 1000, UTC),
+                "end": datetime.fromtimestamp((first_ms + buckets * resolution_ms) / 1000, UTC),
+            },
+        )
+        for closed, stored_base, base_amount, counter_amount, price_n, price_d, operation_id, order in rows:
+            if stored_base != base:  # stored the other way round
+                base_amount, counter_amount = counter_amount, base_amount
+                price_n, price_d = price_d, price_n
+            moment = int(closed.timestamp() * 1000)
+            grouped[moment - moment % resolution_ms].append(
+                (base_amount, counter_amount, price_n, price_d, operation_id, order)
             )
+
+    comparisons = []
+    for index in range(buckets):
+        start = first_ms + index * resolution_ms
+        source = served.get(start)
+        # Prices are compared exactly where the source gives them exactly.
+        exact = start in exact_prices
+        comparisons.append(
+            BucketComparison(
+                datetime.fromtimestamp(start / 1000, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                source if source is not None else _summed([], exact),
+                _summed(grouped.get(start, []), exact),
+            )
+        )
     return comparisons
 
 
-_MARKET_DAY = (
-    "SELECT count(*), "
-    "COALESCE(sum(CASE WHEN base_asset_id = :base THEN base_amount ELSE counter_amount END), 0), "
-    "COALESCE(sum(CASE WHEN base_asset_id = :counter THEN base_amount ELSE counter_amount END), 0) "
+def _bucket_values(record: Mapping[str, Any]) -> dict[str, Any]:
+    """One bucket of the source's answer; absent fields are left out."""
+    values: dict[str, Any] = {}
+    for name, served in (("trades", "trade_count"), ("base_volume", "base_volume"), ("counter_volume", "counter_volume")):
+        if record.get(served) is not None:
+            values[name] = int(record[served]) if name == "trades" else amount_to_stroops(record[served])
+    if record.get(AVG) is not None:
+        values[AVG] = _seven_decimals(Fraction(str(record[AVG])))
+    for name in PRICE_FIELDS:
+        exact = record.get(f"{name}_r")
+        if isinstance(exact, Mapping) and exact.get("n") is not None:
+            values[name] = Fraction(int(exact["n"]), int(exact["d"]))
+        elif record.get(name) is not None:
+            values[name] = _seven_decimals(Fraction(str(record[name])))
+    return values
+
+
+def _summed(trades: Sequence[Trade], exact: bool) -> dict[str, Any]:
+    """The same bucket over stored trades of the pair, in the orientation
+    asked for. ``exact`` keeps prices as fractions; otherwise they are
+    printed with seven decimals, as the source prints them."""
+    values: dict[str, Any] = {
+        "trades": len(trades),
+        "base_volume": sum(trade[0] for trade in trades),
+        "counter_volume": sum(trade[1] for trade in trades),
+    }
+    if not trades:
+        return values
+    values[AVG] = _seven_decimals(Fraction(values["counter_volume"], values["base_volume"]))
+
+    def price(trade: Trade) -> Fraction:
+        return Fraction(trade[2], trade[3])
+
+    priced = [trade for trade in trades if trade[3]]
+    if priced:
+        in_order = sorted(priced, key=lambda trade: (trade[4], trade[5]))
+        chosen = {"high": max(in_order, key=price), "low": min(in_order, key=price), "open": in_order[0], "close": in_order[-1]}
+        for name, trade in chosen.items():
+            values[name] = price(trade) if exact else _seven_decimals(price(trade))
+    return values
+
+
+def _shown(values: Mapping[str, Any]) -> dict[str, str]:
+    """Volumes as amounts, prices with seven decimals: how the source prints them."""
+    shown = {}
+    for name, value in values.items():
+        if name == "trades":
+            shown[name] = str(value)
+        elif name in VOLUME_FIELDS:
+            shown[name] = stroops_to_amount(value)
+        else:
+            shown[name] = _seven_decimals(Fraction(value)) if not isinstance(value, str) else value
+    return shown
+
+
+def _seven_decimals(value: Fraction) -> str:
+    """A price with seven decimals, ties away from zero: as the source rounds."""
+    scaled = value * 10**7
+    whole, rest = divmod(scaled.numerator, scaled.denominator)
+    if rest * 2 >= scaled.denominator:
+        whole += 1
+    return f"{whole // 10**7}.{whole % 10**7:07d}"
+
+
+_PAIR_TRADES = (
+    "SELECT ledger_close_time, base_asset_id, base_amount, counter_amount, price_n, price_d, operation_id, trade_order "
     "FROM history_trades WHERE (base_asset_id = :base AND counter_asset_id = :counter "
     "OR base_asset_id = :counter AND counter_asset_id = :base) "
-    "AND ledger_close_time >= :start AND ledger_close_time < :end"
+    "AND ledger_close_time >= :start AND ledger_close_time < :end "
+    "ORDER BY ledger_close_time, operation_id, trade_order"
 )
 
 
@@ -340,13 +469,3 @@ def fingerprint(engine: Engine, window) -> dict[str, dict[str, Any]]:
             ).one()
             result[name] = {"rows": rows, "digest": digest}
     return result
-
-
-def print_table(title: str, rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> None:
-    widths = {
-        column: max([len(column)] + [len(str(row.get(column, ""))) for row in rows]) for column in columns
-    }
-    print(title)
-    print("  " + "  ".join(column.ljust(widths[column]) for column in columns))
-    for row in rows:
-        print("  " + "  ".join(str(row.get(column, "")).ljust(widths[column]) for column in columns))

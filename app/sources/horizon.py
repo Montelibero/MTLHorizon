@@ -389,6 +389,17 @@ class HorizonClient:
             return body
         raise AssertionError("unreachable")
 
+    def forget_answered(self) -> None:
+        """A new reading sequence begins: forget what was answered last.
+
+        Refusing to ask for the same page again and again is about one
+        sequence. A collector's cycle that finds nothing new asks for little
+        but the source's root, cycle after cycle, and is not going round in
+        circles.
+        """
+        with self._pace_lock:
+            self._answered, self._times_answered = None, 0
+
     def _note_answered(self, label: str) -> None:
         """Refuse to go round in circles.
 

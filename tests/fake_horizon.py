@@ -5,11 +5,14 @@ the public server where the backfill depends on it:
 
 * `_links.next` is attached to every page, the last one included, and an
   empty page repeats the cursor;
-* a cursor at or below the oldest ledger kept gets 410 ``before_history``;
+* a cursor at or below the oldest ledger kept gets 410 ``before_history``
+  when reading backwards; reading forwards starts at that ledger instead;
 * a market asked in the other orientation returns the same trades with base
   and counter exchanged;
 * there is no ``/transactions/{hash}/trades`` and no ``/operations/{id}/trades``;
-* transaction meta is served only where a transaction says so.
+* transaction meta is served only where a transaction says so;
+* ledgers keep closing: ``close`` adds transactions and moves the latest
+  ledger, as the collector meets it.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from fractions import Fraction
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
@@ -25,6 +29,7 @@ import httpx
 
 from app.config import PUBLIC_NETWORK_PASSPHRASE
 from app.sources.horizon import HorizonClient, HorizonSettings
+from app.sources.horizon_format import amount_to_stroops, stroops_to_amount
 from tests.factories import address
 
 ORIGIN = "https://horizon.test"
@@ -167,6 +172,67 @@ def history() -> list[Transaction]:
             {C, D}, {1: {C}},
         ),
     ]
+
+
+def paid(ledger: int, source: str, *to: str) -> Transaction:
+    """A transaction of ``source`` paying each account of ``to``."""
+    return Transaction(
+        ledger,
+        0,
+        source,
+        [_payment(account, 1_000_000) for account in to],
+        {source, *to},
+        {number: {source, account} for number, account in enumerate(to, start=1)},
+    )
+
+
+def sale(ledger: int, *, offer_owner: str | None = None) -> Transaction:
+    """S sells RECT for EUR on the market, as the history does at ledger 112.
+
+    With ``offer_owner`` the offer belongs to another account: that account
+    is a side of the trade without being anywhere in the operation — a
+    passive offer taken by somebody else's operation.
+    """
+    base_account = offer_owner or S
+    operation = Operation(
+        "manage_sell_offer",
+        3,
+        None,
+        {
+            "amount": amount(49325436),
+            "price": "4.7000000",
+            "price_r": {"n": 47, "d": 10},
+            **asset("buying_", EUR),
+            **asset("selling_", RECT),
+        },
+        effects=[
+            {
+                "account": S,
+                "type": "trade",
+                "type_i": TRADE,
+                "offer_id": "1804182570",
+                "sold_amount": amount(49325436),
+                "bought_amount": amount(231829549),
+            }
+        ],
+        trades=[
+            {
+                "base": RECT,
+                "counter": EUR,
+                "base_amount": 49325436,
+                "counter_amount": 231829549,
+                "base_account": base_account,
+                "counter_account": S if offer_owner else D,
+                "seller": True,
+                "price": (47, 10),
+                "kind": "orderbook",
+                "base_offer_id": 1804182570,
+                "counter_offer_id": ledger,
+            }
+        ],
+    )
+    participants = {S} if offer_owner else {S, D}
+    return Transaction(ledger, 0, S, [operation], participants, {1: {S}})
 
 
 def _transaction_record(tx: Transaction) -> dict[str, Any]:
@@ -330,11 +396,12 @@ def key_of(record: Mapping[str, Any], kind: str) -> tuple[float, ...]:
 
 
 def position_of(cursor: str, kind: str) -> tuple[float, ...]:
-    """Sort key of a cursor. A pair cursor given as one number has no order part."""
+    """Sort key of a cursor, of the same shape as ``key_of`` returns for a
+    record. A pair cursor given as one number has no order part."""
     first, _, second = cursor.partition("-")
     if kind in ("effect", "trade"):
         return (int(first), int(second) if second else INF)
-    return (int(first),)
+    return (int(first), 0.0)
 
 
 def token_of(record: Mapping[str, Any]) -> str:
@@ -343,7 +410,8 @@ def token_of(record: Mapping[str, Any]) -> str:
 
 class FakeHorizon:
     def __init__(self, *, elder: int = ELDER, latest: int = LATEST, network: str = PUBLIC_NETWORK_PASSPHRASE) -> None:
-        self.ledger = Ledger(history())
+        self.history: list[Transaction] = history()
+        self.ledger = Ledger(self.history)
         self.elder = elder
         self.latest = latest
         self.network = network
@@ -353,13 +421,22 @@ class FakeHorizon:
         self.gone: set[str] = set()  # record ids left out of the answers
         self.tamper: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
         self.before_answer: Callable[[str], None] | None = None  # runs before a request is answered
-        self.client = HorizonClient(
+        self.root_down = False  # the root answers 503: the source is out of service
+        self.client = self._new_client()
+
+    # -- what tests arrange ---------------------------------------------------
+
+    def reopen(self) -> HorizonClient:
+        """A new client on this fake: a command closes the client it is given."""
+        self.client = self._new_client()
+        return self.client
+
+    def _new_client(self) -> HorizonClient:
+        return HorizonClient(
             HorizonSettings(ORIGIN, requests_per_second=1000, max_attempts=4, backoff_base_seconds=0.0, backoff_cap_seconds=0.0),
             transport=httpx.MockTransport(self._handle),
             sleeper=lambda seconds: None,
         )
-
-    # -- what tests arrange ---------------------------------------------------
 
     def fail(self, path_part: str, status: int, *, times: int = 1, retry_after: str | None = None) -> None:
         self.faults.append(Fault(path_part, status, times, retry_after))
@@ -367,6 +444,13 @@ class FakeHorizon:
     def asked(self, path_part: str) -> list[dict[str, str]]:
         """The queries of the requests whose path contains ``path_part``."""
         return [query for path, query in self.requests if path_part in path]
+
+    def close(self, *transactions: Transaction, latest: int) -> None:
+        """The network closes ledgers: ``transactions`` are in them, and the
+        latest ledger is ``latest``."""
+        self.history.extend(transactions)
+        self.ledger = Ledger(self.history)
+        self.latest = latest
 
     # -- the server -----------------------------------------------------------
 
@@ -393,6 +477,8 @@ class FakeHorizon:
         """An object (a dict) or a collection (kind, records)."""
         parts = [part for part in path.split("/") if part]
         if not parts:
+            if self.root_down:
+                raise _Problem(503)
             return self._root()
         if parts[0] == "ledgers" and len(parts) == 2:
             return self._ledger(int(parts[1]))
@@ -500,30 +586,27 @@ class FakeHorizon:
         return self.ledger.ledgers[sequence]
 
     def _aggregations(self, query: dict[str, str]) -> dict[str, Any]:
-        """Day buckets of a market, in the orientation asked for."""
+        """Buckets of a market, in the orientation asked for, as the source
+        aggregates them: count, both volumes, the average price as counter
+        volume over base volume, and high, low, open and close from the
+        prices the trades were made at."""
         base, counter = self._asset(query, "base_"), self._asset(query, "counter_")
         start, end = int(query["start_time"]), int(query["end_time"])
         resolution = int(query.get("resolution", 86400000))
-        buckets: dict[int, list[int]] = {}
+        buckets: dict[int, list[tuple[int, int, Fraction, int, int]]] = {}  # (base, counter, price, operation, order)
         for record in self._trades(query):
             moment = int(datetime.strptime(record["ledger_close_time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp() * 1000)
             if not start <= moment < end:
                 continue
-            bucket = buckets.setdefault(moment - moment % resolution, [0, 0, 0])
-            bucket[0] += 1
-            if self._asset(record, "base_") == base:
-                bucket[1] += int(float(record["base_amount"]) * 10**7)
-                bucket[2] += int(float(record["counter_amount"]) * 10**7)
-            else:
-                bucket[1] += int(float(record["counter_amount"]) * 10**7)
-                bucket[2] += int(float(record["base_amount"]) * 10**7)
+            amounts = (amount_to_stroops(record["base_amount"]), amount_to_stroops(record["counter_amount"]))
+            if self._asset(record, "base_") != base:
+                amounts = (amounts[1], amounts[0])
+            operation, _, order = record["paging_token"].partition("-")
+            price = Fraction(int(record["price"]["n"]), int(record["price"]["d"]))
+            buckets.setdefault(moment - moment % resolution, []).append((*amounts, price, int(operation), int(order or 0)))
         offset, limit = int(query.get("offset", 0)), int(query.get("limit", 10))
         stamps = sorted(buckets)[offset : offset + limit]
-        return {"_embedded": {"records": [
-            {"timestamp": str(stamp), "trade_count": str(buckets[stamp][0]),
-             "base_volume": amount(buckets[stamp][1]), "counter_volume": amount(buckets[stamp][2])}
-            for stamp in stamps
-        ]}}
+        return {"_embedded": {"records": [_bucket(stamp, buckets[stamp]) for stamp in stamps]}}
 
     # -- pages and problems ---------------------------------------------------
 
@@ -534,8 +617,12 @@ class FakeHorizon:
         if cursor:
             position = position_of(cursor, kind)
             # A cursor at or below the elder ledger asks for what is not kept.
+            # Reading backwards that is an error; reading forwards the source
+            # starts where its history does, without a word.
             if position[0] <= self.elder << 32:
-                return self._problem(410)
+                if order == "desc":
+                    return self._problem(410)
+                position = (self.elder << 32, INF) if kind in ("effect", "trade") else (self.elder << 32,)
             view = [record for record in view if _after(key_of(record, kind), position, order)]
         if order == "desc":
             view = view[::-1]
@@ -572,3 +659,36 @@ def _after(key: tuple[float, ...], position: tuple[float, ...], order: str) -> b
     """Whether a record lies strictly beyond a cursor."""
     return key > position if order == "asc" else key < position
 
+
+def _bucket(stamp: int, trades: list[tuple[int, int, Fraction, int, int]]) -> dict[str, Any]:
+    """One bucket of the source's answer for trades given as (base, counter,
+    price, operation, order)."""
+    volume_base = sum(trade[0] for trade in trades)
+    volume_counter = sum(trade[1] for trade in trades)
+    record: dict[str, Any] = {
+        "timestamp": str(stamp),
+        "trade_count": str(len(trades)),
+        "base_volume": stroops_to_amount(volume_base),
+        "counter_volume": stroops_to_amount(volume_counter),
+        "avg": _seven_decimals(Fraction(volume_counter, volume_base)),
+    }
+    in_order = sorted(trades, key=lambda trade: (trade[3], trade[4]))
+    extremes = {
+        "high": max(in_order, key=lambda trade: trade[2]),
+        "low": min(in_order, key=lambda trade: trade[2]),
+        "open": in_order[0],
+        "close": in_order[-1],
+    }
+    for name, trade in extremes.items():
+        record[name] = _seven_decimals(trade[2])
+        record[f"{name}_r"] = {"n": str(trade[2].numerator), "d": str(trade[2].denominator)}
+    return record
+
+
+def _seven_decimals(value: Fraction) -> str:
+    """A price with seven decimals, ties away from zero."""
+    scaled = value * 10**7
+    whole, rest = divmod(scaled.numerator, scaled.denominator)
+    if rest * 2 >= scaled.denominator:
+        whole += 1
+    return f"{whole // 10**7}.{whole % 10**7:07d}"
