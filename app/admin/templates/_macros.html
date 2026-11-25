@@ -1,0 +1,36 @@
+{% macro badge(state) -%}
+{%- set kind = {"done": "ok", "active": "ok", "complete": "ok", "running": "work", "queued": "work", "waiting": "wait", "wanted": "wait", "pending": "wait", "partial": "bad", "dead": "bad", "error": "bad", "failed": "bad", "ambiguous": "bad", "paused": "mute", "cancelled": "mute", "retired": "mute", "manual": "note", "retiring": "wait", "incomplete": "wait", "unverifiable": "bad", "empty": "mute", "verified": "ok", "stopped": "mute", "deferred": "wait", "idle": "mute"}.get(state) -%}
+<span class="badge badge-{{ kind or 'mute' }}">{{ state }}</span>
+{%- endmacro %}
+
+{% macro when(value) -%}<time datetime="{{ value | when }}" title="{{ value | when }}">{{ value | when }}</time>{% endmacro %}
+
+{% macro ago(value, now) -%}<span class="ago" title="{{ value | when }}">{{ value | ago(now) }}</span>{% endmacro %}
+
+{% macro copy(value, label=None, kept=10) -%}
+<span class="copy"><code data-copy="{{ value }}">{{ label or (value | short(kept)) }}</code><button type="button" class="btn-copy" title="Скопировать" aria-label="Скопировать">⧉</button></span>
+{%- endmacro %}
+
+{% macro csrf(csrf) -%}<input type="hidden" name="csrf" value="{{ csrf }}">{% endmacro %}
+
+{% macro confirm(action, csrf_token, label, message, fields={}, class="btn-danger", confirm_text="Подтвердить") -%}
+<form method="post" action="{{ action }}" class="inline" data-confirm="{{ message }}">
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  {% for name, value in fields.items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+  <button type="submit" class="btn {{ class }}">{{ label }}</button>
+  <noscript><span class="hint">{{ message }}</span></noscript>
+</form>
+{%- endmacro %}
+
+{% macro pager(request, total, page, per_page) -%}
+{% set count = (total + per_page - 1) // per_page %}
+{% if count > 1 %}
+<nav class="pager" aria-label="Страницы">
+  {% if page > 1 %}<a href="{{ request.url.path }}{{ request | query(page=page - 1) }}">← назад</a>{% endif %}
+  <span>страница {{ page }} из {{ count }} · {{ total | num }}</span>
+  {% if page < count %}<a href="{{ request.url.path }}{{ request | query(page=page + 1) }}">дальше →</a>{% endif %}
+</nav>
+{% else %}<div class="pager"><span>{{ total | num }}</span></div>{% endif %}
+{%- endmacro %}
+
+{% macro json(value) -%}<pre class="json">{{ value | tojson(indent=2) }}</pre>{% endmacro %}

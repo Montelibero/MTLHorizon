@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_lists.html" as l with context %}
+{% block title %}Обозреватель{% endblock %}
+{% block content %}
+<h1>Обозреватель</h1>
+<p class="hint">Помощь при настройке списков: что внешний источник (Horizon) говорит <strong>сейчас</strong> об одном аккаунте — его линии и балансы — или об активах одного эмитента. Это не обозреватель блокчейна и не история: текущие данные внешнего источника на момент чтения, и ничего из прочитанного не сохраняется. Страница открывается без единого запроса к Horizon; запрос уходит только когда его просят формой или ссылкой «дальше».</p>
+{% if started %}{{ l.started(started) }}{% endif %}
+<form method="get" action="/admin/explore" class="card form">
+  <label for="account">Аккаунт</label>
+  <div class="row">
+    <input type="text" id="account" name="account" size="40" maxlength="56" value="{{ account }}" placeholder="G… — адрес аккаунта" autocomplete="off" spellcheck="false">
+    <button type="submit" class="btn">Показать линии и балансы</button>
+  </div>
+</form>
+<form method="get" action="/admin/explore" class="card form">
+  <label for="issuer">Эмитент</label>
+  <div class="row">
+    <input type="text" id="issuer" name="issuer" size="40" maxlength="56" value="{{ issuer }}" placeholder="G… — адрес эмитента" autocomplete="off" spellcheck="false">
+    <button type="submit" class="btn">Показать выпущенные активы</button>
+  </div>
+</form>
+
+{% if kind == "account" %}
+  {% set v = view %}
+  <h2>Аккаунт <span class="mono">{{ v.address | short(8) }}</span></h2>
+  <p>{{ m.copy(v.address) }}</p>
+  {% if v.reading.error %}
+    <div class="notice notice-error" role="alert">Horizon не ответил — показать нечего.</div>
+    <p>Попытка в {{ m.when(v.reading.at) }}; ушло запросов: {{ v.reading.requests | num }}. Причина: <span class="mono">{{ v.reading.error }}</span></p>
+    <p class="hint">Это состояние внешнего источника на момент попытки, а не свойство аккаунта. Когда Horizon ответит — прочитайте заново.</p>
+  {% else %}
+    <p>Прочитано {{ m.when(v.reading.at) }}{% if v.reading.servers %}, ответил {{ v.reading.servers }}{% endif %}; запросов к Horizon: {{ v.reading.requests | num }}.{% if v.sequence %} Sequence аккаунта: {{ v.sequence }}.{% endif %} Это текущие данные внешнего источника на этот момент, не история.</p>
+    <div class="card">
+      {% if v.watched %}
+        <p>Наблюдается здесь: <strong>да</strong> — {{ l.onoff(v.watched.enabled, "включён", "выключен") }} · <a href="/admin/accounts/{{ v.address }}">страница аккаунта →</a></p>
+      {% else %}
+        <p>Наблюдается здесь: <strong>нет</strong>.</p>
+        {{ m.confirm("/admin/accounts/add", csrf, "Добавить аккаунт в список наблюдения",
+             "Добавить аккаунт " ~ v.address[:8] ~ "… в список наблюдения? Он добавится включённым, с причиной «" ~ reason ~ "», и станет ждать границу начала; загрузку истории и подписку сделает проход воркера.",
+             fields={"addresses": v.address, "reason": reason}) }}
+      {% endif %}
+    </div>
+    <h3>Балансы и линии (trustline)</h3>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Актив</th><th class="num">Баланс</th><th class="num">Лимит</th><th>Авторизована</th><th class="num">Изменена (леджер)</th><th>Наблюдается здесь</th></tr></thead>
+      <tbody>
+      {% if v.xlm %}
+        <tr>
+          <td><strong>XLM (native)</strong></td>
+          <td class="num">{{ v.xlm.balance }}</td>
+          <td class="num">{{ v.xlm.limit or "—" }}</td>
+          <td>{{ v.xlm.authorized }}</td>
+          <td class="num">{{ v.xlm.changed_at_ledger | num if v.xlm.changed_at_ledger is not none else "—" }}</td>
+          <td>{% if v.flags.get("native") %}«включён»: {{ l.onoff(v.flags["native"][0]) }} · <a href="/admin/assets/native">страница актива →</a>{% else %}<span class="muted">нет</span>{% endif %}</td>
+        </tr>
+      {% endif %}
+      {% for line in v.lines %}
+        <tr>
+          <td>
+            {% if line.kind == "pool_share" %}
+              <span class="hint">доля пула ликвидности</span> {{ m.copy(line.pool_id or "—") }}
+            {% elif line.kind == "credit" %}
+              {% if v.flags.get(line.asset_id) %}{{ l.asset(line.asset_id) }}{% else %}{{ l.asset(line.asset_id, false) }}{% endif %}
+              <div class="hint"><a href="/admin/explore?issuer={{ line.issuer }}">активы эмитента {{ line.issuer | short(6) }} →</a></div>
+            {% else %}
+              <span class="hint">линия неизвестного вида</span> <span class="mono">{{ line.type }}</span>
+            {% endif %}
+          </td>
+          <td class="num">{{ line.balance }}</td>
+          <td class="num">{{ line.limit or "—" }}</td>
+          <td>{{ line.authorized }}</td>
+          <td class="num">{{ line.changed_at_ledger | num if line.changed_at_ledger is not none else "—" }}</td>
+          <td>
+            {% if line.kind == "credit" %}
+              {% if v.flags.get(line.asset_id) %}
+                «включён»: {{ l.onoff(v.flags[line.asset_id][0]) }} · discovery: {{ l.onoff(v.flags[line.asset_id][1]) }}
+              {% else %}
+                <span class="muted">нет</span>
+                {{ m.confirm("/admin/assets/add", csrf, "Добавить актив",
+                     "Добавить актив " ~ l.code(line.asset_id) ~ " в список наблюдения включённым, с причиной «" ~ reason ~ "»? Ничего само не запускается: пометить его для discovery и запустить проход можно на странице актива.",
+                     fields={"asset": line.asset_id, "enabled": "1", "reason": reason}, class="btn-small") }}
+              {% endif %}
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% else %}
+        {% if not v.xlm %}<tr><td colspan="6" class="muted">Балансов в ответе нет.</td></tr>{% endif %}
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <p class="hint">Нулевой баланс — тоже держатель: линия есть. «Наблюдается здесь» — правила актива в списках этой установки, из её базы, а не из ответа Horizon. Добавленные отсюда аккаунт или актив получают причину «{{ reason }}»; её можно изменить на их страницах.</p>
+  {% endif %}
+
+{% elif kind == "issuer" %}
+  {% set v = view %}
+  <h2>Активы эмитента <span class="mono">{{ v.issuer | short(8) }}</span></h2>
+  <p>{{ m.copy(v.issuer) }} · <a class="btn btn-small" href="/admin/explore?account={{ v.issuer }}">что Horizon говорит об аккаунте эмитента →</a></p>
+  {% if v.reading.error %}
+    <div class="notice notice-error" role="alert">Horizon не ответил — показать нечего.</div>
+    <p>Попытка в {{ m.when(v.reading.at) }}; ушло запросов: {{ v.reading.requests | num }}. Причина: <span class="mono">{{ v.reading.error }}</span></p>
+    <p class="hint">Это состояние внешнего источника на момент попытки, а не свойство эмитента. Когда Horizon ответит — прочитайте заново.</p>
+  {% else %}
+    <p>Прочитано {{ m.when(v.reading.at) }}{% if v.reading.servers %}, ответил {{ v.reading.servers }}{% endif %}; запросов к Horizon: {{ v.reading.requests | num }}. Страница {{ v.number }}: активы, как их перечисляет Horizon, по {{ page_size }} на страницу. Это текущие данные внешнего источника; «все когда-либо выпущенные активы» не обещается.</p>
+    <form method="post" action="/admin/explore/run" id="preview" class="card form" data-confirm="Сухой проход по выбранному активу: к Horizon уйдёт не больше написанного числа запросов (один запрос — страница из 200 держателей). Ничего не записывается.">
+      {{ m.csrf(csrf) }}
+      <label>Бюджет запросов для сухого прохода
+        <input type="number" name="max_requests" min="1" max="{{ most }}" step="1" required placeholder="например, 20" style="max-width:11rem">
+      </label>
+      <p class="hint">Кнопка «Сухой проход» в строке актива ставит задачу с этим бюджетом: она ничего не записывает, а её результат — сколько держателей и сколько из них новых — на странице задачи. Настоящий проход — с явным бюджетом и подтверждением — на странице актива.</p>
+    </form>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Актив</th><th>Тип</th><th class="num">Выпущено</th><th class="num">Аккаунтов</th><th>Наблюдается здесь</th><th>Действия</th></tr></thead>
+      <tbody>
+      {% for asset in v.assets %}
+        <tr>
+          <td>{% if asset.enabled is none %}{{ l.asset(asset.asset_id, false) }}{% else %}{{ l.asset(asset.asset_id) }}{% endif %}</td>
+          <td>{{ asset.type }}</td>
+          <td class="num">{{ asset.amount or "—" }}</td>
+          <td class="num">{{ asset.accounts or "—" }}</td>
+          <td>{% if asset.enabled is none %}<span class="muted">нет</span>{% else %}«включён»: {{ l.onoff(asset.enabled) }} · discovery: {{ l.onoff(asset.discover) }}{% endif %}</td>
+          <td class="nowrap">
+            {% if asset.enabled is none %}
+              {{ m.confirm("/admin/assets/add", csrf, "Добавить актив",
+                   "Добавить актив " ~ l.code(asset.asset_id) ~ " в список наблюдения включённым, с причиной «" ~ reason ~ "»? Ничего само не запускается: пометить его для discovery и запустить проход можно на странице актива.",
+                   fields={"asset": asset.asset_id, "enabled": "1", "reason": reason}, class="btn-small") }}
+            {% endif %}
+            <button type="submit" form="preview" name="asset" value="{{ asset.asset_id }}" class="btn btn-small">Сухой проход</button>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="muted">Horizon не перечисляет за этим эмитентом ни одного актива.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <nav class="pager" aria-label="Страницы активов">
+      {% if v.previous_href %}<a href="{{ v.previous_href }}">← назад</a>{% endif %}
+      <span>страница {{ v.number }}</span>
+      {% if v.next_href %}<a href="{{ v.next_href }}">дальше →</a>{% endif %}
+      {% if v.number > 1 %}<a href="/admin/explore?issuer={{ v.issuer | urlencode }}">к первой странице</a>{% endif %}
+    </nav>
+  {% endif %}
+{% endif %}
+{% endblock %}

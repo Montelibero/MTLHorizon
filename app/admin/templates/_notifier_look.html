@@ -1,0 +1,45 @@
+{% import "_macros.html" as m %}
+<div class="card" id="last-look">
+  <h2>Что показал последний взгляд на Notifier</h2>
+  {% if tasks.look %}
+    <p>Задача <a href="/admin/tasks/{{ tasks.look.job.id }}">#{{ tasks.look.job.id }}</a> · {{ m.badge(tasks.look.job.state) }} · закончена {% if tasks.look.job.finished_at %}{{ m.when(tasks.look.job.finished_at) }}{% else %}—{% endif %}</p>
+    {% if tasks.look.done %}
+      <dl class="props">
+        <dt>Смотрел в</dt><dd>{% if tasks.look.at %}{{ m.when(tasks.look.at) }}{% else %}—{% endif %}</dd>
+        <dt>Ключ подписи Notifier</dt><dd>{% if tasks.look.signer %}{{ m.copy(tasks.look.signer, kept=10) }}{% else %}— сервер не назвал{% endif %}</dd>
+        <dt>Ключ среди наших</dt><dd>
+          {%- if tasks.look.signer_known is sameas true %}да: вебхуки от этого Notifier проходят проверку подписи
+          {%- elif tasks.look.signer_known is sameas false %}нет: вебхуки от него установка отвергнет, и проход ничего не зарегистрирует (MTL_HORIZON_NOTIFIER_KEYS)
+          {%- else %}не спрашивалось: ключи подписи в настройках не заданы{% endif -%}
+        </dd>
+        <dt>Подписок у Notifier</dt><dd>{{ tasks.look.at_notifier | num }} — с адресом этой установки {{ tasks.look.ours | num }}, чужих {{ tasks.look.foreign | num }} (их проход не трогает и оставляет как есть)</dd>
+        <dt>Нужно этой установке</dt><dd>{{ tasks.look.wanted | num }}</dd>
+      </dl>
+      {% if tasks.look.would_do_nothing %}
+        <p>Проход ничего бы не сделал: всё нужное зарегистрировано и подтверждено.</p>
+      {% elif tasks.look.steps %}
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Что сделал бы проход</th><th>Тип</th><th>Ключ</th><th>Состояние</th><th>Почему</th></tr></thead>
+            <tbody>
+              {% for step in tasks.look.steps %}
+                <tr>
+                  <td>{{ step.what_said }}</td>
+                  <td>{{ step.kind }}</td>
+                  <td>{{ m.copy(step.key | default(""), kept=12) }}</td>
+                  <td>{% if step.state %}{{ m.badge(step.state) }}{% else %}—{% endif %}</td>
+                  <td title="{{ step.why }}">{{ step.why_said }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endif %}
+      <p class="hint">Это то, что было у Notifier, когда шла задача; сейчас может быть иначе. Взгляд ничего не меняет — ни здесь, ни там.</p>
+    {% else %}
+      <div class="notice notice-error">{{ tasks.look.error }}</div>
+    {% endif %}
+  {% else %}
+    <p class="muted">Из админки на Notifier ещё не смотрели: «Что там сейчас?» ставит задачу, которая это сделает.</p>
+  {% endif %}
+</div>

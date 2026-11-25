@@ -30,6 +30,7 @@ import httpx
 
 from app import __version__
 from app.config import shown_url
+from app.sources import live
 from app.sources.horizon_cursors import InvalidCursor, order_key
 
 # Worth asking again: the answer may differ next time. 404 and 410 are final.
@@ -226,7 +227,9 @@ class HorizonClient:
         self.settings = settings or HorizonSettings()
         self.stats = RequestStats()
         self._origin = urlsplit(self.settings.base_url)
-        self._transport = transport
+        # A real client with a cap on (app.sources.live) sends through the
+        # capped transport; a fake, or a process without a cap, as before.
+        self._transport = transport if transport is not None else live.transport()
         self._http = self._new_client()
         self._interval = 1.0 / self.settings.requests_per_second
         self._pace_lock = threading.Lock()
@@ -470,6 +473,11 @@ class HorizonClient:
             started = time.monotonic()
             try:
                 response = self._send(path, query)
+            except live.Spent as error:
+                # The cap on what may be asked of the real servers (a check
+                # its owner allowed). Nothing more is asked: not of this
+                # server again, not of another.
+                raise Unavailable(f"the live budget is used up, nothing more is asked: {error}") from error
             except httpx.TransportError as error:
                 # Timeouts and connection problems are included.
                 self._note_transport_error(path, query, error)

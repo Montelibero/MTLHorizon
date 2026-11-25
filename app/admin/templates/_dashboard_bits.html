@@ -1,0 +1,57 @@
+{% import "_macros.html" as m %}
+
+{#- One number of the statistics: how much, and — unless it was counted
+    exactly — said to be an estimate. In the title: on what it rests.
+    ``path`` is where the figure is in the snapshot, for a page to be read
+    by something other than an eye. -#}
+{% macro figure(one, path, how) -%}
+<span class="fig" data-figure="{{ path }}" data-exact="{{ 1 if one.exact else 0 }}" title="{{ how(one) }}">{% if one.value is none %}неизвестно{% else %}<span class="fig-value">{{ one.value | num }}</span>{% if not one.exact %} <span class="hint">оценка</span>{% endif %}{% endif %}</span>
+{%- endmacro %}
+
+{#- The same as a figure of a card: under it whether it was counted exactly
+    or is an estimate, and when it was measured — which is not the moment
+    the page was asked for when the figure comes from the cache. -#}
+{% macro measured(one, path, how) -%}
+<div class="value">{{ figure(one, path, how) }}</div>
+<div class="sub">{% if one.value is none %}{{ how(one) }}{% else %}<span class="badge badge-{{ 'ok' if one.exact else 'wait' }}">{{ "точно" if one.exact else "оценка" }}</span> · измерено {{ m.when(one.measured_at) }}{% if not one.exact %} · {{ how(one) }}{% endif %}{% endif %}</div>
+{%- endmacro %}
+
+{#- The job that has waited longest in a queue; ``span`` turns seconds into
+    words. In a large queue only the queue index is read, and the age is a
+    lower bound: said to be one. -#}
+{% macro oldest(waiting, span) -%}
+{%- if waiting is none %}Ждущих заданий нет.
+{%- elif waiting.age_seconds is none %}Ничего не готово к взятию сейчас: ближайшая попытка {{ m.when(waiting.next_attempt_at) }}.
+{%- else %}Старейшее ждущее задание{% if waiting.job_id is not none %} #{{ waiting.job_id }} (с {{ m.when(waiting.since) }}){% endif %} ждёт {% if not waiting.exact %}не меньше, чем {% endif %}{{ span(waiting.age_seconds) }}.
+{%- endif %}
+{%- endmacro %}
+
+{#- A service and its heartbeat in words: one of three sentences, what it is
+    doing, and when it last said anything. An empty queue is never taken for
+    a service that is not running: when nothing is heard of the service, the
+    sentence says so whatever its queue holds. -#}
+{% macro service(title, what, said, moment) -%}
+<div class="card">
+  <h2>{{ title }} <span class="hint">{{ what }}</span></h2>
+  <p class="saying"><span class="badge badge-{{ said.tone }}">{{ said.word }}</span> <strong>{{ said.saying }}</strong>{% if said.queue %} <span class="hint">({{ said.queue }})</span>{% endif %}</p>
+  <dl class="props">
+    <dt>Что делает</dt><dd>{{ said.doing }}</dd>
+    <dt>Последний сигнал</dt><dd>{% if said.beat.at %}{{ m.when(said.beat.at) }} · {{ said.beat.at | ago(moment) }}{% else %}— служба ещё ничего не сказала о себе{% endif %}</dd>
+    <dt>Кто</dt><dd>{{ said.beat.service or "—" }}</dd>
+    {%- set words = {"slices_done": "Срезов сделано", "slices_failed": "Срезов с ошибкой", "done": "Заданий сделано", "failed": "Заданий не сделано", "passes": "Проходов сделано", "passes_done": "Проходов сделано"} -%}
+    {% for name, value in said.beat.other.items() %}<dt>{{ words.get(name, name) }}</dt><dd>{{ value }}</dd>{% endfor %}
+  </dl>
+</div>
+{%- endmacro %}
+
+{#- A task of the admin UI on one line, as the page of tasks shows it. -#}
+{% macro task(job, describe, figures, duration, moment) -%}
+<tr>
+  <td>{{ job.id }}</td>
+  <td><a href="/admin/tasks/{{ job.id }}">{{ describe(job) }}</a><div class="hint">{{ job.kind }}</div></td>
+  <td>{{ m.badge(job.state) }}</td>
+  <td>{{ m.ago(job.created_at, moment) }}</td>
+  <td class="nowrap">{{ duration(job) }}</td>
+  <td>{% for name, value in figures(job).items() %}<span class="nowrap">{{ name }}: <strong>{{ value }}</strong></span> {% endfor %}{% if job.last_error %}<div class="hint">{{ job.last_error | short(90) }}</div>{% endif %}</td>
+</tr>
+{%- endmacro %}

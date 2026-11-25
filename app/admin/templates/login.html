@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Вход{% endblock %}
+{% block content %}
+<div class="narrow">
+  <h1>Вход в админку</h1>
+  {% if not configured %}
+    <div class="notice notice-error">Админка закрыта: в настройках установки нет секрета (<code>MTL_HORIZON_ADMIN_SECRET</code>). Пока его нет, не откроется ни для кого.</div>
+  {% elif blocked_until %}
+    <div class="notice notice-error">Слишком много неверных попыток. Следующая — не раньше {{ blocked_until | when }}.</div>
+  {% elif trouble %}
+    <div class="notice notice-error">{{ trouble }}</div>
+  {% endif %}
+  {% if configured %}
+  <form method="post" action="/admin/login" class="card form" autocomplete="off">
+    <input type="hidden" name="next" value="{{ request.query_params.get('next', '') }}">
+    <label for="secret">Секрет администратора</label>
+    <input type="password" id="secret" name="secret" autocomplete="current-password" required autofocus>
+    <button type="submit" class="btn btn-primary">Войти</button>
+  </form>
+  <p class="hint">Секрет задаётся в <code>.env</code> установки и нигде не хранится здесь. Введённый неверный секрет считается; после пяти подряд адрес блокируется на время.</p>
+  {% endif %}
+</div>
+{% endblock %}

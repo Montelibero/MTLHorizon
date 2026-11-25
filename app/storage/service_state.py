@@ -10,6 +10,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.storage.models import ServiceState
@@ -29,3 +32,16 @@ def put(session: Session, name: str, value: Mapping[str, Any]) -> None:
     else:
         row.value = dict(value)
     session.flush()
+
+
+def write(engine: Engine, name: str, value: Mapping[str, Any]) -> None:
+    """Keep ``value`` under ``name`` whatever another process does at the same
+    moment: two may say the same thing at once — a heartbeat — and neither
+    may fail on the other's saying it first."""
+    with Session(engine) as session, session.begin():
+        session.execute(
+            insert(ServiceState)
+            .values(name=name, value=dict(value))
+            .on_conflict_do_update(index_elements=["name"], set_={"value": dict(value), "updated_at": func.now()})
+            .execution_options(synchronize_session=False)
+        )

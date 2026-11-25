@@ -120,57 +120,27 @@ def command_reconcile(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def _dry_run(engine: Any, api: Any, settings: Settings) -> int:
-    """Say what a pass would do — create, take, retire — and leave
-    everything, here and there, as it is."""
-    with Session(engine) as session:
-        wanted = desired.wanted(session)
-        rows = {
-            (row.kind, row.key): row
-            for row in session.scalars(select(WatchSubscription).where(WatchSubscription.state != "retired"))
-        }
-    engine.dispose()
-    print(f"the Notifier at {shown_url(settings.notifier_api_url)}; webhooks to {settings.notifier_callback_url}")
+    """Say what a pass would do — create, take, retire, register again — and
+    leave everything, here and there, as it is."""
     try:
-        status = api.status()
-        listing = api.list_subscriptions()
+        planned = reconcile.plan(engine, api, settings.notifier_callback_url, keys=settings.notifier_signer_keys)
     except NotifierError as error:
         print(f"the Notifier could not be read: {error}")
         return FAILED
-    if status.get("publicKey") not in settings.notifier_signer_keys:
+    engine.dispose()
+    print(f"the Notifier at {shown_url(settings.notifier_api_url)}; webhooks to {settings.notifier_callback_url}")
+    if planned["signer_known"] is False:
         print(
-            f"the Notifier signs with {status.get('publicKey')}, which is not among MTL_HORIZON_NOTIFIER_KEYS: "
+            f"the Notifier signs with {planned['signer']}, which is not among MTL_HORIZON_NOTIFIER_KEYS: "
             "its webhooks would be refused here, and a pass would register nothing"
         )
-    would: list[dict[str, str]] = []
-    for key, want in sorted(wanted.items()):
-        row = rows.get(key)
-        if row is not None and row.state in reconcile.CONFIRMED:
-            continue
-        params = subscription_params(want.kind, want.key, settings.notifier_callback_url)
-        fits = [sub for sub in listing if same_subscription(sub, params)]
-        if not fits:
-            what = "create"
-        elif len(fits) == 1:
-            what = f"take {remote_id(fits[0])}"
-        else:
-            what = f"AMBIGUOUS, {len(fits)} fit: " + ", ".join(str(remote_id(sub)) for sub in fits)
-        would.append({"what": what, "kind": want.kind, "key": want.key[:16], "why": ", ".join(want.rules)})
-    for key, row in sorted(rows.items()):
-        if key not in wanted and row.remote_id:
-            would.append(
-                {
-                    "what": f"retire {row.remote_id}",
-                    "kind": row.kind,
-                    "key": row.key[:16],
-                    "why": "this installation made it" if row.managed else "made by hand: forgotten here, left there",
-                }
-            )
-    if would:
-        print_table("a pass would", would, ("what", "kind", "key", "why"))
+    if planned["steps"]:
+        print_table("a pass would", planned["steps"], ("what", "kind", "key", "why"))
     else:
         print("a pass would do nothing: everything wanted is registered and confirmed")
-    foreign = [sub for sub in listing if sub.get("reaction_url") != settings.notifier_callback_url]
-    print(f"{len(listing)} subscription(s) at the Notifier; {len(foreign)} with another address are left as they are")
+    print(
+        f"{planned['at_notifier']} subscription(s) at the Notifier; {planned['foreign']} with another address are left as they are"
+    )
     print("dry run: nothing was registered, retired or written")
     return OK
 

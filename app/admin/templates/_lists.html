@@ -1,0 +1,151 @@
+{% import "_macros.html" as m %}
+{# What the pages of the watch lists share: an asset, an account, the import
+   of a history, a subscription, the forms that switch a rule and the ones
+   that put a discovery pass in the queue. Imported "with context": the
+   macros read what every page is given (now, csrf). #}
+
+{% macro onoff(value, yes="да", no="нет") -%}
+<span class="badge badge-{{ 'ok' if value else 'mute' }}">{{ yes if value else no }}</span>
+{%- endmacro %}
+
+{% macro code(value) -%}{%- if value == "native" -%}XLM{%- else -%}{{ value.split(":")[0] }}{%- endif -%}{%- endmacro %}
+
+{% macro asset(value, link=True) -%}
+{%- if value == "native" -%}
+  {%- if link %}<a href="/admin/assets/native" title="native">XLM (native)</a>{% else %}XLM (native){% endif -%}
+{%- else -%}
+  {%- set parts = value.split(":") -%}
+  {%- if link %}<a href="/admin/assets/{{ value | urlencode }}" title="{{ value }}">{{ parts[0] }}</a>{% else %}<span class="mono">{{ parts[0] }}</span>{% endif -%}
+  <span class="hint">{{ m.copy(value, label=parts[1] | short(8), kept=8) }}</span>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro account(address, link=True) -%}
+{%- if link %}<a href="/admin/accounts/{{ address }}" title="{{ address }}">{{ address | short(8) }}</a>{% else %}<span class="mono">{{ address | short(8) }}</span>{% endif -%}
+{{ m.copy(address) }}
+{%- endmacro %}
+
+{% macro imported(job) -%}
+{%- if job -%}
+  {{ m.badge(job.state) }} <a href="/admin/import/jobs/{{ job.id }}">#{{ job.id }}</a>
+  <div class="hint">до леджера {{ job.to_ledger | num }}{% if not job.boundary_final %} · граница не завершена{% endif %}</div>
+  {%- if job.state == "paused" and job.paused_because -%}
+    <div class="hint">пауза: {% if job.paused_because in ("account disabled", "market disabled") %}субъект выключен{% else %}{{ job.paused_because }}{% endif %}</div>
+  {%- endif -%}
+  {%- if job.last_error and job.state in ("error", "partial") -%}<div class="hint">{{ job.last_error | short(90) }}</div>{%- endif -%}
+{%- else -%}
+  <span class="muted">не поставлен</span>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro subscription(row, nothing="нет строки") -%}
+{%- if row -%}
+  {{ m.badge(row.state) }}
+  {%- if row.state in ("error", "ambiguous") and row.last_error -%}<div class="hint">{{ row.last_error | short(110) }}</div>{%- endif -%}
+{%- else -%}
+  <span class="muted" title="Строка подписки появится в проходе воркера">{{ nothing }}</span>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro rule(name) -%}
+{%- if name == "history of the asset" -%}правило «включён» (новые события актива)
+{%- elif name == "discovery" -%}правило discovery (искать держателей)
+{%- elif name.startswith("market ") -%}{%- set sides = name[7:].split(">") -%}рынок {{ code(sides[0]) }} / {{ code(sides[1]) }}
+{%- else -%}{{ name }}
+{%- endif -%}
+{%- endmacro %}
+
+{%- macro wanted(rules) -%}
+{%- for name in rules -%}<div>{{ rule(name) }}</div>
+{%- else -%}<span class="muted">ни одно правило её не хочет</span>
+{%- endfor -%}
+{%- endmacro %}
+
+{# A rule switched on or off from one form, asking before it is done. #}
+{% macro toggle(action, csrf_token, on, off_message, on_message, field="enabled", off_label="Выключить", on_label="Включить") -%}
+{%- if on -%}
+  {{ m.confirm(action, csrf_token, off_label, off_message, fields=dict([(field, "0")]), class="btn-small btn-danger") }}
+{%- else -%}
+  {{ m.confirm(action, csrf_token, on_label, on_message, fields=dict([(field, "1")]), class="btn-small") }}
+{%- endif -%}
+{%- endmacro %}
+
+{# A discovery pass put in the queue: a dry run (nothing is written anywhere)
+   or a pass, each with a budget the owner writes. The pass is a task; the
+   request only queues it. #}
+{% macro run_form(asset_id, csrf_token, dry, stopped=None, most=1000) -%}
+{%- set name = asset_id | short(20) -%}
+{%- set asking = "Сухой проход по " ~ name ~ ": к Horizon уйдёт не больше написанного числа запросов (один запрос — страница из 200 держателей). Ничего не записывается: ни аккаунт, ни запись о проходе." if dry
+                 else "Запустить проход по " ~ name ~ "? Он добавит в список новых держателей актива — по одному запросу на 200 держателей, — и может идти долго. Остановить можно на странице задачи; остановленный проход продолжится с того же места." -%}
+<form method="post" action="/admin/assets/{{ asset_id | urlencode }}/run" class="card form" data-confirm="{{ asking }}">
+  {{ m.csrf(csrf_token) }}
+  <input type="hidden" name="dry_run" value="{{ '1' if dry else '0' }}">
+  <label>Бюджет запросов к Horizon
+    <input type="number" name="max_requests" min="1" max="{{ most }}" step="1" required placeholder="например, 20" style="max-width:11rem">
+  </label>
+  {%- if not dry and stopped %}
+  <label class="check"><input type="checkbox" name="resume" value="1"> продолжить с того места, где остановился прошлый проход ({{ stopped | short(6) }})</label>
+  {%- endif %}
+  <button type="submit" class="btn{{ '' if dry else ' btn-danger' }}">{{ "Предпросмотр (dry run)" if dry else "Найти / обновить держателей (запустить проход)" }}</button>
+  <p class="hint">{% if dry %}Пишет ничего: результат — на странице задачи.{% else %}Один запрос — страница из 200 держателей; бюджет — предел прохода.{% endif %}</p>
+</form>
+{%- endmacro %}
+
+{# The task a form has just put in the queue. #}
+{% macro started(job) -%}
+<div class="notice notice-ok" role="status">
+  Задача <a href="/admin/tasks/{{ job.id }}">#{{ job.id }}</a> стоит в очереди — {{ m.badge(job.state) }}.
+  Запрос только поставил её: возьмёт её воркер в фоне, а состояние, ход и результат — на странице задачи{% if (job.params or {}).get("dry_run") %}; для сухого прохода результат — всё, что он оставит{% endif %}.
+</div>
+{%- endmacro %}
+
+{%- macro runs_table(runs) -%}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Состояние</th><th>Начат</th><th class="num">Страниц</th><th class="num">Найдено</th><th class="num">Новых</th><th class="num">Уже включены</th><th class="num">Отключены</th><th>Дошёл до</th><th>Почему остановлен</th></tr></thead>
+  <tbody>
+  {%- for run in runs %}
+    <tr>
+      <td>{{ m.badge(run.state) }} <span class="hint">#{{ run.id }}</span>{% if run.after_address %}<div class="hint">продолжен с {{ run.after_address | short(6) }}</div>{% endif %}</td>
+      <td>{{ m.when(run.started_at) }}<div class="hint">{{ run.finished_at | ago(now) if run.finished_at else "идёт" }}</div></td>
+      <td class="num">{{ run.pages | num }}</td>
+      <td class="num">{{ run.found | num }}</td>
+      <td class="num">{{ run.added | num }}</td>
+      <td class="num">{{ run.already | num }}</td>
+      <td class="num">{{ run.disabled | num }}</td>
+      <td class="mono">{{ run.last_address | short(8) if run.last_address else "—" }}</td>
+      <td>{{ run.last_error | short(100) if run.last_error else "—" }}</td>
+    </tr>
+  {%- else %}
+    <tr><td colspan="9" class="muted">Прохождений, оставивших запись, ещё не было: сухой проход записи не оставляет.</td></tr>
+  {%- endfor %}
+  </tbody>
+</table>
+</div>
+{%- endmacro %}
+
+{# ``how_far`` and ``why``, when given, say of a task where its pass got to
+   and why it stopped (``discovery.how_far``, ``discovery.stopped_because``). #}
+{%- macro tasks_table(jobs, figures, empty="Задач ещё не было.", how_far=None, why=None) -%}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Задача</th><th>Что</th><th>Состояние</th><th>Поставлена</th><th>Как прошло</th>{% if how_far %}<th>Дошёл до</th>{% endif %}{% if why %}<th>Почему остановлен</th>{% endif %}</tr></thead>
+  <tbody>
+  {%- for job in jobs %}
+    {%- set asked = job.params or {} %}
+    <tr>
+      <td><a href="/admin/tasks/{{ job.id }}">#{{ job.id }}</a></td>
+      <td class="nowrap">{{ "сухой проход" if asked.get("dry_run") else "проход" }}{% if asked.get("resume") %}, продолжение{% endif %}<div class="hint">бюджет {{ asked.get("max_requests") | num }} запросов</div></td>
+      <td>{{ m.badge(job.state) }}{% if job.cancel_requested and job.state == "running" %} <span class="hint">остановка запрошена</span>{% endif %}</td>
+      <td>{{ m.ago(job.created_at, now) }}</td>
+      <td>{% for name, value in figures(job).items() %}<span class="nowrap">{{ name }}: <strong>{{ value }}</strong></span> {% endfor %}{% if job.last_error %}<div class="hint">{{ job.last_error | short(100) }}</div>{% endif %}</td>
+      {% if how_far %}<td class="mono">{{ how_far(job) | short(8) if how_far(job) else "—" }}</td>{% endif %}
+      {% if why %}<td>{{ why(job) | short(110) if why(job) else "—" }}</td>{% endif %}
+    </tr>
+  {%- else %}
+    <tr><td colspan="{{ 7 if how_far and why else 5 }}" class="muted">{{ empty }}</td></tr>
+  {%- endfor %}
+  </tbody>
+</table>
+</div>
+{%- endmacro %}

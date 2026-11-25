@@ -31,7 +31,7 @@ from sqlalchemy.engine import Engine
 from app.backfill import store
 from app.backfill.loader import CONTEXT_STREAMS, ContextFetcher, ContextIndex
 from app.sources.horizon import HorizonClient, NotFound, RateLimited, Scope, Unavailable
-from app.storage import jobs
+from app.storage import heartbeats, jobs, retry
 from app.storage.models import ProcessingJob
 from app.storage.writer import HistoryWriter
 
@@ -45,9 +45,10 @@ DEFAULT_RETRY_CAP = 600.0
 # any one request can take.
 DEFAULT_LEASE = 120.0
 DEFAULT_POLL = 2.0
-# How often the worker looks whether an account needs a boundary, a history
-# import or a subscription, while no event is waiting.
-DEFAULT_PROVISION_EVERY = 60.0
+# How often a worker that is idle says so; one that works says so at every
+# job it takes and ends. (The pass that keeps accounts in step is not this
+# loop's: ``app.worker.background``.)
+HEARTBEAT_EVERY = 10.0
 
 
 class JobLost(Exception):
@@ -98,6 +99,7 @@ class Worker:
         self._stop: threading.Event | None = None
         self._job: ProcessingJob | None = None
         self._last_renewal = 0.0
+        self._beat_state, self._beat_at = "", 0.0
         self._stored: set[str] = set()
         self._finished = False
         self.done = 0
@@ -120,38 +122,46 @@ class Worker:
         *,
         poll_seconds: float = DEFAULT_POLL,
         max_jobs: int | None = None,
-        provision: Callable[[], Any] | None = None,
-        provision_every: float = DEFAULT_PROVISION_EVERY,
     ) -> None:
         """Take and do jobs until ``stop`` is set, or ``max_jobs`` are done.
 
-        While the queue is empty, every ``provision_every`` seconds,
-        ``provision`` is called: the pass that keeps accounts, their history
-        imports and their subscriptions in step. It is called only when no
-        job was waiting, so an event never waits for it; and it asks Horizon
-        for nothing when there is nothing to do.
+        While it runs it says every few seconds that it is alive and whether
+        it is on a job (``heartbeat.worker`` in ``service_state``): so a
+        dashboard tells a queue that is empty from a worker that is not
+        running. The pass that keeps accounts, their history imports and
+        their subscriptions in step is not this loop's — it runs in the
+        worker's background thread, on its schedule, whether or not events
+        are waiting.
         """
         self._stop = stop
-        last_provision = time.monotonic() - provision_every  # due as soon as the queue is quiet
         while not stop.is_set() and (max_jobs is None or self.done + self.failed < max_jobs):
-            if self.once(stop=stop) is False and max_jobs is None:
-                if provision is not None and time.monotonic() - last_provision >= provision_every:
-                    last_provision = time.monotonic()
-                    self._provision(provision)
+            self._beat("idle")
+            if self.once(stop=stop) is False:
                 stop.wait(poll_seconds)
+        self._beat("idle")
 
-    def _provision(self, provision: Callable[[], Any]) -> None:
-        try:
-            report = provision()
-        except Exception:  # noqa: BLE001 - the next pass tries again; the rows still say what is to be done
-            logger.exception("the pass that keeps accounts in step failed; it is run again")
+    def _beat(self, state: str, job_id: int | None = None) -> None:
+        """Say that this worker is alive and what it is doing: when it
+        changes, and every ``HEARTBEAT_EVERY`` seconds while it does not. A
+        worker that cannot say it is not stopped for that: the loop says
+        soon enough that the database is gone."""
+        now = time.monotonic()
+        if state == self._beat_state and now - self._beat_at < HEARTBEAT_EVERY:
             return
-        done = getattr(report, "as_dict", lambda: {})()
-        quiet = not any(
-            done.get(name) for name in ("accounts_added", "start_boundaries", "imports_planned", "upper_boundaries", "imports_paused")
-        ) and not (done.get("subscriptions_wanted") and done.get("subscriptions_not_done"))
-        for line in getattr(report, "lines", lambda: [])():
-            logger.log(logging.DEBUG if quiet else logging.INFO, "provisioning: %s", line)
+        self._beat_state, self._beat_at = state, now
+        try:
+            heartbeats.beat(
+                self.engine,
+                heartbeats.WORKER,
+                now=self.clock(),
+                name=self.name,
+                state=state,
+                job_id=job_id,
+                done=self.done,
+                failed=self.failed,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("the heartbeat could not be written", exc_info=True)
 
     def once(self, *, stop: threading.Event | None = None) -> bool:
         """Take the next job whose time has come and do it. False when there
@@ -167,6 +177,7 @@ class Worker:
         """Bring one transaction in, or say why not."""
         first = self.client.stats.requests
         self._job, self._last_renewal = job, time.monotonic()
+        self._beat("working", job.id)
         self._stored, self._finished = set(), False
         # The transaction's ledger: a server that keeps none of it, or has
         # not got as far as it, is not asked.
@@ -206,17 +217,36 @@ class Worker:
             jobs.put_back(self.engine, job, self.name, why="stopped before it was done", now=self.clock())
             state, self.failed = jobs.PENDING, self.failed + 1
         except Exception as error:  # noqa: BLE001 - a try that failed: the job says why and is tried again later
-            self.failed += 1
-            state = jobs.failed(
-                self.engine,
-                job,
-                error=f"{type(error).__name__}: {error}",
-                delay=self._delay(job),
-                max_attempts=self.max_attempts,
-                now=self.clock(),
-            )
-            level = logging.WARNING if state == jobs.PENDING else logging.ERROR
-            logger.log(level, "job %s (transaction %s): try %d failed, %s: %s", job.id, job.transaction_hash[:8], job.attempts, state, error)
+            code = retry.contention(error)
+            if code is not None and job.attempts < self.max_attempts:
+                # The database chose this try as the victim of a deadlock, or
+                # could not serialize it. Not the work's failure: what was
+                # stored is stored, and the try is asked again at once. It
+                # counts as a try, so that it cannot go on for ever.
+                state = jobs.failed(
+                    self.engine,
+                    job,
+                    error=f"the database aborted the try ({retry.said(code)}): asked again at once",
+                    delay=0.0,
+                    max_attempts=self.max_attempts,
+                    now=self.clock(),
+                )
+                logger.info(
+                    "job %s (transaction %s): try %d was aborted by the database (%s); asked again at once",
+                    job.id, job.transaction_hash[:8], job.attempts, retry.said(code),
+                )
+            else:
+                self.failed += 1
+                state = jobs.failed(
+                    self.engine,
+                    job,
+                    error=f"{type(error).__name__}: {error}",
+                    delay=self._delay(job),
+                    max_attempts=self.max_attempts,
+                    now=self.clock(),
+                )
+                level = logging.WARNING if state == jobs.PENDING else logging.ERROR
+                logger.log(level, "job %s (transaction %s): try %d failed, %s: %s", job.id, job.transaction_hash[:8], job.attempts, state, error)
         else:
             self.done += 1
         if state == jobs.DONE:

@@ -22,20 +22,38 @@ subject that moves slowly.
 Nothing is deleted here. A job that gave up waits for a person
 (``python -m app.history retry``); a job whose subject was switched off is
 paused, and the history it imported stays.
+
+What a job stored is not what it read. The rows a slice stored — inserted,
+or found stored already — are counted by the transaction that stored the
+page (``add_stored_in``), whoever holds the job by then; what was asked of
+the servers is counted when the slice ends. A crash between the two cannot
+make a job claim what is not stored. Only slices of a job count so: the
+worker of events stores through the same rules and is told nothing.
+
+Two pauses are told apart. ``pause`` stops jobs, each on its own, with the
+reason kept on the job. ``pause_all`` stops the queue as a whole — one
+record in ``service_state``, no job touched — and ``take`` gives nothing
+until ``resume_all``. It says nothing of the worker of events, which takes
+nothing from this queue, and it outlives every process.
+
+Priority (``set_priority``) changes who goes next, never who goes at all.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import BigInteger, cast, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from app.storage.models import HistoryJob
+from app.storage import service_state
+from app.storage.locks import _key  # noqa: no private marker - the number of a name, shared
+from app.storage.models import HistoryJob, ServiceState
+from app.storage.upsert import DATA_TYPES, StoredCounts
 
 WAITING, RUNNING, DONE, PARTIAL, ERROR, PAUSED = "waiting", "running", "done", "partial", "error", "paused"
 STATES = (WAITING, RUNNING, DONE, PARTIAL, ERROR, PAUSED)
@@ -48,10 +66,21 @@ KINDS = ("account", "market")
 # How a slice ended (``slice_done``).
 PROGRESS, FINISHED, FAILED, DEFERRED = "progress", "finished", "failed", "deferred"
 OUTCOMES = (PROGRESS, FINISHED, FAILED, ERROR, DEFERRED, PAUSED)
+# ...and how it is said to have ended when its worker never came back.
+LOST = "lost"
 # Slices that failed in a row before a subject is left alone, when none is given.
 DEFAULT_MAX_ATTEMPTS = 10
+# What one point of priority is worth in the queue (``take``).
+PRIORITY_STEP = timedelta(minutes=10)
+# When a job that was never served counts as served: before every job that
+# was, whatever its priority. Tie-break is the id, as it always was.
+NEVER_SERVED = datetime(2000, 1, 1, tzinfo=UTC)
+# The pause of the whole queue, by name in ``service_state``.
+QUEUE_PAUSED = "history_paused"
 
 _LOST_WORKER = "its worker did not finish the slice before the lease ran out"
+# Who may change the pause of the whole queue: one at a time, for one transaction.
+_PAUSE_LOCK = text("SELECT pg_advisory_xact_lock(:key)")
 
 
 # -- planning ------------------------------------------------------------------
@@ -205,6 +234,12 @@ def _switched_off(kind: str) -> str:
     return f"{kind} disabled"
 
 
+def switched_off(kind: str) -> str:
+    """The reason a job of a switched-off subject of ``kind`` is paused with —
+    the one ``plan`` lifts with ``resume``."""
+    return _switched_off(kind)
+
+
 # -- the lease -----------------------------------------------------------------
 
 
@@ -217,20 +252,32 @@ def take(
     now: datetime | None = None,
 ) -> HistoryJob | None:
     """Take, under a lease of ``lease_seconds``, the job that was served
-    longest ago among those whose time has come. None when there is none.
+    longest ago among those whose time has come. None when there is none —
+    and while the whole queue is paused (``pause_all``), whoever asks.
 
     Leases that ran out are put back first. The job least recently served is
     first — one that was never served before all others — so that a subject
     with much history does not keep the others waiting: every subject gets a
     slice before any gets a second.
+
+    Priority makes a job look served longer ago than it was: one of
+    priority N as if N steps (``PRIORITY_STEP``) had passed since its last
+    slice. So it goes first until the others have caught up with that lead
+    — and each of them then gets a slice in turn, for whoever was really
+    served longest ago goes next. No job is left out: one of priority N
+    takes at most its lead from the others, and a job that waits longer
+    than that goes before it. A job that was never served goes before every
+    job that was, whatever anybody's priority.
     """
     now = now or datetime.now(UTC)
     with Session(engine, expire_on_commit=False) as session, session.begin():
         _release_expired(session, now, max_attempts)
+        if paused_in(session):
+            return None
         job = session.scalar(
             select(HistoryJob)
             .where(HistoryJob.state == WAITING, HistoryJob.next_attempt_at <= now)
-            .order_by(HistoryJob.last_slice_at.asc().nulls_first(), HistoryJob.id)
+            .order_by(_served_ago(), HistoryJob.id)
             .with_for_update(skip_locked=True)
             .limit(1)
         )
@@ -243,11 +290,20 @@ def take(
         return job
 
 
+def _served_ago() -> Any:
+    """When a job was last served as the queue sees it, least recently served
+    first. The priority is taken as a big number: a large one makes a job
+    wait or go first for a long time, and is never an error."""
+    lead = cast(HistoryJob.priority, BigInteger) * int(PRIORITY_STEP.total_seconds())
+    return func.coalesce(HistoryJob.last_slice_at, NEVER_SERVED) - func.make_interval(0, 0, 0, 0, 0, 0, lead)
+
+
 def _release_expired(session: Session, now: datetime, max_attempts: int) -> int:
     """Jobs whose worker did not come back before its lease ran out: back to
     the queue at once, the death counted as a failed slice — or, when the
-    count is used up, ended as a job that kept failing is. What the worker
-    stored before it died is in the coverage and needs nothing here."""
+    count is used up, ended as a job that keeps failing is. What the worker
+    stored before it died is in the coverage, and was counted as it was
+    stored; it needs nothing here."""
     released = 0
     for job in session.scalars(
         select(HistoryJob)
@@ -255,7 +311,12 @@ def _release_expired(session: Session, now: datetime, max_attempts: int) -> int:
         .with_for_update(skip_locked=True)
     ):
         job.leased_at, job.lease_expires_at, job.leased_by = None, None, None
-        job.last_error, job.attempts = _LOST_WORKER, job.attempts + 1
+        job.last_error, job.attempts, job.failed_slices, job.last_slice_outcome = (
+            _LOST_WORKER,
+            job.attempts + 1,
+            job.failed_slices + 1,
+            LOST,
+        )
         if job.attempts >= max_attempts:
             job.state, job.finished_at = ERROR, now
         else:
@@ -287,6 +348,39 @@ def renew_in(session: Session, job_id: int, worker: str, *, lease_seconds: float
     return changed.rowcount == 1  # type: ignore[attr-defined]
 
 
+# -- what a slice stored -------------------------------------------------------
+
+
+def add_stored_in(session: Session, job_id: int, stored: StoredCounts, *, at: datetime) -> None:
+    """Add what a stored page stored to the counters of its job: the page,
+    the records in it, the rows inserted and the rows found stored already,
+    and when it last moved forward. Runs inside the transaction that stored
+    the page, and nowhere else: committed with the page, rolled back with
+    it, so the counters cannot say what is not stored — not after a crash,
+    not after a retry of the same page.
+
+    Counted for the job whoever holds it by then. The page was read for its
+    subject, and may land after the job was paused or taken away: a pause
+    loses nothing, and neither does the count. The job's row is locked here
+    for the rest of the transaction, after the writer's lock the page
+    already holds; nothing takes the two the other way round.
+    """
+    job = session.get(HistoryJob, job_id, with_for_update=True)
+    if job is None:
+        return
+    job.pages += stored.pages
+    job.records += stored.records
+    job.inserted = _plus(job.inserted, stored.inserted)
+    job.repeated = _plus(job.repeated, stored.repeated)
+    job.last_progress_at = at
+
+
+def _plus(kept: Mapping[str, Any] | None, added: Mapping[str, int]) -> dict[str, int]:
+    """A job's count by data type with a page's added: every data type named."""
+    kept = kept or {}
+    return {data_type: int(kept.get(data_type, 0)) + added.get(data_type, 0) for data_type in DATA_TYPES}
+
+
 # -- the end of a slice --------------------------------------------------------
 
 
@@ -298,14 +392,15 @@ def slice_done(
     error: str | None = None,
     result: dict[str, Any] | None = None,
     requests: int = 0,
-    pages: int = 0,
-    records: int = 0,
+    seconds: float = 0.0,
     delay: float = 0.0,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     now: datetime | None = None,
 ) -> str:
     """End the slice that was made of ``job`` (as ``take`` gave it) and
-    return the state the job is in. The counters are added to the job's.
+    return the state the job is in. ``requests`` and ``seconds`` — the time
+    the slice took — are added to the job's. What the slice stored was
+    counted as it stored it (``add_stored_in``), and is not said here.
 
     * ``progress`` — the slice stopped at its limit and work remains: back
       to the queue at once, the failures forgotten.
@@ -321,6 +416,9 @@ def slice_done(
       counted; asked again after ``delay``.
     * ``paused`` — the subject was switched off meanwhile.
 
+    A failed slice is counted as such for good (``failed_slices``), however
+    the job's tries stand.
+
     The state is written only for a job that is still this slice's. One
     whose lease ran out and that was put back, or taken by another worker,
     is theirs to write now; the counters are the truth either way.
@@ -332,13 +430,15 @@ def slice_done(
         current = session.scalar(select(HistoryJob).where(HistoryJob.id == job.id).with_for_update())
         assert current is not None, "a job is never deleted"
         current.requests += requests
-        current.pages += pages
-        current.records += records
+        current.time_spent_ms += round(max(0.0, seconds) * 1000)
+        if outcome in (FAILED, ERROR):
+            current.failed_slices += 1
         if current.state != RUNNING or current.leased_by != job.leased_by or current.leased_at != job.leased_at:
             return current.state
         if outcome == FINISHED and result is not None and _outgrown(current, result["window"]):
             outcome = PROGRESS
         current.leased_at, current.lease_expires_at, current.leased_by = None, None, None
+        current.last_slice_outcome = outcome
         if result is not None:
             current.result = result
         if outcome == PAUSED:
@@ -459,6 +559,131 @@ def _chosen(
     if subject is not None:
         chosen += (HistoryJob.subject == subject,)
     return chosen
+
+
+def set_priority(
+    engine: Engine,
+    *,
+    priority: int,
+    ids: Iterable[int] | None = None,
+    kind: str | None = None,
+    subject: str | None = None,
+) -> int:
+    """Say of jobs how much sooner they are served than the others, in
+    points (``take``: a point is ``PRIORITY_STEP`` of going first). The
+    jobs named — by id, by account or by market — and 0 is the place they
+    had. Nothing else of a job is touched: not its state, not its counters,
+    not its place in line from its last slice. Returns how many jobs were
+    changed."""
+    with Session(engine) as session, session.begin():
+        changed = session.execute(
+            update(HistoryJob)
+            .where(*_chosen(ids, kind, subject, False))
+            .values(priority=priority)
+            .execution_options(synchronize_session=False)
+        )
+        return changed.rowcount  # type: ignore[attr-defined]
+
+
+# -- the pause of the whole queue ----------------------------------------------
+
+
+def pause_all(engine: Engine, *, because: str, by: str, now: datetime | None = None) -> dict[str, Any]:
+    """Stop the whole queue until ``resume_all``: from now on ``take`` gives
+    nothing, whoever asks. Returns what is kept of it (``pause_state``).
+
+    No job is touched. One that waited goes on waiting; one whose slice is
+    running ends where it stands — its worker sees the pause before its next
+    request — and what that slice stored is stored. The pause is one record
+    in the database, so it outlives every process; and it is not ``pause``,
+    which stops jobs one by one and says why on each. The worker of events
+    takes nothing from this queue and is not stopped.
+    """
+    now = now or datetime.now(UTC)
+    state = {"paused": True, "because": because, "by": by, "at": _moment(now)}
+    with Session(engine) as session, session.begin():
+        _one_pause_writer(session)
+        state = _pause_record(state)
+        _keep(session, state)
+    return state
+
+
+def resume_all(engine: Engine, *, by: str, now: datetime | None = None) -> dict[str, Any]:
+    """The whole queue back to work: ``take`` gives jobs again. Returns what
+    is kept of the pause afterwards (``pause_state``).
+
+    No job is touched: what waited is taken in its turn, and a slice that
+    was cut off is gone on with from where it stood. What the last pause
+    said stays in the record — the pause is not history to be ashamed of —
+    with ``paused`` false and who lifted it when.
+    """
+    now = now or datetime.now(UTC)
+    with Session(engine) as session, session.begin():
+        _one_pause_writer(session)
+        state = {
+            **_pause_record(service_state.get(session, QUEUE_PAUSED)),
+            "paused": False,
+            "resumed_by": by,
+            "resumed_at": _moment(now),
+        }
+        _keep(session, state)
+    return state
+
+
+def pause_state(engine: Engine) -> dict[str, Any]:
+    """Whether the whole queue is paused, and what is known of the last
+    pause: ``paused``, always there; ``because``, ``by`` and ``at``, of the
+    pause — None when there was none; ``resumed_by`` and ``resumed_at``,
+    when it was lifted. Nothing is asked of any server."""
+    with Session(engine) as session:
+        return _pause_record(service_state.get(session, QUEUE_PAUSED))
+
+
+def is_paused(engine: Engine) -> bool:
+    """Whether the whole queue is paused."""
+    with Session(engine) as session:
+        return paused_in(session)
+
+
+def paused_in(session: Session) -> bool:
+    """The same, inside the caller's transaction."""
+    return bool(service_state.get(session, QUEUE_PAUSED).get("paused"))
+
+
+def _pause_record(kept: Mapping[str, Any]) -> dict[str, Any]:
+    """The pause of the queue as it is said: every field there, what is not
+    known as None. Nothing stored means: not paused, and nothing is known
+    of a pause."""
+    return {
+        "paused": bool(kept.get("paused")),
+        "because": kept.get("because"),
+        "by": kept.get("by"),
+        "at": kept.get("at"),
+        "resumed_by": kept.get("resumed_by"),
+        "resumed_at": kept.get("resumed_at"),
+    }
+
+
+def _moment(now: datetime) -> str:
+    return now.astimezone(UTC).isoformat(timespec="milliseconds")
+
+
+def _one_pause_writer(session: Session) -> None:
+    """Who changes the pause reads the record and writes it: one at a time,
+    or the reading of one could be written over the writing of another. The
+    lock ends with the transaction."""
+    session.execute(_PAUSE_LOCK, {"key": _key(QUEUE_PAUSED)})
+
+
+def _keep(session: Session, state: Mapping[str, Any]) -> None:
+    """The record of the pause, written over whatever is there — as
+    ``service_state.write`` does, in the caller's transaction."""
+    session.execute(
+        insert(ServiceState)
+        .values(name=QUEUE_PAUSED, value=dict(state))
+        .on_conflict_do_update(index_elements=["name"], set_={"value": dict(state), "updated_at": func.now()})
+        .execution_options(synchronize_session=False)
+    )
 
 
 # -- looking -------------------------------------------------------------------

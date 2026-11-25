@@ -286,6 +286,59 @@ def test_without_an_api_address_everything_is_only_wished_for(site: Site) -> Non
     assert provision.make_api(site.settings) is None
 
 
+# -- what is really there ---------------------------------------------------------------------
+
+
+def test_a_subscription_gone_from_the_notifier_is_seen_and_registered_again_once(site: Site) -> None:
+    """Deleted there, or switched off by the Notifier after deliveries nobody
+    answered: of that nobody tells — the Notifier simply sends nothing for
+    it any more. The next pass that reads the list finds it gone, says so,
+    and it is registered again: once."""
+    with site.api() as api:
+        settle(site, api)
+        assert site.api_fake.switch_off(account=A) == 1
+        left = len(site.api_fake.subscriptions)
+        planned = reconcile.plan(site.engine, api, CALLBACK, keys=site.settings.notifier_signer_keys, now=site.now)
+        assert [step["what"] for step in planned["steps"] if step["key"] == A] == ["register again"]
+        assert planned["would_do_nothing"] is False and planned["signer_known"] is True
+        assert planned["at_notifier"] == left and planned["foreign"] == 0
+        site.now += timedelta(minutes=11)  # the list is read again, to look for exactly this
+        found = reconcile.run(site.engine, api, CALLBACK, now=site.now)
+        assert any("gone from the Notifier" in problem for problem in found.problems)
+        row = site.rows()[(ACCOUNT, A)]
+        assert row.state == "wanted" and "gone from the Notifier" in (row.last_error or "")
+        assert len(site.api_fake.subscriptions) == left  # not at once: it waits for its pause
+        report = settle(site, api, passes=4)
+        planned = reconcile.plan(site.engine, api, CALLBACK, keys=site.settings.notifier_signer_keys, now=site.now)
+    assert {row.state for row in site.rows().values()} == {"active"}
+    assert len(site.api_fake.subscriptions) == left + 1 and report.created == 1, "one new, not two"
+    assert planned["would_do_nothing"] and planned["steps"] == []
+    assert sum(sub.get("account") == A for sub in site.api_fake.subscriptions) == 1
+
+
+def test_a_subscription_made_by_hand_and_gone_is_left_to_a_person(site: Site) -> None:
+    """One adopted by hand was a person's: gone from the Notifier, it is said
+    so — and nothing is made in its place."""
+    reconcile.adopt(site.engine, ACCOUNT, A, "made-by-hand", callback_url=CALLBACK, now=site.now)
+    with site.api() as api:
+        planned = reconcile.plan(site.engine, api, CALLBACK, now=site.now)
+        assert [step["what"] for step in planned["steps"] if step["key"] == A] == ["a person decides"]
+        site.now += timedelta(minutes=11)
+        reconcile.run(site.engine, api, CALLBACK, now=site.now)
+        settle(site, api)
+    row = site.rows()[(ACCOUNT, A)]
+    assert row.state == "ambiguous" and "gone from the Notifier" in (row.last_error or "")
+    assert not any(sub.get("account") == A for sub in site.api_fake.subscriptions)
+
+
+def test_a_plan_says_of_a_notifier_whose_key_is_not_known(site: Site) -> None:
+    with site.api() as api:
+        planned = reconcile.plan(site.engine, api, CALLBACK, keys=("G" + "A" * 55), now=site.now)
+        assert planned["signer_known"] is False and planned["signer"] == site.signer.public_key
+        planned = reconcile.plan(site.engine, api, CALLBACK, now=site.now)
+        assert planned["signer_known"] is None, "not asked, not answered"
+
+
 # -- the commands ------------------------------------------------------------------------------
 
 

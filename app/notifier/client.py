@@ -45,6 +45,7 @@ import httpx
 
 from app import __version__
 from app.notifier.format import G_ADDRESS
+from app.sources import live
 
 # The most complete matching rules the Notifier has (v0.12.0); 1 keeps the
 # rules it had before.
@@ -250,7 +251,12 @@ class NotifierClient:
             # The Notifier looks at X-Access-Token first of the two.
             named = bool(base.username or base.password)
             headers["X-Access-Token" if named else "Authorization"] = token
-        self._http = httpx.Client(base_url=str(base), headers=headers, timeout=timeout_seconds, transport=transport)
+        self._http = httpx.Client(
+            base_url=str(base),
+            headers=headers,
+            timeout=timeout_seconds,
+            transport=transport if transport is not None else live.transport(),
+        )
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(base_url={self._shown!r})"

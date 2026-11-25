@@ -46,6 +46,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.config import shown_url
+from app.sources import live
 from app.sources.horizon import (
     BeforeHistory,
     History,
@@ -236,6 +237,10 @@ class HorizonPool(HorizonClient):
                 lambda: self._stalled(server),
                 timeout,
             )
+        except live.Spent as error:
+            # The cap on live requests: not this server's doing, and nothing
+            # is left to ask of anyone.
+            raise Unavailable(f"the live budget is used up, nothing more is asked: {error}") from error
         except httpx.TransportError as error:
             return Outcome(None, time.monotonic() - started, f"{type(error).__name__}: {error}", {}, None)
         self.stats.responses_by_status[response.status_code] += 1

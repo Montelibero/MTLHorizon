@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Horizon{% endblock %}
+{% block content %}
+<h1>Horizon</h1>
+<p class="hint">Серверы пула — из настроек установки (<code>MTL_HORIZON_URLS</code>), только для просмотра: адреса здесь не редактируются. О каждом показано то, что о нём помнит база — последняя проверка и то, что видели работающие процессы. Открытие страницы ничего не спрашивает ни у одного сервера.</p>
+
+{% if tasks.job %}
+  <div class="notice notice-ok" role="status">Задача <a href="/admin/tasks/{{ tasks.job.id }}">#{{ tasks.job.id }}</a> — {{ m.badge(tasks.job.state) }}{% if tasks.job.state in ("queued", "running") %}; итог появится здесь, когда она закончится{% endif %}.</div>
+{% endif %}
+
+<div class="card">
+  <h2>Активный сервер</h2>
+  {% if first_choice.how == "check" and first_choice.url %}
+    <p>Последняя проверка пула ({{ m.when(first_choice.at) }}): активным был <strong>{{ first_choice.url }}</strong> — его пул спросил бы первым в тот момент.</p>
+  {% elif first_choice.how == "check" %}
+    <p>На последней проверке пула ({{ m.when(first_choice.at) }}) не было ни одного доступного сервера: в тот момент пул не спросил бы никого.</p>
+  {% elif first_choice.url %}
+    <p>Проверки пула целиком ещё не было. По последним проверкам серверов (у каждой своё время; здесь {{ m.when(first_choice.at) }}) первым был бы <strong>{{ first_choice.url }}</strong>.</p>
+  {% else %}
+    <p class="muted">Пока неизвестно: ни одна проверка ещё не закончилась.</p>
+  {% endif %}
+  <p class="hint">Это сказано по последней проверке и не позже. У каждого процесса свой пул, и кто ответит, решается при каждом запросе: первый подходящий по списку, пока отвечает; сбой — переход к следующему; ответ 429 сервер не меняет, а ставит общую паузу.</p>
+</div>
+
+<div class="card">
+  <h2>Проверить все</h2>
+  <form method="post" action="/admin/horizon/check" class="form">
+    {{ m.csrf(csrf) }}
+    <div class="row">
+      <label>Повторов каждого запроса (от 1 до {{ most }})
+        <select name="repeats">{% for number in repeats %}<option value="{{ number }}"{% if number == most %} selected{% endif %}>{{ number }}</option>{% endfor %}</select>
+      </label>
+      <button type="submit" class="btn btn-primary">Проверить все</button>
+    </div>
+  </form>
+  <p class="hint">Кнопка ставит задачу в очередь; выполняет её воркер в фоне. Каждый сервер спрашивается сам по себе, без подмены другим: его root и один небольшой запрос истории (леджер чуть ниже последнего) — до трёх повторов каждого, то есть не больше шести запросов на сервер, через общий ограничитель темпа. Это запрос истории, а не ping. Ничего в истории и в курсорах проверка не меняет, и то, кто активен, решает сам пул при каждом запросе.</p>
+  {% if tasks.running %}
+    <p>Проверка уже идёт или стоит в очереди: задача <a href="/admin/tasks/{{ tasks.running.id }}">#{{ tasks.running.id }}</a> ({{ m.badge(tasks.running.state) }}). Вторая такая не ставится.</p>
+  {% endif %}
+  {% if tasks.last %}
+    <h3>Последняя проверка</h3>
+    <p>Задача <a href="/admin/tasks/{{ tasks.last.id }}">#{{ tasks.last.id }}</a> · {{ m.badge(tasks.last.state) }} · закончена {% if tasks.last.finished_at %}{{ m.when(tasks.last.finished_at) }}{% else %}—{% endif %}</p>
+    {% if tasks.result %}
+      <p>Запросов: {{ tasks.requests | num }} · серверов доступно: {{ tasks.available | num }} из {{ tasks.checked | num }}{% if tasks.unavailable %} · недоступны: {% for address in tasks.unavailable %}<code>{{ address }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}.</p>
+      <p class="hint">Подробности — на странице задачи; о каждом сервере — в его карточке ниже.</p>
+    {% elif tasks.last.last_error %}
+      <div class="notice notice-error">{{ tasks.last.last_error }}</div>
+    {% endif %}
+  {% else %}
+    <p class="muted">Из админки пул ещё не проверяли.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Общий темп</h2>
+  <p><strong>{{ pace }} запросов в секунду</strong> (<code>MTL_HORIZON_REQUESTS_PER_SECOND</code>) — один для всех процессов и всех серверов вместе: второй сервер не делает чтение быстрее. Ответ 429 ставит паузу всем.</p>
+</div>
+
+<h2>Серверы</h2>
+{% for server in servers %}
+  <div class="card">
+    <h3>{{ server.position }}. {{ server.url }}{% if server.active %} <span class="badge badge-ok">активный на последней проверке</span>{% endif %}</h3>
+    {% if server.check %}
+      <p>
+        {% if server.check.available %}<span class="badge badge-ok">доступен</span>{% else %}<span class="badge badge-bad">недоступен</span>{% endif %}
+        <span class="hint">проверен {{ m.when(server.check.at) }}</span>
+        {% if not server.check.available %}<div>Причина: {{ server.check.reason }}.</div>{% endif %}
+      </p>
+      <dl class="props">
+        <dt>Сеть</dt><dd>{% if server.check.network %}{{ server.check.network | short(56) }}{% if server.check.network_ok is sameas true %} <span class="hint">(та, что хранит установка)</span>{% elif server.check.network_ok is sameas false %} <strong>(другая сеть — установка его не спрашивает)</strong>{% endif %}{% else %}сервер не сказал{% endif %}</dd>
+        <dt>Версия Horizon</dt><dd>{{ server.check.version or "—" }}</dd>
+        <dt>Последний леджер</dt><dd>{% if server.check.latest is not none %}{{ server.check.latest | num }}, закрыт {{ m.when(server.check.closed_at) }}{% else %}сервер не сказал{% endif %}</dd>
+        <dt>Старейший леджер</dt><dd>{% if server.check.elder is not none %}{{ server.check.elder | num }} — ниже история этого сервера не идёт{% else %}сервер не сказал{% endif %}</dd>
+        <dt>Отставание</dt><dd>{% if server.check.lag is not none %}{{ server.check.lag | num }} леджеров за самым свежим сервером той же проверки{% else %}—{% endif %}</dd>
+        <dt>root</dt><dd>{{ server.check.root }}</dd>
+        <dt>История</dt><dd>{% if server.check.ledger is not none %}<code>/ledgers/{{ server.check.ledger }}</code>: {% endif %}{{ server.check.history }}</dd>
+        <dt>Заголовки лимитов</dt><dd>{% if server.check.limits %}{% for name, value in server.check.limits.items() %}<div><code>{{ name }}={{ value }}</code></div>{% endfor %}{% else %}сервер не прислал{% endif %}</dd>
+      </dl>
+    {% else %}
+      <p class="muted">Ещё не проверялся: каким сервер бывает под проверкой, неизвестно.</p>
+    {% endif %}
+    <h3>Что видели работающие процессы</h3>
+    {% if server.kept %}
+      <dl class="props">
+        <dt>Последний ответ</dt><dd>{{ m.when(server.last_answer_at) }}</dd>
+        <dt>Последняя ошибка</dt><dd>{% if server.last_error %}{{ server.last_error | short(120) }} ({{ m.when(server.last_error_at) }}){% else %}не записано{% endif %}</dd>
+        <dt>Оставлен до</dt><dd>{% if server.cooling_until %}{{ m.when(server.cooling_until) }}{% if server.cooling %} <span class="hint">(время ещё не пришло)</span>{% else %} <span class="hint">(время вышло: снова спрашивается)</span>{% endif %}{% else %}не оставлялся{% endif %}</dd>
+      </dl>
+    {% else %}
+      <p class="muted">Процессы о нём ещё ничего не сказали.</p>
+    {% endif %}
+  </div>
+{% else %}
+  <p class="muted">В настройках нет ни одного сервера Horizon.</p>
+{% endfor %}
+
+{% if gone %}
+  <details>
+    <summary>Помнятся ещё {{ gone | length | num }} серверов, которых уже нет в настройках</summary>
+    <p class="hint">Их больше не спрашивают; сказанное о них осталось в базе от прошлых проверок.</p>
+    <ul>{% for row in gone %}<li>{{ row.url }} — проверялся {{ m.when(row.checked_at) }}{% if row.available %}, был доступен{% elif row.checked_at %}, был недоступен{% endif %}</li>{% endfor %}</ul>
+  </details>
+{% endif %}
+{% endblock %}

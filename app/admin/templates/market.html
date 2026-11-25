@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_lists.html" as l with context %}
+{% block title %}Рынок {{ l.code(row.base_asset_id) }} / {{ l.code(row.counter_asset_id) }}{% endblock %}
+{% block content %}
+{% set page = "/admin/markets/" ~ (row.base_asset_id | urlencode) ~ "/" ~ (row.counter_asset_id | urlencode) %}
+{% set base, counter = l.code(row.base_asset_id), l.code(row.counter_asset_id) %}
+<h1>Рынок <span class="mono">{{ base }} / {{ counter }}</span></h1>
+<p class="hint">Каноническая пара — так рынок хранится и именуется в заданиях: <code>{{ row.key }}</code>. Записанный иначе — <span class="mono">{{ counter }} / {{ base }}</span> — это тот же рынок.</p>
+<div class="card">
+  <dl class="props">
+    <dt>Пара</dt><dd>{{ l.asset(row.base_asset_id) }} <span class="muted">/</span> {{ l.asset(row.counter_asset_id) }}</dd>
+    <dt>Включён</dt><dd>{{ l.onoff(row.enabled, "да — сделки пары собираются", "нет — новые сделки пары не собираются") }}</dd>
+    <dt>Причина</dt><dd>{{ row.reason }}</dd>
+    <dt>Подписка</dt>
+    <dd>
+      {% if row.subscribed %}по активу {{ l.asset(row.subscribed) }} — {{ l.subscription(row.subscription) }}{% else %}<span class="muted">не нужна: оба актива — native</span>{% endif %}
+    </dd>
+    <dt>Импорт сделок</dt>
+    <dd>
+      {% if row.job %}{{ l.imported(row.job) }}{% if row.job.finished_at %} <span class="hint">закончен {{ m.when(row.job.finished_at) }}</span>{% endif %}{% if row.job.slices %} <span class="hint">срезов: {{ row.job.slices | num }}, запросов: {{ row.job.requests | num }}, страниц: {{ row.job.pages | num }}</span>{% endif %}
+      {% else %}<span class="muted">не поставлен</span>{% endif %}
+    </dd>
+    <dt>Добавлен</dt><dd>{{ m.when(row.created_at) }}</dd>
+  </dl>
+</div>
+<div class="row">
+  {% if row.enabled %}
+    {{ l.toggle(page ~ "/enabled", csrf, true,
+         "Выключить рынок " ~ base ~ " / " ~ counter ~ "? Его импорт сделок встанет на паузу; история, активы, аккаунты и чужие подписки останутся.", "",
+         off_label="Выключить рынок") }}
+    {{ m.confirm(page ~ "/history", csrf, "Загрузить всю доступную историю сделок",
+         "Поставить загрузку всей доступной истории сделок пары " ~ base ~ " / " ~ counter ~ " — от начала истории пула? Это задание очереди истории, его выполняет служба history в фоне и, возможно, долго. Повторная постановка прогресс не сбрасывает.") }}
+  {% else %}
+    {{ l.toggle(page ~ "/enabled", csrf, false, "",
+         "Включить рынок " ~ base ~ " / " ~ counter ~ " снова? Его импорт вернётся в очередь, если был поставлен.", on_label="Включить рынок") }}
+    <span class="hint">выключенному рынку история не читается</span>
+  {% endif %}
+  <a class="btn" href="/admin/import">Импорт истории →</a>
+</div>
+
+<h2>Что покрывает подписка рынка</h2>
+<div class="card">
+  <p>Рынок покрывается <strong>одной</strong> подпиской — на один актив пары{% if row.subscribed and row.subscribed != "native" %}: здесь это {{ l.asset(row.subscribed) }}{% endif %}. Native ради рынка не подписывается никогда: почти каждая операция сети имеет дело с XLM. В каждой сделке пары есть оба актива, и правила Notifier версии 2 матчат операцию по её активам, по активам пути платежа и по активам её сделок.</p>
+  <p>С версии Notifier 0.13.0 так же матчатся и <strong>сделки пула ликвидности этой пары</strong>: у такой сделки Notifier пишет пару пула (<code>pool_assets</code>), у операций с пулом — <code>assets</code> с парой пула и <code>fee</code>.</p>
+  <p><strong>Чего подписка не обещает.</strong> Ограничения показываются, а не обходятся — Operations Notifier здесь не меняется:</p>
+  <ul>
+    <li>Подписка на актив — наблюдение новых событий, а не «И» двух подписок и не история актива. Историю сделок даёт только загрузка выше.</li>
+    <li>Подтверждение подписки — не гарантия непрерывной доставки. Пропущенное закрывает импорт: проход воркера поднимает его верхнюю границу до последнего леджера пула и делает её завершённой.</li>
+    <li>Доля пула ликвидности в уведомлении не имеет имени актива: такая доставка всё равно принимается в очередь.</li>
+    <li>Notifier до версии 0.13.0 записывал долю пула как XLM.</li>
+    <li>Отдельного ручного списка пулов здесь нет: пул виден через сделки своей пары.</li>
+  </ul>
+  <p class="hint">По коду Operations Notifier ревизий e4039fb (v0.12.0) и 0fb6050 (v0.13.0), как он изучен в этапе 05; живая интеграция с Notifier тогда не проверялась.</p>
+</div>
+{% endblock %}

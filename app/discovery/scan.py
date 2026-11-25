@@ -52,6 +52,10 @@ class _Budget(Exception):
     """The pass used up the requests it was given."""
 
 
+class _Stopped(Exception):
+    """Somebody asked the pass to stop: it ends between two requests."""
+
+
 @dataclass
 class ScanReport:
     """What a pass found and did, and how far it got."""
@@ -197,13 +201,19 @@ def scan(
     after_address: str | None = None,
     max_requests: int = DEFAULT_MAX_REQUESTS,
     clock: Callable[[], datetime] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    on_page: Callable[[ScanReport], None] | None = None,
 ) -> ScanReport:
     """Read the holders of ``asset_id`` and add the new ones to the watch
     list; say what was found and how far the pass got.
 
     With ``dry_run`` nothing is written anywhere: not a row of a run, not an
     account. The pass begins after ``after_address`` — where an earlier pass
-    stopped — and stops itself at ``max_requests``.
+    stopped — and stops itself at ``max_requests``. ``should_stop`` is asked
+    before every request: True ends the pass where it stands, as one that
+    did not get to the end (a page that was taken is kept: it is stored
+    whole). ``on_page`` hears of the report after every page — for whoever
+    shows how far the pass has got, a dry run included.
     """
     if asset_id == "native":
         raise ValueError("native cannot be discovered: every account of the network holds it")
@@ -214,7 +224,9 @@ def scan(
     run_id: int | None = None
     if not dry_run:
         with Session(engine) as session, session.begin():
-            run = DiscoveryRun(asset_id=asset_id, state=RUNNING, dry_run=False, after_address=after_address)
+            run = DiscoveryRun(
+                asset_id=asset_id, state=RUNNING, dry_run=False, after_address=after_address, started_at=now()
+            )
             session.add(run)
             session.flush()
             run_id = report.run_id = run.id
@@ -227,6 +239,8 @@ def scan(
             inner()
         if client.stats.requests - first >= max_requests:
             raise _Budget()
+        if should_stop is not None and should_stop():
+            raise _Stopped()
 
     client.before_request = before_request
     try:
@@ -262,9 +276,14 @@ def scan(
             if not dry_run:
                 _keep(engine, run_id, asset_id, holders, new, report, now())
             report.added.extend(new)
+            if on_page is not None:
+                on_page(report)
     except _Budget:
         report.state = DRY_RUN if dry_run else INCOMPLETE
         report.stopped_because = f"the pass used its {max_requests} requests"
+    except _Stopped:
+        report.state = DRY_RUN if dry_run else INCOMPLETE
+        report.stopped_because = "stopped on request"
     except Exception as error:  # noqa: BLE001 - the pass did not get to the end: that is said, not hidden
         report.state = DRY_RUN if dry_run else INCOMPLETE
         report.stopped_because = f"{type(error).__name__}: {error}"
@@ -328,15 +347,19 @@ def _finish(engine: Engine, run_id: int, report: ScanReport, at: datetime) -> No
 
 
 def stopped_at(engine: Engine, asset_id: str) -> str | None:
-    """Where the last pass over the asset that did not finish stopped."""
+    """Where the last pass over the asset stopped, when that pass did not
+    finish: None when it did (a pass that is to go on from an old place
+    would read what a whole pass after it has read already)."""
     with Session(engine) as session:
         run = session.scalars(
             select(DiscoveryRun)
-            .where(DiscoveryRun.asset_id == asset_id, DiscoveryRun.state == INCOMPLETE, DiscoveryRun.dry_run.is_(False))
-            .order_by(DiscoveryRun.started_at.desc())
+            .where(DiscoveryRun.asset_id == asset_id, DiscoveryRun.dry_run.is_(False))
+            .order_by(DiscoveryRun.started_at.desc(), DiscoveryRun.id.desc())
             .limit(1)
         ).first()
-    return None if run is None else run.last_address or run.after_address
+    if run is None or run.state != INCOMPLETE:
+        return None
+    return run.last_address or run.after_address
 
 
 def run_all(

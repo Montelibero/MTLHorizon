@@ -3,18 +3,21 @@ there after whatever happens to it."""
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable, Iterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import create_engine, text
+from alembic import command
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
 
 from app.backfill import config as watch_lists
+from app.backfill import store
 from app.backfill import verify as checking
 from app.backfill.jobs import market_key, stream_jobs
 from app.backfill.loader import Backfill, RunStopped
@@ -24,17 +27,32 @@ from app.history import cli as history_cli
 from app.history.runner import DEFAULT_DEFER, HistoryWorker, SliceLimits
 from app.sources.horizon import HorizonSettings
 from app.sources.pool import HorizonPool, PoolSettings
-from app.storage import coverage, history_jobs
-from app.storage.models import HistoryJob
+from app.storage import coverage, heartbeats, history_jobs, upsert
+from app.storage.models import HistoryJob, HistoryTransaction
+from app.storage.upsert import DATA_TYPES, StoredCounts, count_stored
+from tests.conftest import alembic_config
 from tests.factories import address
 from tests.fake_horizon import A, B, C, D, EUR, ISSUER, RECT, FakeHorizon, paid, sale, serve
 from tests.test_backfill import WATCH_LIST, WINDOW
 from tests.test_pool import SETTINGS, Clock
-from tests.test_worker import Wall
 
 MARKET = market_key(RECT, EUR)
 STREAMS = ("transactions", "operations", "effects", "trades")
 WAITING, RUNNING, DONE, PARTIAL, ERROR, PAUSED = history_jobs.STATES
+ZERO = dict.fromkeys(DATA_TYPES, 0)
+
+
+class Wall:
+    """The time the queue goes by; only moves when a test moves it."""
+
+    def __init__(self) -> None:
+        self.now = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def wait(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
 
 
 class Yard:
@@ -42,22 +60,36 @@ class Yard:
     history imports."""
 
     def __init__(self, url: str, *fakes: FakeHorizon, **options: Any) -> None:
+        self.url = url
+        self.fakes = fakes
         self.engine = create_engine(url)
         self.fake = fakes[0]
         self.wall = Wall()
         self.clock = Clock()
         with Session(self.engine) as session, session.begin():
             watch_lists.apply(session, WATCH_LIST)
-        self.pool = HorizonPool(
-            tuple(fake.origin for fake in fakes),
+        self.pool = self._pool()
+        self.worker = self.new_worker("worker-1", **options)
+
+    def _pool(self) -> HorizonPool:
+        return HorizonPool(
+            tuple(fake.origin for fake in self.fakes),
             HorizonSettings(**SETTINGS),
             network_passphrase=PUBLIC_NETWORK_PASSPHRASE,
             pool_settings=PoolSettings(health_check_interval=60, failover_cooldown=5),
-            transports={fake.origin: httpx.MockTransport(fake._handle) for fake in fakes},
+            transports={fake.origin: httpx.MockTransport(fake._handle) for fake in self.fakes},
             clock=self.clock,
             sleeper=self.clock.sleep,
         )
-        self.worker = self.new_worker("worker-1", **options)
+
+    def restart(self, **options: Any) -> None:
+        """What a process had is gone — its connections, its worker, what it
+        kept in memory — and another starts on the same database."""
+        self.pool.close()
+        self.engine.dispose()
+        self.engine = create_engine(self.url)
+        self.pool = self._pool()
+        self.worker = self.new_worker("worker-2", **options)
 
     def new_worker(self, name: str, *, max_attempts: int = 3, **options: Any) -> HistoryWorker:
         return HistoryWorker(
@@ -165,14 +197,25 @@ def served(fake: FakeHorizon) -> list[str]:
     return order
 
 
-def in_turn(needs: dict[str, int]) -> list[str]:
+def in_turn(needs: dict[str, int], *, priority: dict[str, int] | None = None, step: int = 0) -> list[str]:
     """The order a fair queue serves subjects in: the one that waited longest
-    among those that still need slices; one never served before all others."""
+    among those that still need slices; one never served before all others.
+
+    ``step`` is how much time passes between two slices, and ``priority`` is
+    what the queue makes of it: a subject of priority N is served as if it
+    had last been served N ten-minute steps earlier than it was."""
     order: list[str] = []
     last: dict[str, int] = {}
+
+    def place(who: str) -> tuple[float, int]:
+        lead = (priority or {}).get(who, 0) * 600
+        if who not in last:
+            return -(10**9) - lead, list(needs).index(who)
+        served = last[who] * step if step else last[who]
+        return served - lead, list(needs).index(who)
+
     while any(needs.values()):
-        due = [subject for subject, left in needs.items() if left > 0]
-        subject = min(due, key=lambda who: (last.get(who, -1), list(needs).index(who)))
+        subject = min((who for who, left in needs.items() if left > 0), key=place)
         last[subject] = len(order)
         needs[subject] -= 1
         order.append(subject)
@@ -832,6 +875,582 @@ def test_a_thousand_subjects_are_planned_once_and_served_in_turn(make_database: 
         yard.close()
 
 
+# -- what the queue counts is in the database -------------------------------------------
+
+
+def test_the_columns_the_queue_counts_in_are_migrated_as_the_models_tell_them(
+    monkeypatch: pytest.MonkeyPatch, fresh_database_url: str
+) -> None:
+    """``alembic check`` compares types and defaults as well as names. On a
+    private copy of the schema at head: nothing to migrate; and the counters
+    can be taken away and put back."""
+    monkeypatch.setenv("MTL_HORIZON_DATABASE_URL", fresh_database_url)
+    config = alembic_config(fresh_database_url)
+    command.check(config)
+    command.downgrade(config, "0011")
+    with create_engine(fresh_database_url).connect() as connection:
+        names = {row[0] for row in connection.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'history_job'"))}
+    assert not names & {"inserted", "repeated", "failed_slices", "time_spent_ms", "last_progress_at", "last_slice_outcome", "priority"}
+    command.upgrade(config, "head")
+    command.check(config)
+
+
+# -- what a job stored: counted as the page was stored ---------------------------------
+
+
+def streams_of(engine: Any, *subjects: str) -> list[Any]:
+    """The streams of these subjects of the watch list."""
+    with Session(engine) as session:
+        return [stream for stream in stream_jobs(session)[0] if stream.key.subject_key in subjects]
+
+
+def forget_coverage(engine: Any, *subjects: str) -> None:
+    """Make what these subjects verified pending again: to be read once more."""
+    with Session(engine) as session, session.begin():
+        for stream in streams_of(engine, *subjects):
+            coverage.invalidate(session, stream.key, LOGICAL_SOURCE, 100, 130)
+
+
+def counted(job: HistoryJob) -> tuple[int, int, dict[str, int], dict[str, int]]:
+    return job.pages, job.records, dict(job.inserted), dict(job.repeated)
+
+
+B_INSERTED = {"transactions": 2, "operations": 2, "effects": 5, "trades": 2}
+A_INSERTED = {"transactions": 4, "operations": 5, "effects": 3, "trades": 0}
+B_BY_TABLE = ("history_transactions", "history_operations", "history_effects", "history_trades")
+
+
+def test_a_count_is_kept_inside_the_transaction_that_stores_the_page(yard: Yard) -> None:
+    """What a run stored — by data type, inserted or found there already —
+    is told to the count inside the transaction that stored the page, and
+    of that transaction only."""
+    ledger = yard.fake.ledger
+    operation = next(record for record in ledger.operations.values() if int(record["id"]) >> 32 == 104)
+    transaction = ledger.transactions[operation["transaction_hash"]]
+    effects = [record for token, record in ledger.effects.items() if token.startswith(operation["id"])]
+    trades = [record for token, record in ledger.trades.items() if token.startswith(operation["id"])]
+    assert (len(effects), len(trades)) == (5, 2)
+
+    with Session(yard.engine) as session, session.begin():
+        counts = count_stored(session)
+        store.store_transaction(session, transaction)
+        store.store_operation(session, operation)
+        for record in effects:
+            store.store_effect(session, record)
+        for record in trades:
+            store.store_trade(session, record)
+        assert (counts.inserted, counts.repeated) == ({"transactions": 1, "operations": 1, "effects": 5, "trades": 2}, {})
+        # A count is not a commit: from outside the transaction nothing of the page is there yet.
+        assert yard.count("history_transactions") == 0, "nothing is committed yet"
+    assert [yard.count(table) for table in B_BY_TABLE] == [1, 1, 5, 2]
+
+    # Met again, nothing is stored twice, and all of it is found there.
+    with Session(yard.engine) as session, session.begin():
+        counts = count_stored(session)
+        store.store_transaction(session, transaction)
+        store.store_operation(session, operation)
+        for record in effects:
+            store.store_effect(session, record)
+        for record in trades:
+            store.store_trade(session, record)
+        # A row that was there and is completed now was there.
+        assert upsert.upsert_row(
+            session, HistoryTransaction.__table__, {"id": int(transaction["paging_token"])}, {"raw": {"a": 1}}
+        ) == upsert.UpsertOutcome.ENRICHED
+        assert (counts.inserted, counts.repeated) == ({}, {"transactions": 2, "operations": 1, "effects": 5, "trades": 2})
+    assert [yard.count(table) for table in B_BY_TABLE] == [1, 1, 5, 2]
+
+    # A session that did not ask is told nothing, and stores as it always did.
+    with Session(yard.engine) as session, session.begin():
+        assert store.store_transaction(session, transaction) and upsert.COUNTING not in session.info
+
+    # A run: told of every page as it is stored, and keeping the run's own.
+    told: list[dict[str, Any]] = []
+
+    def counting(session: Session, stored: StoredCounts) -> None:
+        # Inside the transaction that stored the page: the row of the page is
+        # there to be counted, committed or not.
+        told.append(
+            {
+                **stored.as_dict(),
+                "transactions_now": session.scalar(select(func.count()).select_from(HistoryTransaction)) - 1,
+            }
+        )
+
+    with Backfill(
+        yard.pool, yard.engine, source=LOGICAL_SOURCE, page_size=1, context="parents", on_page_stored=counting
+    ) as backfill:
+        assert backfill.stored.as_dict() == {"pages": 0, "records": 0, "inserted": ZERO, "repeated": ZERO}, (
+            "nothing is the run's before a page is committed"
+        )
+        reports = backfill.run(WINDOW, streams_of(yard.engine, A))
+    assert {report.status for report in reports} == {"verified"}
+    stored = backfill.stored.as_dict()
+    # Eleven pages of records, and three empty ones that ended a stream whose
+    # last record lies above where the pool's history begins.
+    assert stored["records"] == 12 and stored["pages"] == len(told) == 15
+    assert sum(page["records"] == 0 for page in told) == 3
+    assert (stored["inserted"], stored["repeated"]) == (A_INSERTED, ZERO)
+    assert sum(page["records"] for page in told) == 12
+    assert [page["transactions_now"] for page in told if page["inserted"]["transactions"]] == [1, 2, 3, 4], (
+        "each page's transaction is already in the transaction that counts it"
+    )
+
+    # The same window read again: everything is found there, nothing inserted.
+    forget_coverage(yard.engine, A)
+    with Backfill(yard.pool, yard.engine, source=LOGICAL_SOURCE, page_size=200, context="parents") as again:
+        assert {report.status for report in again.run(WINDOW, streams_of(yard.engine, A))} == {"verified"}
+    read = again.stored.as_dict()
+    assert (read["records"], read["pages"], read["inserted"], read["repeated"]) == (12, 4, ZERO, A_INSERTED)
+
+    # A count that cannot be made takes its page with it: the two are one
+    # transaction.
+    def refuse(session: Session, stored: StoredCounts) -> None:
+        raise RuntimeError("cannot count")
+
+    with Backfill(
+        yard.pool, yard.engine, source=LOGICAL_SOURCE, page_size=1, context="parents", on_page_stored=refuse
+    ) as backfill:
+        reports = backfill.run(WINDOW, streams_of(yard.engine, B))
+    assert {report.status for report in reports} == {"failed"} and backfill.stored.as_dict() == {
+        "pages": 0,
+        "records": 0,
+        "inserted": ZERO,
+        "repeated": ZERO,
+    }
+    assert yard.count("history_transactions") == 5 and all(
+        span[0] == "pending" for spans in ranges_of(yard.engine, "account", B).values() for span in spans
+    ), "nothing of the pages whose count was refused is stored"
+
+
+def test_a_job_counts_what_it_inserted_and_what_was_there_already(yard: Yard) -> None:
+    """Read is not added. A job says of every data type what it was the first
+    to store and what it found stored — by another account's job, or by a
+    market's."""
+    job, _ = yard.plan(B)
+    assert (job.inserted, job.repeated, job.failed_slices, job.priority, job.time_spent_ms) == ({}, {}, 0, 0, 0)
+    assert finish(yard.worker) == 1
+    job = yard.job()
+    assert counted(job) == (4, 11, B_INSERTED, ZERO)
+    assert [yard.count(table) for table in B_BY_TABLE] == list(B_INSERTED.values()), (
+        "what it says it inserted is what is there"
+    )
+    assert (job.failed_slices, job.last_slice_outcome, job.last_error) == (0, "finished", None)
+    assert job.last_progress_at == yard.wall() and job.time_spent_ms > 0, "it moved forward when it stored a page"
+
+    # The market's trades: one was stored by the account's job, and is found
+    # there; the other is new, and brings its operation and its transaction.
+    market, _ = history_jobs.plan(yard.engine, kind="market", subject=MARKET, to_ledger=130, now=yard.wall())
+    assert finish(yard.worker) == 1 and history_jobs.get(yard.engine, market.id).state == DONE
+    market = history_jobs.get(yard.engine, market.id)
+    assert market is not None
+    assert counted(market) == (1, 2, {"transactions": 1, "operations": 1, "effects": 0, "trades": 1}, {**ZERO, "trades": 1})
+
+    # A's job shares a transaction and an operation with B's.
+    shared, _ = yard.plan(A)
+    assert finish(yard.worker) == 1
+    shared = yard.job(shared.id)
+    assert counted(shared) == (
+        4,
+        12,
+        {"transactions": 3, "operations": 4, "effects": 3, "trades": 0},
+        {"transactions": 1, "operations": 1, "effects": 0, "trades": 0},
+    )
+    assert yard.rows("SELECT count(*), count(DISTINCT transaction_hash) FROM history_transactions") == [(6, 6)]
+
+    # The same window read again by the same job: it repeats everything and
+    # inserts nothing, and what it counted before is still counted.
+    forget_coverage(yard.engine, A)
+    with yard.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE history_job SET state = 'waiting', next_attempt_at = :now WHERE id = :id"),
+            {"now": yard.wall(), "id": shared.id},
+        )
+    assert finish(yard.worker) == 1 and yard.job(shared.id).state == DONE
+    again = yard.job(shared.id)
+    assert again.inserted == shared.inserted, "nothing new was inserted"
+    # ...and every record it met again was there — on top of the two it had found there before.
+    assert again.repeated == {name: shared.repeated[name] + A_INSERTED[name] for name in STREAMS}
+    assert (again.pages, again.records) == (shared.pages + 4, shared.records + 12)
+    assert again.failed_slices == 0 and nothing_twice(yard.engine) is None
+
+
+def test_a_slice_that_fails_after_storing_a_page_counts_what_it_stored_and_nothing_more(yard: Yard) -> None:
+    """A page is counted as it is stored — so a slice that fails further on
+    has counted what it stored, and not the page it failed on."""
+    job, _ = yard.plan(B)
+    yard.worker = yard.new_worker("cut", page_size=1, slice_requests=200)
+    asked: list[str] = []
+
+    def cut(path: str) -> None:
+        if path == f"/accounts/{B}/trades":
+            asked.append(path)
+            if len(asked) == 3:  # its two pages of a record are stored; the request for the third is refused for good
+                yard.fake.fail(f"/accounts/{B}/trades", 503, times=1000)
+
+    yard.fake.before_answer = cut
+    assert yard.worker.once() is True
+    job = yard.job(job.id)
+    assert (job.state, job.attempts, job.failed_slices, job.last_slice_outcome) == (WAITING, 1, 1, "failed")
+    assert job.last_error is not None and job.last_error.startswith("trades: RequestFailed: Horizon answered 503")
+    # Every page of the first three streams, and the two pages of the trades
+    # before the one that was refused — and not that one.
+    assert (job.pages, job.records) == (13, 11) and (job.inserted, job.repeated) == (B_INSERTED, ZERO)
+    assert [yard.count(table) for table in B_BY_TABLE] == list(B_INSERTED.values())
+    assert fates(job) == dict.fromkeys(STREAMS, "verified") | {"trades": "failed"}
+    assert job.next_attempt_at == yard.wall() + timedelta(seconds=30) and job.last_progress_at == yard.wall()
+    assert yard.worker.last is not None and yard.worker.last.stored.pages == 13, "the slice says what it stored"
+    assert (yard.worker.failed, yard.worker.done) == (1, 0)
+
+    # Tried again: the refused request is gone on with, and nothing is counted twice.
+    yard.fake.before_answer, yard.fake.faults = None, []
+    yard.wall.wait(31)
+    assert finish(yard.worker) == 1 and yard.job(job.id).state == DONE
+    job = yard.job(job.id)
+    # The refused page is taken again: an empty page, that ends the stream.
+    assert (job.inserted, job.repeated, job.pages, job.records) == (B_INSERTED, ZERO, 14, 11)
+    assert job.failed_slices == 1 and job.last_slice_outcome == "finished" and job.last_error is None
+    assert verified(ranges_of(yard.engine, "account", B), 100, 130)
+
+
+def test_the_worker_of_events_stores_through_the_same_rules_and_is_not_counted(yard: Yard) -> None:
+    """The worker of events may store a transaction first. The job of that
+    account finds it there when it reads — and nothing of what the worker
+    stored was ever counted for a job."""
+    from app.notifier import format as notifier_format
+    from app.storage import events as journal
+    from app.worker.loader import Worker
+    from tests.fake_notifier import notification
+
+    job, _ = yard.plan(B)
+    notice = notifier_format.read(notification(yard.fake, str((100 << 32) | 1), subscription="s"))
+    journal.receive(yard.engine, notice, received_at=yard.wall(), headers={}, signed_by="G-test")
+    with Worker(
+        yard.pool, yard.engine, name="events", max_attempts=3, retry_base=5.0, lease_seconds=120, clock=yard.wall
+    ) as events:
+        assert events.once() is True
+    assert (yard.count("history_transactions"), yard.count("history_operations"), yard.count("history_effects")) == (1, 1, 2)
+    job = yard.job(job.id)
+    assert (job.inserted, job.repeated, job.pages, job.records, job.slices) == ({}, {}, 0, 0, 0), (
+        "a job that read nothing counts nothing"
+    )
+
+    # The job reads: the transaction, its operation and one effect of it are
+    # found there; the rest is its own.
+    assert finish(yard.worker) == 1 and yard.job(job.id).state == DONE
+    job = yard.job(job.id)
+    assert counted(job) == (
+        4,
+        11,
+        {"transactions": 1, "operations": 1, "effects": 4, "trades": 2},
+        {"transactions": 1, "operations": 1, "effects": 1, "trades": 0},
+    )
+
+    # And after the job is done the worker goes on storing, and the job's
+    # numbers do not move.
+    before = counted(job)
+    yard.fake.close(paid(131, A, B), latest=132)
+    notice = notifier_format.read(notification(yard.fake, str((131 << 32) | 1), subscription="s"))
+    journal.receive(yard.engine, notice, received_at=yard.wall(), headers={}, signed_by="G-test")
+    with Worker(
+        yard.pool, yard.engine, name="events", max_attempts=3, retry_base=5.0, lease_seconds=120, clock=yard.wall
+    ) as events:
+        assert events.once() is True
+    assert yard.count("history_transactions") == 3
+    assert counted(yard.job(job.id)) == before and nothing_twice(yard.engine) is None
+
+
+def test_what_a_job_counted_is_kept_through_another_worker_and_another_process(yard: Yard) -> None:
+    """The numbers are the database's, not a worker's: a new worker in a new
+    process finds them and goes on counting from there."""
+    job, _ = yard.plan(B)
+    yard.worker = yard.new_worker("small", slice_requests=1)
+    assert yard.worker.once() is True and yard.worker.once() is True
+    before = counted(yard.job(job.id))
+    asked = len(yard.fake.requests)
+    assert before == (2, 4, {"transactions": 2, "operations": 2, "effects": 0, "trades": 0}, ZERO), "somewhere in the middle"
+
+    yard.restart(slice_requests=200)
+    assert yard.worker.name == "worker-2" and yard.pool.stats.requests == 0, "nothing of the old process is left"
+    assert counted(yard.job(job.id)) == before, "the numbers are the database's"
+    assert finish(yard.worker) == 1 and yard.job(job.id).state == DONE
+    job = yard.job(job.id)
+    assert counted(job) == (4, 11, B_INSERTED, ZERO)
+    assert job.requests == len(yard.fake.requests) and job.requests > asked, "what both processes asked is one count"
+    assert [yard.count(table) for table in B_BY_TABLE] == list(B_INSERTED.values())
+
+
+# -- priority: sooner, and nobody left waiting ------------------------------------------
+
+
+def longest_wait(order: list[str], needs: dict[str, int]) -> dict[str, int]:
+    """For each subject, the most slices in a row that others got while it
+    still needed one."""
+    left, longest, last = dict(needs), dict.fromkeys(needs, 0), dict.fromkeys(needs, -1)
+    for number, subject in enumerate(order):
+        for who in needs:
+            if who != subject and left[who] > 0:
+                longest[who] = max(longest[who], number - last[who] - 1)
+        last[subject], left[subject] = number, left[subject] - 1
+    return longest
+
+
+def test_a_prioritised_subject_is_served_sooner_and_nobody_is_left_waiting(yard: Yard) -> None:
+    """A job of priority N is served as if it had last been served N
+    ten-minute steps earlier: it goes first until the others have caught up
+    with that lead, and then each of them gets a slice in turn. The order is
+    one the rule tells in advance."""
+    yard.plan(A)
+    yard.plan(B)
+    history_jobs.plan(yard.engine, kind="market", subject=MARKET, to_ledger=130, now=yard.wall())
+    assert history_jobs.set_priority(yard.engine, priority=1, kind="account", subject=B) == 1
+    job = yard.job(2)
+    assert job.priority == 1 and (job.state, job.attempts, job.last_slice_at) == (WAITING, 0, None), (
+        "nothing else of it is touched"
+    )
+    assert yard.job(1).priority == 0
+    with pytest.raises(ValueError, match="say which jobs"):
+        history_jobs.set_priority(yard.engine, priority=1)
+
+    # Pages of one record, one page a slice. A stream ends with an empty
+    # page, which is a slice too, or with the source's 410, which is a slice
+    # that stores nothing: how many slices each needs.
+    needs = {A: 16, B: 15, MARKET: 3}
+    expected = in_turn(dict(needs), priority={B: 1}, step=60)
+    assert expected[:3] == [B, A, MARKET], "never served before all others; the prioritised one first among them"
+    assert len(expected) == sum(needs.values()) == 34
+
+    yard.worker = yard.new_worker("fair", slice_requests=1, page_size=1)
+    order: list[str] = []
+    for _ in range(sum(needs.values())):
+        assert yard.worker.once() is True and yard.worker.last is not None
+        order.append(yard.worker.last.subject)
+        yard.wall.wait(60)  # a minute a slice: a point of priority is worth ten slices
+    assert order == expected, "the order is the one the rule tells"
+    assert history_jobs.counts(yard.engine)["done"] == 3 and yard.worker.once() is False
+
+    assert order[0] == B and order[:20].count(B) > order[:20].count(A), "the larger share is the prioritised one's"
+    assert len(order) - 1 - order[::-1].index(B) < len(order) - 1 - order[::-1].index(A), (
+        "it needed one slice less than A and finished far sooner"
+    )
+    waits = longest_wait(order, needs)
+    assert max(waits.values()) <= 10 + 2, f"nobody waits for good: {waits}"
+    assert {who: order.count(who) for who in needs} == needs, "every subject got all its slices"
+    assert history_jobs.set_priority(yard.engine, priority=5, ids=[999]) == 0, "there is no such job"
+
+
+# -- the pause of the whole queue ------------------------------------------------------
+
+
+def test_the_pause_of_the_whole_queue_stops_history_and_nothing_else(yard: Yard) -> None:
+    """One record in the database stops every worker's taking; no job is
+    touched; the worker of events goes on; a slice that is on ends where it
+    stands; and it outlives every process."""
+    from app.notifier import format as notifier_format
+    from app.storage import events as journal
+    from app.worker.loader import Worker
+    from tests.fake_notifier import notification
+
+    first, _ = yard.plan(B)
+    second, _ = yard.plan(A)
+    said = history_jobs.pause_all(yard.engine, because="the servers are being moved", by="owner", now=yard.wall())
+    moment = yard.wall().isoformat(timespec="milliseconds")
+    assert said == {
+        "paused": True,
+        "because": "the servers are being moved",
+        "by": "owner",
+        "at": moment,
+        "resumed_by": None,
+        "resumed_at": None,
+    }
+    assert history_jobs.pause_state(yard.engine) == said and history_jobs.is_paused(yard.engine)
+    assert yard.rows("SELECT name FROM service_state WHERE name = 'history_paused'") == [("history_paused",)]
+    assert history_jobs.take(yard.engine, "whoever", lease_seconds=60, now=yard.wall()) is None, "whoever asks"
+    assert yard.worker.once() is False and yard.fake.requests == []
+    assert (yard.job(first.id).state, yard.job(second.id).state) == (WAITING, WAITING), "no job is touched"
+    assert history_jobs.counts(yard.engine)[PAUSED] == 0, "and it is not `pause --all`: the jobs are not paused"
+
+    # The worker of events takes nothing from this queue and is not stopped.
+    notice = notifier_format.read(notification(yard.fake, str((100 << 32) | 1), subscription="s"))
+    journal.receive(yard.engine, notice, received_at=yard.wall(), headers={}, signed_by="G-test")
+    with Worker(
+        yard.pool, yard.engine, name="events", max_attempts=3, retry_base=5.0, lease_seconds=120, clock=yard.wall
+    ) as events:
+        assert events.once() is True
+    assert yard.count("history_transactions") == 1
+
+    # Another process, another engine: the pause is still there.
+    yard.restart()
+    assert history_jobs.pause_state(yard.engine) == said and yard.worker.once() is False
+    assert history_jobs.resume_all(yard.engine, by="owner", now=yard.wall()) == {
+        **said,
+        "paused": False,
+        "resumed_by": "owner",
+        "resumed_at": moment,
+    }, "what the pause said stays; it is over, and says who ended it"
+    assert history_jobs.pause_state(yard.engine)["paused"] is False
+    assert (yard.job(first.id).state, yard.job(first.id).next_attempt_at) == (WAITING, yard.wall())
+
+    # A slice that is on when the pause comes ends where it stands: what it
+    # stored is stored and counted, the job is not paused and has not
+    # failed, and the page it was on is taken again after the resume.
+    history_jobs.plan(yard.engine, kind="market", subject=MARKET, to_ledger=130, now=yard.wall())
+    yard.worker = yard.new_worker("cut", page_size=1, slice_requests=200)
+    paused: list[str] = []
+
+    def pause_mine(path: str) -> None:
+        if path == f"/accounts/{B}/operations" and not paused:
+            paused.append(path)
+            history_jobs.pause_all(yard.engine, because="enough for now", by="owner", now=yard.wall())
+
+    yard.fake.before_answer = pause_mine
+    assert yard.worker.once() is True
+    job = yard.job(first.id)
+    last = yard.worker.last
+    assert paused and last is not None and (last.outcome, last.state) == ("progress", WAITING)
+    assert "history queue is paused" in (last.error or "")
+    assert (job.state, job.attempts, job.failed_slices, job.last_slice_outcome, job.last_error) == (
+        WAITING, 0, 0, "progress", None
+    )
+    # Two pages of transactions and one of operations were stored, and are
+    # counted — the transaction the worker of events stored first as found
+    # there, the rest as inserted.
+    assert counted(job) == (
+        3,
+        3,
+        {"transactions": 1, "operations": 1, "effects": 0, "trades": 0},
+        {"transactions": 1, "operations": 0, "effects": 0, "trades": 0},
+    )
+    asked = len(yard.fake.requests)
+    assert yard.worker.once() is False and len(yard.fake.requests) == asked and yard.worker.failed == 0
+
+    # What was never served goes first once the queue goes again: A's job is
+    # read whole. Then the market's: its first page is answered, and the
+    # request for the parent of its trade is where the pause is seen — so
+    # the page it was in the middle of stores nothing.
+    def pause_at_the_trades(path: str) -> None:
+        if path == "/trades" and len(paused) == 1:
+            paused.append(path)
+            history_jobs.pause_all(yard.engine, because="once more", by="owner", now=yard.wall())
+
+    yard.fake.before_answer = pause_at_the_trades
+    assert history_jobs.resume_all(yard.engine, by="owner", now=yard.wall())["paused"] is False
+    assert yard.worker.once() is True and yard.job(second.id).state == DONE
+    assert yard.worker.once() is True and len(paused) == 2
+    market = history_jobs.get(yard.engine, 3)
+    assert market is not None
+    assert (market.state, market.attempts, market.failed_slices, market.last_slice_outcome) == (WAITING, 0, 0, "progress")
+    assert (market.pages, market.records, market.inserted, market.repeated) == (0, 0, {}, {}), (
+        "the page it was on is not stored, and nothing is counted"
+    )
+    assert yard.worker.once() is False
+
+    history_jobs.resume_all(yard.engine, by="owner", now=yard.wall())
+    assert finish(yard.worker) == 2, "B's job goes on from where it stood, and the market's page is taken again"
+    assert (yard.job(first.id).state, history_jobs.get(yard.engine, 3).state) == (DONE, DONE)
+    assert counted(yard.job(first.id)) == (
+        14,
+        11,
+        {"transactions": 1, "operations": 1, "effects": 4, "trades": 2},
+        {"transactions": 1, "operations": 1, "effects": 1, "trades": 0},
+    )
+    market = history_jobs.get(yard.engine, 3)
+    assert market is not None and counted(market) == (
+        3,
+        2,
+        {"transactions": 1, "operations": 1, "effects": 0, "trades": 1},
+        {**ZERO, "trades": 1},
+    )
+    assert verified(ranges_of(yard.engine, "account", B), 100, 130) and nothing_twice(yard.engine) is None
+
+
+# -- the worker's word of itself --------------------------------------------------------
+
+
+def test_the_worker_says_of_itself_and_its_word_stays_fresh(
+    yard: Yard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``heartbeat.history`` the worker says that it is there and what
+    it is doing — when it is news, and at least every so often while it
+    runs, with an empty queue or a paused one no less. The time is its own
+    clock, and no poll is a write."""
+    said: list[dict[str, Any]] = []
+    beat = heartbeats.beat
+    monkeypatch.setattr(
+        heartbeats, "beat", lambda engine, record, **state: (said.append(dict(state)), beat(engine, record, **state))
+    )
+
+    def heard() -> dict[str, Any]:
+        word = heartbeats.read(yard.engine, "heartbeat.history")
+        assert word is not None
+        return word
+
+    assert heartbeats.read(yard.engine, "heartbeat.history") is None
+    assert yard.worker.once() is False, "the queue is empty"
+    moment = yard.wall().isoformat(timespec="milliseconds")
+    assert heard() == {
+        "at": moment,
+        "name": "worker-1",
+        "state": "idle",
+        "job_id": None,
+        "slices_done": 0,
+        "slices_failed": 0,
+    }
+    for _ in range(5):
+        assert yard.worker.once() is False
+    assert len(said) == 1, "not on every poll: nothing changed, and the word is not old"
+
+    job, _ = yard.plan(B)
+    yard.worker = yard.new_worker("one", page_size=1)  # one worker from here on: its counts are its own
+    on_the_way: list[dict[str, Any]] = []
+    yard.fake.before_answer = lambda path: on_the_way.append(heard())
+    assert yard.worker.once() is True and yard.job(job.id).state == DONE
+    assert (on_the_way[0]["state"], on_the_way[0]["job_id"], on_the_way[0]["at"]) == ("working", job.id, moment), (
+        "while a slice is on, the word says so, by the worker's clock"
+    )
+    after = heard()
+    assert (after["state"], after["job_id"], after["slices_done"], after["slices_failed"]) == ("idle", None, 1, 0)
+
+    yard.fake.before_answer = None
+    yard.fake.fail(f"/accounts/{A}/trades", 503, times=1000)  # for good: the client's retries too
+    yard.plan(A)
+    assert yard.worker.once() is True and heard()["slices_failed"] == 1, "a slice that failed is counted"
+    yard.fake.faults.clear()
+    yard.wall.wait(31)
+    assert finish(yard.worker) == 1 and heard()["slices_done"] == 2 and heard()["slices_failed"] == 1
+
+    history_jobs.pause_all(yard.engine, because="for now", by="owner", now=yard.wall())
+    assert yard.worker.once() is False and heard()["state"] == "paused", "a paused queue is told from a stopped service"
+    history_jobs.resume_all(yard.engine, by="owner", now=yard.wall())
+
+    # With time passing: the word is said again at least every
+    # ``heartbeat_seconds`` while the loop runs, however empty the queue.
+    live = HistoryWorker(yard.pool, yard.engine, name="live", heartbeat_seconds=0.05, slice_seconds=30)
+    stop = threading.Event()
+    thread = threading.Thread(target=live.run, args=(stop,), kwargs={"poll_seconds": 0.005})
+    said.clear()
+    thread.start()
+    time.sleep(0.6)
+    stop.set()
+    thread.join(30)
+    assert not thread.is_alive() and len(said) >= 4, f"said {len(said)} times in six tenths of a second"
+    word = heartbeats.read(yard.engine, "heartbeat.history")
+    assert word is not None and word["name"] == "live" and word["state"] == "idle"
+    assert abs(datetime.now(UTC) - datetime.fromisoformat(word["at"])) < timedelta(seconds=2), "the word is fresh"
+
+    # And not more often than that: with the default, a quiet second of
+    # polling is one word.
+    quiet = HistoryWorker(yard.pool, yard.engine, name="quiet")
+    said.clear()
+    thread = threading.Thread(target=quiet.run, args=(stop,), kwargs={"poll_seconds": 0.005})
+    stop.clear()
+    thread.start()
+    time.sleep(0.4)
+    stop.set()
+    thread.join(30)
+    assert not thread.is_alive() and len(said) == 1, "the first word; then nothing until it grows old"
+
+
 # -- the commands ------------------------------------------------------------------
 
 
@@ -975,5 +1594,86 @@ def test_what_the_commands_are_told_to_plan_is_checked_and_said(
         assert [row[0] for row in loaded] == [100, 104], "the transactions met by the account planned with full"
         others = "ledger_sequence IN (108, 110) AND cardinality(context_loaded) > 0"
         assert yard.rows(f"SELECT count(*) FROM history_transactions WHERE {others}") == [(0,)]
+    finally:
+        yard.close()
+
+
+def test_the_pause_of_the_queue_the_priority_and_the_json_line_as_commands(
+    make_database: Callable[[], str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from app.storage import heartbeats
+
+    yard = Yard(make_database(), FakeHorizon())
+    try:
+        commands(monkeypatch, yard)
+        ok = history_cli.OK
+        assert history_cli.main(["enqueue", "--account", B, "--to-ledger", "130"]) == ok
+        capsys.readouterr()
+
+        # The pause of the whole queue: one record, no job touched — and not
+        # the same as `pause --all`.
+        assert history_cli.main(["pause", "--queue", "--because", "maintenance"]) == ok
+        out = capsys.readouterr().out
+        assert "the queue is paused: maintenance (by python -m app.history, at " in out
+        assert history_jobs.pause_state(yard.engine)["paused"] is True and history_jobs.counts(yard.engine)[PAUSED] == 0
+        assert history_cli.main(["once"]) == ok and "nothing to do" in capsys.readouterr().out
+        assert history_cli.main(["status"]) == ok
+        out = capsys.readouterr().out
+        assert "queue: 1 waiting, 0 running, 0 done, 0 partial, 0 error, 0 paused" in out
+        assert "the queue is paused: maintenance (by python -m app.history" in out
+        assert "nothing is taken until `python -m app.history resume --queue`; the jobs themselves are not paused" in out
+        word = heartbeats.read(yard.engine, "heartbeat.history")
+        assert word is not None
+        assert (
+            f"history service {word['name']}: paused at {word['at']}, 0 job(s) done, 0 slice(s) failed" in out
+        ), "the worker's last word, as it is"
+
+        assert history_cli.main(["priority", "3", "--account", B]) == ok
+        assert "1 job(s) at priority 3" in capsys.readouterr().out and yard.job().priority == 3
+        assert history_cli.main(["priority", "0", "--id", "1"]) == ok and yard.job().priority == 0
+        assert history_cli.main(["resume", "--queue"]) == ok
+        out = capsys.readouterr().out
+        assert "the queue goes again: it was paused at" in out and "by python -m app.history because maintenance" in out
+        assert history_jobs.pause_state(yard.engine)["paused"] is False
+
+        # One slice, in the JSON log: what the slice says of itself is in the
+        # line, next to the message — the job, its subject, its streams, what
+        # it stored, how it ended. No record in it, nothing secret.
+        assert history_cli.main(["--log-format", "json", "once", "--slice-requests", "200"]) == ok
+        out, err = capsys.readouterr()
+        job = yard.job()
+        assert "job 1 (account" in out and "inserted transactions=2 operations=2 effects=5 trades=2, repeated -" in out
+        lines = [json.loads(line) for line in err.splitlines()]
+        assert lines and all(set(line) == {"time", "level", "logger", "message"} for line in lines if "slice" not in line)
+        said = [line for line in lines if "slice" in line]
+        assert len(said) == 1 and said[0]["logger"] == "app.history.runner" and said[0]["level"] == "INFO"
+        line = said[0]
+        assert set(line) == {"time", "level", "logger", "message", "slice"}
+        slice_ = line["slice"]
+        assert (slice_["job_id"], slice_["kind"], slice_["subject"], slice_["priority"]) == (1, "account", B, 0)
+        assert (slice_["outcome"], slice_["state"], slice_["error"], slice_["asked_again_in"]) == (
+            "finished", "done", None, None
+        )
+        assert slice_["streams"] == dict.fromkeys(STREAMS, "verified") and slice_["window"] == [100, 130]
+        assert (slice_["requests"], slice_["pages"], slice_["records"]) == (job.requests, 4, 11)
+        assert (slice_["inserted"], slice_["repeated"]) == (B_INSERTED, ZERO) and slice_["duration_seconds"] >= 0
+        assert slice_["cursor"] == dict.fromkeys(STREAMS) and slice_["reached"] == {}, "a finished stream left no checkpoint"
+        assert f"job 1 (account {B}): finished, the job is done" in line["message"]
+        assert "xdr" not in json.dumps(line).lower()
+
+        # The text log says the same in its line, and nothing else.
+        assert history_cli.main(["enqueue", "--account", A, "--to-ledger", "130"]) == ok
+        capsys.readouterr()
+        assert history_cli.main(["once", "--slice-requests", "200"]) == ok
+        out, err = capsys.readouterr()
+        said = [line for line in err.splitlines() if "app.history.runner" in line]
+        assert len(said) == 1 and "slice" not in said[0] and "{-" not in said[0]
+        assert f"job 2 (account {A}): finished, the job is done" in said[0]
+        assert "inserted transactions=3 operations=4 effects=3, repeated transactions=1 operations=1" in said[0]
+        assert "streams transactions=verified operations=verified effects=verified trades=verified" in said[0]
+        # One line for the slice, and the few a verified range says — never one per record.
+        lines = [line for line in err.splitlines() if line.strip()]
+        assert all(any(f" {level} " in line for level in ("INFO", "WARNING", "ERROR")) for line in lines)
+        assert len(lines) == 5, lines
     finally:
         yard.close()

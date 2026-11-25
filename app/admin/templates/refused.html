@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Отказано{% endblock %}
+{% block content %}
+<div class="narrow">
+  <h1>Запрос не выполнен</h1>
+  <div class="notice notice-error">{{ why }}</div>
+  <p><a href="/admin">Вернуться на дашборд</a></p>
+</div>
+{% endblock %}

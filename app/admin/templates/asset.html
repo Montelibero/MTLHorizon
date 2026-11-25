@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_lists.html" as l with context %}
+{% block title %}Актив {{ l.code(row.asset_id) }}{% endblock %}
+{% block content %}
+{% set native = row.asset_id == "native" %}
+{% set where = "/admin/assets/" ~ (row.asset_id | urlencode) %}
+<h1>Актив <span class="mono">{{ l.code(row.asset_id) }}</span></h1>
+<p>{{ m.copy(row.asset_id) }}{% if not native %} <span class="hint">эмитент</span> {{ m.copy(row.asset_id.split(":")[1]) }}{% endif %}</p>
+{% if started %}{{ l.started(started) }}{% endif %}
+<div class="card">
+  <dl class="props">
+    <dt>«Включён»</dt><dd>{{ l.onoff(row.enabled, "да — новые события с активом собираются", "нет — новые события с активом не собираются") }}</dd>
+    <dt>«Discovery»</dt><dd>{% if native %}<span class="muted">нельзя — native держит каждый аккаунт сети</span>{% else %}{{ l.onoff(row.discover, "да — держателей его trustline ищут проходы", "нет — держателей не ищут") }}{% endif %}</dd>
+    <dt>Подписка</dt><dd>{{ l.subscription(row.subscription) }}<div class="hint">её хотят правила:</div>{{ l.wanted(row.rules) }}</dd>
+    <dt>Найдено аккаунтов</dt><dd>{{ row.found_by | num }} <span class="hint">записаны найденными этим активом ·</span> <a href="/admin/accounts?origin=discovery">все найденные discovery →</a></dd>
+    <dt>Последний проход</dt>
+    <dd>
+      {% if row.last_run %}{{ m.badge(row.last_run.state) }} <span class="hint">{{ m.when(row.last_run.started_at) }}</span>
+        <div class="hint">{{ row.last_run.pages | num }} стр. · найдено {{ row.last_run.found | num }} · новых {{ row.last_run.added | num }} · уже включены {{ row.last_run.already | num }} · отключены {{ row.last_run.disabled | num }} · без линии {{ (row.last_run.found - row.last_run.with_line) | num }}</div>
+        {% if row.last_run.last_address %}<div class="hint">дошёл до {{ row.last_run.last_address | short(8) }}{% if row.last_run.state == "incomplete" %} и остановился: {{ row.last_run.last_error }}{% endif %}</div>{% endif %}
+      {% else %}<span class="muted">ещё не проходил</span>{% endif %}
+    </dd>
+    <dt>Добавлен</dt><dd>{{ m.when(row.created_at) }}</dd>
+    <dt>Причина</dt><dd>{{ row.reason }}</dd>
+  </dl>
+</div>
+<div class="row">
+  {{ l.toggle(where ~ "/enabled", csrf, row.enabled,
+       "Выключить сбор новых событий по активу " ~ l.code(row.asset_id) ~ "? Уже собранная история останется; discovery и рынки, где есть этот актив, не тронуты.",
+       "Включить сбор новых событий по активу " ~ l.code(row.asset_id) ~ "?",
+       off_label="Выключить (новые события)", on_label="Включить (новые события)") }}
+  {% if not native %}
+    {{ l.toggle(where ~ "/discover", csrf, row.discover,
+         "Снять пометку discovery с актива " ~ l.code(row.asset_id) ~ "? Прохождения перестанут искать его держателей; найденные аккаунты останутся в списке.",
+         "Пометить актив " ~ l.code(row.asset_id) ~ " для discovery? Его держателей ищут проходы; первый запуск — явный, кнопками ниже.",
+         field="discover", off_label="Снять пометку discovery", on_label="Пометить для discovery") }}
+  {% endif %}
+  <a class="btn" href="/admin/discovery">Проходы discovery →</a>
+</div>
+
+<h2 id="discovery">Поиск держателей (discovery)</h2>
+<div class="card">
+  <p><strong>Что делает проход.</strong> Читает у Horizon аккаунты, у которых есть линия (trustline) на этот актив, страницами по 200, и добавляет новых в список наблюдения — включёнными и с пометкой, через кого найдены. <strong>Держатель — это тот, у кого есть линия: нулевой баланс тоже считается.</strong></p>
+  <p><strong>Эмитент не добавляется</strong>: выпустить актив — не держать его.</p>
+  <p><strong>История актива — не история его нынешних держателей.</strong> У Horizon нет endpoint'а «все операции с активом», поэтому собирается история аккаунтов из списка наблюдения: найденные держатели получат свою, а закрывшие линию до прохода или не попавшие в него — только то, что уже сохранено. <strong>Полнота не обещается.</strong></p>
+  <p><strong>Закрытая trustline</strong> с этого момента не наблюдается: закрытие линии ничего не выключает и ничего не стирает, но и новых открытий не принесёт. Момент открытия линии между проходами виден по эффекту <code>trustline_created</code> успешной транзакции — и его приносит подписка по правилу discovery.</p>
+  <p><strong>Проход — не снимок сети:</strong> он идёт время, и страницы могут ответить разные серверы. О каждом проходе записано, кто и когда отвечал и до какого адреса он дошёл; не дошедший до конца помечен <code>incomplete</code> и продолжается с того же места. Повторный проход безопасен: аккаунт добавляется один раз, уже наблюдаемый не меняется, выключенный вручную остаётся выключенным.</p>
+  <p><strong>Сухой проход (dry run)</strong> не пишет ничего — ни аккаунтов, ни записи о проходе. Его итог — сколько найдено, сколько новых, сколько уже включены и сколько отключены, где он остановился — на странице задачи.</p>
+</div>
+{% if not native %}
+  {% if not row.discover %}<p class="hint">Актив сейчас не пометен для discovery. Разовый проход всё равно добавит держателей, но между проходами новые открытия trustline замечены не будут — их приносит подписка по правилу discovery. Нужно и это — поставьте пометку кнопкой выше.</p>{% endif %}
+  {% if stopped %}<p class="hint">Прошлый проход не дошёл до конца и остановился после адреса {{ stopped | short(8) }}: «Запустить проход» с отметкой «продолжить» пойдёт дальше от этого места.</p>{% endif %}
+  <div class="row">
+    {{ l.run_form(row.asset_id, csrf, dry=True, most=most) }}
+    {{ l.run_form(row.asset_id, csrf, dry=False, stopped=stopped, most=most) }}
+  </div>
+  <p class="hint">Обе кнопки только ставят задачу в очередь — по одной на актив; выполняет её воркер в фоне. «Показать результат» — на странице задачи: у сухого прохода это всё, что он оставит, у настоящего — сколько пройдено страниц и где он остановился.</p>
+{% else %}
+  <p class="hint">Для native поиска держателей нет: его держит каждый аккаунт сети.</p>
+{% endif %}
+
+{% if not native %}
+<h2>Задачи discovery по этому активу</h2>
+{{ l.tasks_table(tasks, figures, "Задач по этому активу ещё не было.", how_far, stopped_because) }}
+<h2>Прохождения</h2>
+{{ l.runs_table(runs) }}
+{% endif %}
+{% endblock %}

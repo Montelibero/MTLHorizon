@@ -321,6 +321,40 @@ def test_nothing_is_decided_until_the_transaction_is_stored_whole(shop: Shop) ->
     assert [change.outcome for change in events.find_and_add(shop.engine, [EUR], now=shop.wall())] == [watched.ADDED]
 
 
+def test_a_transaction_whose_job_finished_hours_late_is_found_by_the_next_look(shop: Shop) -> None:
+    """The servers did not answer for two hours while the looks went on every
+    minute, each moving its place forward. A look reads what finished since
+    the look before it — by the time of the finishing, not by the ledger — so
+    the transaction is found by the first look after its job is done, however
+    late and whatever its ledger."""
+    mark(shop, EUR)
+    shop.fake.close(Transaction(121, 0, D, [trust(D, EUR)], {D}, {1: {D}}), latest=122)
+    digest = next(hash_ for hash_, record in shop.fake.ledger.transactions.items() if record["ledger"] == 121)
+    shop.fake.down = refused()
+    shop.receive(shop.notice(str((121 << 32) | 1), subscription="asset-sub"))
+    shop.worker.once()
+    assert shop.job().state == "pending" and shop.job().attempts == 0  # the servers' state, not the job's failure
+    for minute in range(120):
+        shop.wall.wait(60)
+        assert events.find_and_add(shop.engine, [EUR], now=shop.wall()) == []
+    # Two hours after the first look, and long after its ledger: the servers are back.
+    shop.fake.down = None
+    shop.clock.sleep(4000)  # its cooldown doubled all the while it was down; long past it now
+    shop.wall.wait(4000)
+    shop.worker.once()
+    assert shop.job().state == "done"
+    found_now = events.find_and_add(shop.engine, [EUR], now=shop.wall())
+    assert [change.outcome for change in found_now] == [watched.ADDED]
+    found = tracked(shop, D)
+    assert found is not None and found.origin == "discovery"
+    again = events.find_and_add(shop.engine, [EUR], now=shop.wall())
+    assert [change.outcome for change in again] == [watched.ENABLED], "read again within the margin, and nothing added twice"
+    shop.wall.wait(360)
+    events.find_and_add(shop.engine, [EUR], now=shop.wall())  # the place moves past the margin…
+    shop.wall.wait(1)
+    assert events.find_and_add(shop.engine, [EUR], now=shop.wall()) == []  # …and then it is not read any more
+
+
 def test_a_manual_addition_takes_the_same_road(shop: Shop) -> None:
     with Session(shop.engine) as session, session.begin():
         first = watched.add_account(session, address(900), reason="added by hand", origin=watched.MANUAL)

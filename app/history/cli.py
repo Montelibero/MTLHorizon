@@ -3,18 +3,30 @@
 Commands: ``run`` (give the queue's jobs slices until stopped — the service),
 ``once`` (one slice), ``status`` (the queue, asking nothing of any server),
 ``pause`` and ``resume`` (by hand), ``retry`` (jobs that gave up back into
-the queue), ``enqueue`` (plan the history of accounts, or of markets).
+the queue), ``enqueue`` (plan the history of accounts, or of markets),
+``priority`` (say how much sooner jobs are served than the others).
 
 A history import is planned once and then works its way through the pool's
 history slice by slice; nobody has to watch it. What it has not verified is
 said here and not papered over: a stream that keeps failing is named, and so
 is the range above which events are not guaranteed yet.
+
+A pause is one of two things. ``pause --id``, ``--account``, ``--market`` or
+``--all`` stops jobs, each on its own, with the reason kept on each.
+``pause --queue`` stops the queue as a whole — one record, no job touched —
+until ``resume --queue``; it is the one to reach for to make the whole import
+stand still, and the one a dashboard lifts.
+
+With ``--log-format json`` a log line is one object, and what a slice says
+of itself (``app.history.runner``) is in it as ``slice``, next to the
+message. The text log says the same in the message.
 """
 
 from __future__ import annotations
 
 import argparse
 import faulthandler
+import json
 import logging
 import signal
 import sys
@@ -28,7 +40,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 from stellar_sdk import StrKey
 
-from app import __version__
+from app import __version__, cli_common
 from app.backfill import config as watch_lists
 from app.backfill.jobs import market_key
 from app.cli_common import configure_logging, engine_for, make_client, print_table, require_schema, short_name
@@ -44,7 +56,7 @@ from app.history.runner import (
     Slice,
 )
 from app.sources.horizon import RateLimited, Unavailable
-from app.storage import history_jobs
+from app.storage import heartbeats, history_jobs
 from app.storage.models import HistoryJob, TrackedAccount, TrackedMarket
 
 logger = logging.getLogger("app.history")
@@ -52,14 +64,21 @@ logger = logging.getLogger("app.history")
 OK, FAILED, STOPPED = 0, 1, 2
 
 TAKEN_BACK = "`python -m app.history %s` takes them back"
+# Who paused or resumed the queue, as the record of the pause says of a
+# command line: the command, for a command has nobody's name.
+BY = "python -m app.history"
 # The streams of an account, in the order a person reads them. What a job
 # kept comes back in the order JSON keeps keys, which is none.
 STREAMS = ("transactions", "operations", "effects", "trades")
+# What a log call says next to its message, for a line that is JSON: one
+# object under its own name — the ``slice`` of ``app.history.runner``.
+FIELDS = ("slice",)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     stream = configure_logging(args.log_format, args.log_level, args.log_file)
+    _say_fields()
     # `kill -USR1 <pid>` writes the stack of every thread to the log.
     try:
         faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True)
@@ -74,6 +93,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return STOPPED
+
+
+class JsonLinesWithFields(cli_common.JsonLines):
+    """The JSON line of the command lines, with what a log call says besides
+    its message. A line is one object still: what a machine reads is in the
+    object, not in the message."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        line = json.loads(super().format(record))
+        for name in FIELDS:
+            if record.__dict__.get(name) is not None:
+                line[name] = record.__dict__[name]
+        return json.dumps(line, ensure_ascii=False)
+
+
+def _say_fields() -> None:
+    """Have the JSON lines say what a log call says besides its message. A
+    text line says it in the message itself."""
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler.formatter, cli_common.JsonLines):
+            handler.setFormatter(JsonLinesWithFields())
 
 
 # -- commands ------------------------------------------------------------------
@@ -135,6 +175,8 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
     """The queue. Nothing is asked of any server."""
     engine = engine_for(settings)
     counts = history_jobs.counts(engine)
+    held = history_jobs.pause_state(engine)
+    heard = heartbeats.read(engine, heartbeats.HISTORY)
     with Session(engine) as session:
         next_try = session.scalar(
             select(func.min(HistoryJob.next_attempt_at)).where(HistoryJob.state == history_jobs.WAITING)
@@ -178,6 +220,14 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
         f"{counts[history_jobs.DONE]} done, {counts[history_jobs.PARTIAL]} partial, "
         f"{counts[history_jobs.ERROR]} error, {counts[history_jobs.PAUSED]} paused"
     )
+    if held["paused"]:
+        print(f"the queue is paused: {held['because']} (by {held['by']}, at {held['at']})")
+        print("nothing is taken until `python -m app.history resume --queue`; the jobs themselves are not paused")
+    if heard:
+        print(
+            f"history service {heard.get('name')}: {heard.get('state')} at {heard.get('at')}, "
+            f"{heard.get('slices_done')} job(s) done, {heard.get('slices_failed')} slice(s) failed"
+        )
     if next_try is not None:
         print(f"next try at {_when(next_try)}")
     if running:
@@ -253,9 +303,14 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def command_pause(args: argparse.Namespace, settings: Settings) -> int:
-    """Stop working on jobs until they are resumed."""
+    """Stop working on jobs until they are resumed: the jobs named, or —
+    ``--queue`` — the whole queue, with no job touched."""
     engine = engine_for(settings)
     try:
+        if args.queue:
+            state = history_jobs.pause_all(engine, because=args.because, by=BY, now=datetime.now(UTC))
+            print(f"the queue is paused: {state['because']} (by {state['by']}, at {state['at']})")
+            return OK
         paused = _selected(engine, args, lambda **which: history_jobs.pause(engine, because=args.because, **which))
     finally:
         engine.dispose()
@@ -264,13 +319,34 @@ def command_pause(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def command_resume(args: argparse.Namespace, settings: Settings) -> int:
-    """Paused jobs back into the queue."""
+    """Paused jobs back into the queue; or — ``--queue`` — the whole queue
+    back to work."""
     engine = engine_for(settings)
     try:
+        if args.queue:
+            state = history_jobs.resume_all(engine, by=BY, now=datetime.now(UTC))
+            line = "the queue goes again"
+            if state["at"]:
+                line += f": it was paused at {state['at']} by {state['by']} because {state['because']}"
+            print(line)
+            return OK
         resumed = _selected(engine, args, lambda **which: history_jobs.resume(engine, **which))
     finally:
         engine.dispose()
     print(f"{resumed} job(s) back in the queue")
+    return OK
+
+
+def command_priority(args: argparse.Namespace, settings: Settings) -> int:
+    """Say how much sooner jobs are served than the others."""
+    engine = engine_for(settings)
+    try:
+        changed = _selected(
+            engine, args, lambda **which: history_jobs.set_priority(engine, priority=args.points, **which)
+        )
+    finally:
+        engine.dispose()
+    print(f"{changed} job(s) at priority {args.points}")
     return OK
 
 
@@ -328,11 +404,13 @@ def _jobs(session: Session, chosen: Any) -> list[HistoryJob]:
 
 
 def _saying(last: Slice) -> str:
-    """One slice in a line: the job, what became of the slice, and why, when
-    it did not go as wanted."""
+    """One slice in a line: the job, what became of the slice, what it read
+    and what it added, and why, when it did not go as wanted."""
     line = (
         f"job {last.job_id} ({last.kind} {short_name(last.subject)}): {last.outcome}, "
-        f"the job is {last.state}, {last.requests} request(s)"
+        f"the job is {last.state}, {last.requests} request(s), {last.stored.pages} page(s), "
+        f"{last.stored.records} record(s), inserted {reading.counted(last.stored.inserted)}, "
+        f"repeated {reading.counted(last.stored.repeated)}"
     )
     return line + (f" — {last.error}" if last.error else "")
 
@@ -474,6 +552,11 @@ def _naming(sub: argparse.ArgumentParser, *, planned: bool) -> None:
     )
     if not planned:
         group.add_argument("--all", action="store_true", help="every job")
+        group.add_argument(
+            "--queue",
+            action="store_true",
+            help="the whole queue at once, with no job touched (pause and resume only)",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -568,6 +651,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument(
         "--id", type=int, action="append", help="only these job(s); repeatable (default: every job that gave up)"
     )
+
+    sub = commands.add_parser("priority", help="say how much sooner jobs are served than the others")
+    sub.set_defaults(handler=command_priority)
+    sub.add_argument(
+        "points",
+        type=int,
+        help="how much sooner, in points: a point is ten minutes of going first after each slice (0: as everyone)",
+    )
+    _naming(sub, planned=False)
 
     sub = commands.add_parser("enqueue", help="plan the history of accounts, or of markets")
     sub.set_defaults(handler=command_enqueue)

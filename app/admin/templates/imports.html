@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_import_macros.html" as own with context %}
+
+{% block title %}Импорт истории{% endblock %}
+{% block content %}
+<h1>Импорт истории</h1>
+<p class="hint">Как читается история аккаунтов и рынков из пула Horizon. Страница читает базу и ни у кого ничего не спрашивает — ни Horizon, ни Notifier. Цифры измерены {{ m.when(measured_at) }}.</p>
+{% for what in trouble %}<div class="notice notice-error" role="alert">{{ what }}</div>{% endfor %}
+
+{{ own.queue(pause, service) }}
+
+{% if whole %}
+<section class="card" data-part="meaning">
+<p class="hint"><strong>done</strong> значит: доступное окно проверено — не вся жизнь адреса. Ниже того, что хранит пул, проверить нельзя; такие леджеры названы недоступными и прочитанными не считаются. Аккаунты и рынки считаются каждый сам по себе: одного общего процента для них нет.</p>
+</section>
+{{ own.subjects("account", whole.accounts) }}
+{{ own.subjects("market", whole.markets) }}
+{{ own.pool(whole.pool, whole.windows) }}
+{% endif %}
+
+<section class="card" data-part="jobs">
+<h2>Задания</h2>
+{% if table %}
+<form method="get" action="/admin/import" class="filter" role="search">
+  <label>Вид
+    <select name="kind"><option value="">любой</option><option value="account"{% if kind == "account" %} selected{% endif %}>аккаунты</option><option value="market"{% if kind == "market" %} selected{% endif %}>рынки</option></select>
+  </label>
+  <label>Состояние
+    <select name="state"><option value="">любое</option>{% for name in states %}<option value="{{ name }}"{% if state == name %} selected{% endif %}>{{ name }}</option>{% endfor %}</select>
+  </label>
+  <label>Субъект
+    <input type="search" name="q" value="{{ q }}" maxlength="200" placeholder="адрес или начало пары">
+  </label>
+  <button type="submit" class="btn">Показать</button>
+</form>
+{{ own.jobs_table(table) }}
+<p class="hint">Сначала то, что в работе: running, затем waiting — по времени следующей попытки, — затем paused, partial, error и done. Показаны {{ table["items"] | length | num }} из {{ table.total | num }}; цифры таблицы измерены {{ m.when(table.measured_at) }}.</p>
+<details>
+<summary>Что означают состояния и слова таблицы</summary>
+<dl class="props">
+  {% for name in states %}<dt>{{ m.badge(name) }}</dt><dd>{{ words.states[name] }}</dd>{% endfor %}
+  <dt>потоки</dt><dd>transactions, operations, effects, trades — четыре потока аккаунта; у рынка один, trades. «Осталось» называет те, где есть непроверенные леджеры окна.</dd>
+  <dt>окно</dt><dd>от нижней до верхней границы задания. Низ либо задан при постановке, либо найден первым срезом — там, где начиналась история пула. Задание без заданного низа спрашивают настолько далеко, насколько хранит пул: пока ни один срез не читал, низ не известен.</dd>
+  <dt>курсор</dt><dd>самый низкий леджер, до которого дошёл хотя бы один поток, и время этого леджера, если транзакция из него здесь сохранена.</dd>
+  <dt>подтверждено</dt><dd>где начинается и кончается проверенное покрытие каждого потока внутри окна.</dd>
+  <dt>контекст</dt><dd>{{ words.contexts["parents"] }}; {{ words.contexts["full"] }}.</dd>
+  <dt>граница не окончательная</dt><dd>события субъекта выше неё ещё не гарантированы; проход по списку наблюдения поднимет границу, когда подписка подтвердится, и заданию будет что дочитать.</dd>
+</dl>
+</details>
+{% endif %}
+</section>
+{% endblock %}

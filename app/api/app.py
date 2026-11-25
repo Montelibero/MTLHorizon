@@ -7,6 +7,10 @@ actually do its job: the database answers, its schema is at the head of the
 migration chain, and it belongs to the configured Stellar network. Anything
 else is a 503 naming the failing check.
 
+Stage 06 adds the admin UI under ``/admin`` (``app.admin``): closed until
+``MTL_HORIZON_ADMIN_SECRET`` is set, and then behind a login, a session and a
+form's token. It asks no server when a page is opened.
+
 ``POST /webhooks/notifier`` takes what Operations Notifier posts
 (:mod:`app.notifier.format`), and only that: every request is checked
 against the keys the Notifier signs with before anything in it is read. A
@@ -44,6 +48,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from app import __version__
+from app.admin import web as admin_web
+from app import history_api
 from app.config import Settings
 from app.notifier import format as notifier
 from app.notifier import signature
@@ -136,6 +142,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             engine.dispose()
 
     app = FastAPI(title="MTL Horizon", version=__version__, lifespan=lifespan)
+    # Stage 06: the admin UI under /admin — closed until a secret is configured.
+    admin_web.install(app, settings, engine)
+    # Stage 06: the history API — upstream Horizon's paths, read from this
+    # archive alone and by token (docs/history-api.md).
+    app.include_router(history_api.build_router(engine, settings))
 
     @app.get("/health")
     def health() -> dict[str, str]:

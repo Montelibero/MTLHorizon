@@ -1,0 +1,76 @@
+{% import "_macros.html" as m %}
+
+{#- The controls of the period: a day, a week or a month — or two dates in
+    UTC, the last day not included. Whatever else the page shows, the filter
+    and the sort, travels with them. -#}
+{% macro controls(periods, period, sorts, sort, descending, enabled, orders, per_page, default_per_page) -%}
+<form method="get" action="/admin/activity" class="card">
+  <div class="filter">
+    <strong>Период</strong>
+    {% for name, words in periods %}
+    <span class="check"><input type="radio" name="period" id="period-{{ name }}" value="{{ name }}"{% if period.name == name %} checked{% endif %}><label for="period-{{ name }}">{{ words }}</label></span>
+    {% endfor %}
+  </div>
+  <div class="filter">
+    <label>с <input type="date" name="from" value="{{ period.start }}" aria-label="Дата начала"></label>
+    <label>по <input type="date" name="to" value="{{ period.end }}" aria-label="Дата конца"></label>
+    <span class="hint">для периода «с даты по дату»; время UTC, день «по» в период не входит</span>
+  </div>
+  <div class="filter">
+    <label>Наблюдение
+      <select name="enabled">
+        <option value="">все аккаунты</option>
+        <option value="on"{% if enabled == "on" %} selected{% endif %}>только включённые</option>
+        <option value="off"{% if enabled == "off" %} selected{% endif %}>только отключённые</option>
+      </select>
+    </label>
+    <label>Сортировать
+      <select name="sort">{% for name, words in sorts %}<option value="{{ name }}"{% if sort == name %} selected{% endif %}>{{ words }}</option>{% endfor %}</select>
+    </label>
+    <label>
+      <select name="order">{% for name, words in orders %}<option value="{{ name }}"{% if (name == "desc") == descending %} selected{% endif %}>{{ words }}</option>{% endfor %}</select>
+    </label>
+    {% if per_page != default_per_page %}<input type="hidden" name="per_page" value="{{ per_page }}">{% endif %}
+    <button type="submit" class="btn">Показать</button>
+  </div>
+</form>
+{%- endmacro %}
+
+{#- A count of the window, against the window before: by how much, in percents
+    — «—» when the window before had none, for a share of zero is no number. -#}
+{% macro count(row, kind, percent) -%}
+<td class="num" data-count="{{ kind }}"><strong>{{ row[kind] | num }}</strong><div class="hint">{{ change(row.change[kind], percent) }} · было {{ row.previous[kind] | num }}</div></td>
+{%- endmacro %}
+
+{% macro change(change, percent) -%}
+{%- if change.by > 0 %}+{{ change.by | num }}{% elif change.by < 0 %}-{{ (-change.by) | num }}{% else %}0{% endif %} ({{ percent(change.percent, signed=True) }})
+{%- endmacro %}
+
+{#- The operations of the account with its own assets and with other
+    people's, where the database proves it. Where it does not: «неизвестно»,
+    with the reason — never a guess. -#}
+{% macro assets(assets, why, share) -%}
+<td data-assets="{{ assets.state }}">
+  {% if assets.state == "unknown" %}
+  <span class="badge badge-mute">неизвестно</span>
+  <div class="hint">не оценено операций: {{ assets.unclassified | num }}</div>
+  <div class="hint">{{ why(assets) }}</div>
+  {% else %}
+  <strong>{{ share(assets.own_share) }}</strong> <span class="hint">свои активы</span>
+  <div class="hint">свои {{ assets.own | num }} · чужие {{ assets.foreign | num }}{% if assets.no_asset %} · без актива {{ assets.no_asset | num }}{% endif %}{% if assets.unreadable %} · не читаются {{ assets.unreadable | num }}{% endif %}</div>
+  {% if assets.state == "partial" %}<div class="hint">не оценено операций: {{ assets.unclassified | num }} — {{ why(assets) }}</div>{% endif %}
+  {% endif %}
+</td>
+{%- endmacro %}
+
+{#- To switch the watch of the account off, by hand, with a reason if the
+    owner cares to give one. Asked twice: once by the page (the browser's
+    question), once by the token. ``back`` is the page the form came from. -#}
+{% macro disable_form(row, csrf, back, reason_limit) -%}
+<form method="post" action="/admin/activity/{{ row.account_id }}/disable" class="form" data-confirm="Отключить наблюдение за {{ row.account_id | short(8) }}…? История остаётся. Импорт этого аккаунта встанет на паузу, его подписка уйдёт — это сделает воркер. Включить снова можно на странице аккаунта.">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="back" value="{{ back }}">
+  <input type="text" name="reason" maxlength="{{ reason_limit }}" placeholder="причина (можно не заполнять)" aria-label="Причина отключения">
+  <button type="submit" class="btn btn-danger btn-small">Отключить наблюдение</button>
+</form>
+{%- endmacro %}

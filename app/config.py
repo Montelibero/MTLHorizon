@@ -103,6 +103,25 @@ class Settings:
     # next cycle. The time budget is None for nine tenths of the interval.
     collector_max_requests: int = 2000
     collector_max_seconds: float | None = None
+    # Stage 06. The admin UI under /admin is opened by this secret. With no
+    # secret set it is closed to everyone — and says so. It is a secret: it
+    # never reaches a log, a page or a message.
+    admin_secret: str = ""
+    # How long a session of the admin UI lasts, in seconds.
+    admin_session_seconds: float = 12 * 3600
+    # Where this installation is reached from behind the owner's proxy:
+    # scheme, host and port, and nothing more. Set — the cookies of the admin
+    # UI are Secure, a request that changes something has to come from there,
+    # and the history API writes its links with it.
+    public_origin: str = ""
+    # The history API: ``token`` — only with one of the tokens; ``open`` —
+    # anyone who reaches the API reads it. The tokens are secrets.
+    api_access: str = "token"
+    api_tokens: tuple[str, ...] = ()
+    # For a check of the real servers its owner allowed: the most HTTP
+    # attempts this installation may make for as long as the run lasts —
+    # every client, every retry, every probe. 0, the default, is no cap.
+    live_budget: int = 0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -135,6 +154,12 @@ class Settings:
             history_slice_requests=_positive_whole(env, "HISTORY_SLICE_REQUESTS", 50),
             history_slice_seconds=_positive_number(env, "HISTORY_SLICE_SECONDS", 60.0),
             history_context=_history_context(env),
+            admin_secret=env.get(f"{ENV_PREFIX}ADMIN_SECRET", "").strip(),
+            admin_session_seconds=_positive_number(env, "ADMIN_SESSION_SECONDS", 12 * 3600),
+            public_origin=_address(env, "PUBLIC_ORIGIN", path_allowed=False),
+            api_access=_api_access(env),
+            api_tokens=_tokens(env, "API_TOKENS"),
+            live_budget=_whole_or_zero(env, "LIVE_BUDGET"),
         )
 
 
@@ -258,6 +283,29 @@ def _positive_number(env: Mapping[str, str], name: str, default: float) -> float
     if value <= 0 or value != value:
         raise ConfigError(f"{ENV_PREFIX}{name} must be positive, got {raw!r}")
     return value
+
+
+def _api_access(env: Mapping[str, str]) -> str:
+    """Who reads the history API: only the holder of a token, or anyone."""
+    raw = env.get(f"{ENV_PREFIX}API_ACCESS", "").strip() or "token"
+    if raw not in ("token", "open"):
+        raise ConfigError(f"{ENV_PREFIX}API_ACCESS must be token or open, got {raw!r}")
+    return raw
+
+
+def _tokens(env: Mapping[str, str], name: str) -> tuple[str, ...]:
+    """Secrets given as a comma-separated list. Nothing is said of them."""
+    return tuple(token for token in (part.strip() for part in env.get(f"{ENV_PREFIX}{name}", "").split(",")) if token)
+
+
+def _whole_or_zero(env: Mapping[str, str], name: str) -> int:
+    """Zero or a positive whole number; zero is "none"."""
+    raw = env.get(f"{ENV_PREFIX}{name}", "").strip()
+    if not raw:
+        return 0
+    if not raw.isdigit():
+        raise ConfigError(f"{ENV_PREFIX}{name} must be a whole number, got {raw!r}")
+    return int(raw)
 
 
 def _positive_whole(env: Mapping[str, str], name: str, default: int) -> int:

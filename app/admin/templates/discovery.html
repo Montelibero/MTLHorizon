@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_lists.html" as l with context %}
+{% block title %}Discovery{% endblock %}
+{% block content %}
+<h1>Discovery</h1>
+<p class="hint">Правило, отдельное от «включён»: актив помечен — и держатели его trustline ищутся проходами и добавляются в список аккаунтов включёнными, с пометкой, через кого найдены. Проход — задача: страница только ставит её в очередь, выполняет воркер в фоне. Состояние читается из базы.</p>
+<div class="grid">
+  <div class="stat"><div class="label">Помечено активов</div><div class="value">{{ total | num }}</div></div>
+  <div class="stat"><div class="label">Найдено аккаунтов</div><div class="value">{{ found | num }}</div></div>
+  <div class="stat"><div class="label">Задач в очереди и в работе</div><div class="value">{{ going | num }}</div></div>
+</div>
+<div class="card"><strong>Расписание:</strong> {{ schedule }}. <span class="hint">Оно задаётся переменной окружения <code>MTL_HORIZON_DISCOVERY_INTERVAL</code> (секунды; 0 — выключено) и здесь не редактируется. Открытие trustline на помеченный актив между проходами замечается по сохранённым событиям — их приносит подписка по правилу discovery.</span></div>
+{% if total > rows | length %}<p class="hint">Показаны первые {{ rows | length }} из {{ total | num }} помеченных активов.</p>{% endif %}
+{% for row in rows %}
+  <div class="card">
+    <h2>{{ l.asset(row.asset_id) }} <a class="btn btn-small" href="/admin/assets/{{ row.asset_id | urlencode }}">страница актива →</a></h2>
+    <p class="hint">{{ row.reason | short(90) }}</p>
+    <p class="hint">правило «включён»: {{ l.onoff(row.enabled) }} · подписка: {{ l.subscription(row.subscription) }} · её хотят: {{ l.wanted(row.rules) }} · найдено аккаунтов: {{ row.found_by | num }}</p>
+    {% if stopped[row.asset_id] %}<p class="hint">Прошлый проход не дошёл до конца и остановился после адреса {{ stopped[row.asset_id] | short(8) }}: «Запустить проход» с отметкой «продолжить» пойдёт дальше от этого места.</p>{% endif %}
+    <div class="row">
+      {{ l.run_form(row.asset_id, csrf, dry=True, most=most) }}
+      {{ l.run_form(row.asset_id, csrf, dry=False, stopped=stopped[row.asset_id], most=most) }}
+    </div>
+    {{ l.runs_table(runs[row.asset_id]) }}
+  </div>
+{% else %}
+  <div class="card"><p>Ни один актив ещё не помечен для discovery. Пометить актив можно на <a href="/admin/assets">странице активов</a> — кнопкой «Пометить для discovery»; там же объяснено, что проход делает и чего не обещает.</p></div>
+{% endfor %}
+<h2>Задачи discovery</h2>
+{{ l.tasks_table(tasks, figures, "Задач discovery ещё не было.", how_far, stopped_because) }}
+<p class="hint">Сначала идущие и стоящие в очереди, за ними последние закончившиеся. У сухого прохода результат — на странице задачи: сколько нашёл, сколько новых, сколько уже включены и отключены, где остановился. Остановить задачу и поставить заново можно там же.</p>
+{% endblock %}

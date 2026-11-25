@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_lists.html" as l with context %}
+{% block title %}Аккаунт {{ row.account_id | short(6) }}{% endblock %}
+{% block content %}
+<h1>Аккаунт <span class="hint">{{ row.account_id | short(10) }}</span></h1>
+<p>{{ m.copy(row.account_id) }} {{ l.onoff(row.enabled, "включён", "выключен") }}{% if row.boundary_due %} <span class="badge badge-wait">ждёт границу начала</span>{% endif %}</p>
+<div class="card">
+  <dl class="props">
+    <dt>Откуда</dt><dd>{{ origin_in_words(row.origin) }}{% if row.origin == "legacy" %} <span class="hint">— был здесь до того, как у аккаунтов появились граница начала, импорт истории и подписка</span>{% endif %}</dd>
+    <dt>Добавлен</dt><dd>{{ m.when(row.created_at) }}</dd>
+    <dt>Найден через</dt><dd>{% for asset_id in row.discovered_by %}{{ l.asset(asset_id) }} {% endfor %}{% if not row.discovered_by %}<span class="muted">—</span>{% endif %}</dd>
+    <dt>Граница начала</dt>
+    <dd>
+      {% if row.boundary_due %}<span class="hint">ещё не взята: проход воркера спросит у пула последний леджер и запишет его</span>
+      {% elif row.watch_since_ledger is not none %}леджер {{ row.watch_since_ledger | num }} — последний на момент добавления или включения
+      {% else %}<span class="muted">не записана</span>{% endif %}
+    </dd>
+    <dt>Подписка</dt>
+    <dd>
+      {% if row.subscription %}
+        {{ m.badge(row.subscription.state) }}
+        {% if row.subscription.remote_id %} <span class="hint">у Notifier: {{ row.subscription.remote_id | short(16) }}</span>{% endif %}
+        {% if row.subscription.confirmed_at %} <span class="hint">подтверждена чтением {{ m.when(row.subscription.confirmed_at) }}</span>{% endif %}
+        {% if row.subscription.last_error %}<div class="hint">{{ row.subscription.last_error | short(160) }}</div>{% endif %}
+        {% if row.subscription.state in ("wanted", "error", "retiring") %}<div class="hint">следующая попытка {{ m.when(row.subscription.next_attempt_at) }}</div>{% endif %}
+      {% else %}<span class="muted">строки ещё нет: её заведёт проход воркера</span>{% endif %}
+    </dd>
+    <dt>Импорт истории</dt>
+    <dd>{% if row.job %}{{ l.imported(row.job) }}{% if row.job.finished_at %} <span class="hint">закончен {{ m.when(row.job.finished_at) }}</span>{% endif %}{% if row.job.slices %} <span class="hint">срезов: {{ row.job.slices | num }}, запросов: {{ row.job.requests | num }}</span>{% endif %}{% else %}<span class="muted">не поставлен</span>{% endif %}</dd>
+    <dt>Новый леджер в базе</dt><dd>{% if row.latest_ledger is not none %}{{ row.latest_ledger | num }} <span class="hint">({{ m.when(row.latest_ledger_at) }})</span>{% else %}<span class="muted">транзакций с этим аккаунтом ещё не сохранено</span>{% endif %}</dd>
+  </dl>
+</div>
+<div class="row">
+  {% if row.enabled %}
+    {{ l.toggle("/admin/accounts/" ~ row.account_id ~ "/enabled", csrf, true,
+         "Выключить аккаунт " ~ row.account_id[:8] ~ "…? Его импорт истории встанет на паузу, его подписка уйдёт. История, активы, рынки и чужие подписки останутся.",
+         "", off_label="Выключить аккаунт") }}
+  {% else %}
+    {{ l.toggle("/admin/accounts/" ~ row.account_id ~ "/enabled", csrf, false, "",
+         "Включить аккаунт " ~ row.account_id[:8] ~ "… снова? Он будет ждать новой границы начала, и проход воркера загрузит пропущенное.", on_label="Включить аккаунт") }}
+  {% endif %}
+  <a class="btn" href="/admin/explore?account={{ row.account_id }}">Что говорит Horizon сейчас</a>
+  <span class="hint">«Что говорит Horizon сейчас» — один запрос к Horizon через обозреватель; страница ничего не сохраняет</span>
+</div>
+
+<h2>Причина</h2>
+<div class="card">{{ row.reason }}</div>
+<form method="post" action="/admin/accounts/{{ row.account_id }}/reason" class="card form">
+  {{ m.csrf(csrf) }}
+  <label for="reason">Изменить причину</label>
+  <input type="text" id="reason" name="reason" maxlength="500" required value="{{ row.reason }}">
+  <button type="submit" class="btn">Сохранить причину</button>
+</form>
+
+{% if row.origin == "legacy" and (row.boundary_due or row.watch_since_ledger is none) %}
+<h2>Историческая загрузка и подписка</h2>
+{% if row.boundary_due %}
+  <p>Загрузка поставлена. Аккаунт ждёт границу начала: проход воркера, в тишине между событиями, возьмёт её, поставит импорт по ней, займётся подпиской и поднимет верхнюю границу, когда подписка подтвердится.</p>
+{% elif row.watch_since_ledger is none %}
+  {% if row.job %}
+    <p>Задание загрузки истории у этого аккаунта уже есть, а границы начала — нет: аккаунт был здесь до этапа 05. Кнопка отметит его ждущим границу той же дорогой, какой идёт аккаунт, добавленный вручную.</p>
+  {% else %}
+    <p>Этот аккаунт был здесь до этапа 05: у него нет ни своей загрузки истории, ни границы начала. Кнопка ставит то и другое той же дорогой, какой идёт аккаунт, добавленный вручную.</p>
+  {% endif %}
+  {% if row.enabled %}
+    {{ m.confirm("/admin/accounts/" ~ row.account_id ~ "/history", csrf, "Поставить историческую загрузку и проверку подписки",
+         "Поставить загрузку всей доступной истории этого аккаунта и проверку подписки? Задание загрузки будет поставлено или расширено — прогресс не сбрасывается, — а проход воркера возьмёт границу начала, проверит подписку и, когда она подтвердится, поднимет верхнюю границу задания.") }}
+  {% else %}
+    <p class="hint">Аккаунт выключен: его история не читается. Включите его, затем ставьте загрузку.</p>
+  {% endif %}
+{% endif %}
+{% endif %}
+
+<h2>Последние события</h2>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Получено</th><th>Тип</th><th>Операция</th><th class="num">Леджер</th><th>Состояние</th><th>Уведомление</th></tr></thead>
+  <tbody>
+  {% for event in row.events %}
+    <tr>
+      <td>{{ m.when(event.received_at) }} <span class="hint">{{ event.received_at | ago(now) }}</span></td>
+      <td>{{ event.type }}</td>
+      <td>{{ event.operation_type or "—" }}</td>
+      <td class="num">{{ event.ledger | num if event.ledger is not none else "—" }}</td>
+      <td>{{ event.state }}</td>
+      <td>{{ event.id | short(16) }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">Среди последних 2000 полученных уведомлений этот аккаунт не назван.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="hint">Это журнал уведомлений Operations Notifier, а не история аккаунта: история собирается загрузкой и живыми событиями, здесь видно только, что о нём недавно приходило.</p>
+{% endblock %}

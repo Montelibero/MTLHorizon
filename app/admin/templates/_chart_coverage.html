@@ -1,0 +1,51 @@
+{% import "_macros.html" as m %}
+{% set trades = chart.coverage.streams.trades %}
+<div class="card">
+  <h2>Покрытие: что архив проверил по этому рынку</h2>
+  <dl class="props">
+    <dt>Наблюдается</dt><dd>{% if chart.coverage.tracked is none %}нет{% elif chart.coverage.tracked.enabled %}да, включён{% else %}да, но выключен{% endif %}</dd>
+    <dt>Импорт истории</dt><dd>
+      {%- if chart.coverage.import %}{{ chart.coverage.import.state }}{% if chart.coverage.import.from_ledger is not none %}, леджеры {{ chart.coverage.import.from_ledger | num }}–{{ chart.coverage.import.to_ledger | num }}{% elif chart.coverage.import.to_ledger is not none %}, до леджера {{ chart.coverage.import.to_ledger | num }}{% endif %}
+      {%- else %}не планировался{% endif -%}
+    </dd>
+    <dt>Сохранённые сделки</dt><dd>{% if trades.stored %}от леджера {{ trades.stored.first_ledger | num }} до {{ trades.stored.last_ledger | num }}{% else %}нет ни одной{% endif %}</dd>
+    <dt>Леджеры архива</dt><dd>{{ chart.coverage.archive.oldest_ledger | num }}–{{ chart.coverage.archive.newest_ledger | num }}</dd>
+  </dl>
+  {% for policy in chart.policies %}
+    <h3>Правило {{ policy.policy }}: окно леджеров {{ policy.window.from_ledger | num }}–{{ policy.window.to_ledger | num }}</h3>
+    <dl class="props">
+      <dt>Проверено</dt><dd>{{ policy.ledgers.complete | num }} леджеров</dd>
+      <dt>Проверено и пусто</dt><dd>{{ policy.ledgers.empty | num }} леджеров</dd>
+      <dt>Не прочитано</dt><dd>{{ policy.ledgers.pending | num }} леджеров</dd>
+      <dt>Недоступно для проверки</dt><dd>{{ policy.ledgers.unverifiable | num }} леджеров</dd>
+    </dl>
+    {% if policy.ranges %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Леджеры</th><th>Состояние</th><th>Проверено в</th><th>Подробность</th></tr></thead>
+          <tbody>
+            {% for piece in policy.ranges %}
+              <tr>
+                <td class="nowrap">{{ piece.from | num }}–{{ piece.to | num }}</td>
+                <td>{{ m.badge(piece.state) }}</td>
+                <td>{{ m.when(piece.at) }}</td>
+                <td>{{ piece.detail or "—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if policy.more %}<p class="hint">Показаны первые {{ policy.ranges | length | num }} диапазонов из {{ (policy.ranges | length + policy.more) | num }}.</p>{% endif %}
+    {% endif %}
+  {% else %}
+    <p>По этому рынку ничего не проверено: ни один диапазон не планировался и не прочитан.</p>
+  {% endfor %}
+  {% if not chart.placed %}<p class="hint">Диапазонов покрытия больше, чем помещается на рисунок: полоса под графиком оставлена серой, смотрите таблицу.</p>{% endif %}
+  <p class="hint">Полоса под графиком — эти же диапазоны на оси времени периода. Каждый стоит от первого до последнего леджера, время закрытия которого архив знает; где два диапазона соприкасаются, граница между ними проведена по номеру разделяющего их леджера. Сделка всегда стоит на полосе своего диапазона: её время — это время закрытия её леджера. Серое — вне проверенных диапазонов или там, где архив не знает времени леджеров: ничего не утверждается, там может быть что-то и может не быть ничего. Ровный или пустой участок графика — не обязательно тихий рынок.</p>
+  {% if chart.coverage.incomplete %}
+    <details>
+      <summary>Что покрытие говорит о себе (как в /v1/coverage)</summary>
+      <ul>{% for line in chart.coverage.incomplete %}<li>{{ line }}</li>{% endfor %}</ul>
+    </details>
+  {% endif %}
+</div>

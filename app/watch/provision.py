@@ -39,18 +39,19 @@ from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from app.backfill.jobs import market_key
 from app.config import Settings
 from app.discovery import events
 from app.notifier.client import NotifierClient, NotifierError
+from app.sources import live
 from app.sources.horizon import HorizonClient
 from app.storage import history_jobs
-from app.storage.models import HistoryJob, TrackedAccount, TrackedAsset, WatchSubscription
+from app.storage.models import HistoryJob, TrackedAccount, TrackedAsset, TrackedMarket, WatchSubscription
 from app.subscriptions import reconcile
 from app.watch import accounts as watched
 
 logger = logging.getLogger(__name__)
 
-ACCOUNT_DISABLED = "account disabled"
 
 
 @dataclass
@@ -170,20 +171,35 @@ def run(
         else:
             report.subscriptions = reconcile.run(engine, api, settings.notifier_callback_url, now=now)
 
-    # 5. The upper boundary, once the account is told of.
+    # 5. The upper boundary: for an account once it is told of; for a market
+    #    at once, for it is told of by the subscription of its asset — which
+    #    is not this job's to wait for. A market's import is planned from the
+    #    admin page with whatever ledger was last known; this makes it the
+    #    latest one.
     told_of = _imports_awaiting_the_boundary(engine)
-    if told_of and client is not None:
+    markets = _market_imports_awaiting_the_boundary(engine, _enabled_markets(engine))
+    if (told_of or markets) and client is not None:
         latest = client.history().latest
         for job_id, subject, to_ledger in told_of:
             history_jobs.extend_boundary(
                 engine, job_id, to_ledger=max(latest, to_ledger), boundary_final=True, now=now
             )
-        report.upper_boundaries, report.imports_extended = len(told_of), len(told_of)
+        for job_id, subject, to_ledger in markets:
+            # Planned again first: that lifts the pause the pass makes for a
+            # market switched off, now that it is on — and widens nothing,
+            # for the boundary asked is the one it has.
+            history_jobs.plan(
+                engine, kind="market", subject=subject, to_ledger=to_ledger, boundary_final=False, resume=True, now=now
+            )
+            history_jobs.extend_boundary(
+                engine, job_id, to_ledger=max(latest, to_ledger), boundary_final=True, now=now
+            )
+        report.upper_boundaries, report.imports_extended = len(told_of) + len(markets), len(told_of) + len(markets)
         logger.info(
-            "%d history import(s) now reach ledger %d, from where their accounts are told of", len(told_of), latest
+            "%d history import(s) now reach ledger %d, from where their subjects are told of", len(told_of) + len(markets), latest
         )
 
-    # 6. Accounts switched off: the import pauses, the history stays.
+    # 6. Accounts and markets switched off: the import pauses, the history stays.
     paused = _pause_imports_of_disabled(engine)
     report.imports_paused = paused
 
@@ -246,32 +262,81 @@ def _imports_awaiting_the_boundary(engine: Engine) -> list[tuple[int, str, int]]
         ]
 
 
-def _pause_imports_of_disabled(engine: Engine) -> int:
-    """Pause the imports of accounts that are switched off, or gone from the
-    watch list, that are not paused yet. Returns how many were paused."""
+def _enabled_markets(engine: Engine) -> list[str]:
+    """The keys of the enabled markets, as a market's import is named by."""
     with Session(engine) as session:
-        ids = [
-            int(job_id)
-            for (job_id,) in session.execute(
-                select(HistoryJob.id)
-                .outerjoin(TrackedAccount, TrackedAccount.account_id == HistoryJob.subject)
+        return [
+            market_key(market.base_asset_id, market.counter_asset_id)
+            for market in session.scalars(select(TrackedMarket).where(TrackedMarket.enabled.is_(True)))
+        ]
+
+
+def _market_imports_awaiting_the_boundary(engine: Engine, enabled: list[str]) -> list[tuple[int, str, int]]:
+    """The imports of enabled markets whose upper boundary is not final yet,
+    and those the pass paused for their market being switched off — which is
+    on again: (job id, market, boundary)."""
+    if not enabled:
+        return []
+    with Session(engine) as session:
+        return [
+            (int(job_id), market, int(to_ledger))
+            for job_id, market, to_ledger in session.execute(
+                select(HistoryJob.id, HistoryJob.subject, HistoryJob.to_ledger)
                 .where(
-                    HistoryJob.kind == "account",
-                    # Not the paused ones (they are) and not the done ones
-                    # (there is nothing left to stop).
-                    HistoryJob.state.notin_(("paused", "done")),
-                    (TrackedAccount.account_id.is_(None)) | (TrackedAccount.enabled.is_(False)),
+                    HistoryJob.kind == "market",
+                    HistoryJob.subject.in_(enabled),
+                    (HistoryJob.boundary_final.is_(False) & (HistoryJob.state != "paused"))
+                    | (HistoryJob.paused_because == history_jobs.switched_off("market")),
                 )
+                .order_by(HistoryJob.id)
             )
         ]
-    if ids:
-        history_jobs.pause(engine, ids=ids, because=ACCOUNT_DISABLED)
-    return len(ids)
 
 
-def make_api(settings: Settings, *, transport: Any = None) -> NotifierClient | None:
+def _pause_imports_of_disabled(engine: Engine) -> int:
+    """Pause the imports of accounts and markets that are switched off, or
+    gone from the watch lists, that are not paused yet — each with the
+    reason of its own kind, for that is what lifts the pause again when the
+    subject is switched on (``history_jobs.plan`` with ``resume``). Returns
+    how many were paused."""
+    from sqlalchemy import true
+
+    with Session(engine) as session:
+        enabled_markets = [
+            market_key(market.base_asset_id, market.counter_asset_id)
+            for market in session.scalars(select(TrackedMarket).where(TrackedMarket.enabled.is_(True)))
+        ]
+        accounts_off = (HistoryJob.kind == "account") & (
+            TrackedAccount.account_id.is_(None) | TrackedAccount.enabled.is_(False)
+        )
+        markets_off = (HistoryJob.kind == "market") & (
+            HistoryJob.subject.notin_(enabled_markets) if enabled_markets else true()
+        )
+        rows = session.execute(
+            select(HistoryJob.id, HistoryJob.kind)
+            .outerjoin(TrackedAccount, TrackedAccount.account_id == HistoryJob.subject)
+            .where(
+                # Not the paused ones (they are) and not the done ones
+                # (there is nothing left to stop).
+                HistoryJob.state.notin_(("paused", "done")),
+                accounts_off | markets_off,
+            )
+        ).all()
+    ids = {"account": [], "market": []}
+    for job_id, kind in rows:
+        ids[kind].append(int(job_id))
+    paused = 0
+    for kind, kind_ids in ids.items():
+        if kind_ids:
+            history_jobs.pause(engine, ids=kind_ids, because=history_jobs.switched_off(kind))
+            paused += len(kind_ids)
+    return paused
+
+
+def make_api(settings: Settings, *, transport: Any = None, engine: Engine | None = None) -> NotifierClient | None:
     """The client of the Notifier's API, or None when none is configured:
     subscriptions are then made by hand and adopted here by their ids."""
     if not settings.notifier_api_url:
         return None
+    live.configure(settings.live_budget, engine)
     return NotifierClient(settings.notifier_api_url, token=settings.notifier_api_token, transport=transport)

@@ -903,6 +903,15 @@ class HistoryJob(Base, Timestamped):
     then it may be raised. ``from_ledger`` NULL means as far back as the
     pool keeps. Re-planning a subject raises its boundary and never resets
     its progress: that is in the coverage and the checkpoints.
+
+    What a job read is not what it added. ``records`` is what it read;
+    ``inserted`` and ``repeated`` say what storing cost, by data type
+    (transactions, operations, effects, trades): the rows the job was the
+    first to store, and the rows that were stored already when it met them —
+    met through another account, or brought in by the worker of events,
+    which never counts here. Both are added in the transaction that stores
+    the page, so they cannot disagree with what is stored. Only the slices
+    of a history job count; a backfill run from the command line does not.
     """
 
     __tablename__ = "history_job"
@@ -918,12 +927,28 @@ class HistoryJob(Base, Timestamped):
     boundary_final: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     # parents | full: what is fetched for a record before it is stored.
     context: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'parents'"))
+    # How much sooner this job is served than the others (``history_jobs.take``).
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # Slices that ended in failure, one after the other.
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     slices: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Slices that failed in all: a server answered with an error, or the
+    # worker died in the slice. Unlike ``attempts`` it is never started over.
+    failed_slices: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # The wall time its slices took, in milliseconds: from the beginning of
+    # each to its end, the waits between them not included.
+    time_spent_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     requests: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     pages: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     records: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    # data type -> rows: the ones this job was the first to store, and the
+    # ones that were stored already when it met them.
+    inserted: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    repeated: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    # progress | finished | failed | error | deferred | paused | lost: how
+    # its last slice ended, and when it last stored a page.
+    last_slice_outcome: Mapped[str | None] = mapped_column(Text)
+    last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     # When it last had a slice: the one that waited longest is served first.
     last_slice_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -948,6 +973,8 @@ class HistoryJob(Base, Timestamped):
         CheckConstraint("to_ledger > 0", name="to_ledger_positive"),
         CheckConstraint("from_ledger IS NULL OR from_ledger <= to_ledger", name="from_ledger_below_to"),
         CheckConstraint("attempts >= 0", name="attempts_not_negative"),
+        CheckConstraint("failed_slices >= 0", name="failed_slices_not_negative"),
+        CheckConstraint("time_spent_ms >= 0", name="time_spent_not_negative"),
         Index("ix_history_job_queue", "state", "next_attempt_at"),
     )
 
@@ -1060,3 +1087,117 @@ class ServiceState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class ServiceJob(Base):
+    """A task that takes time, started from the admin UI (or a command) and
+    run by the worker's background thread: a discovery pass, a check of the
+    pool, a verification or a recovery of one subject's history, a
+    reconciliation with the Notifier.
+
+    Nothing of it is done in the request that asked for it: the request puts
+    the task here and is answered at once, and the state of the task is read
+    from here. ``progress`` is what the task says of itself while it runs;
+    ``result`` is what it came to.
+
+    ``state`` is one of:
+
+    * ``queued`` — waiting to be taken;
+    * ``running`` — taken under a lease; a worker that died takes nothing
+      along, and whoever finds the lease expired puts the task back;
+    * ``done`` — it ran to its end;
+    * ``failed`` — it could not be run, or kept failing (``last_error`` says
+      why);
+    * ``cancelled`` — asked to stop before or while it ran.
+
+    Two tasks of one ``kind`` and one ``one_at_a_time`` key are never queued
+    or running at once (a partial unique index).
+    """
+
+    __tablename__ = "service_job"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    # discovery | pool_check | verify | reconcile
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    params: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
+    # admin | cli
+    requested_by: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'admin'"))
+    one_at_a_time: Mapped[str | None] = mapped_column(Text)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    progress: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    leased_by: Mapped[str | None] = mapped_column(Text)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('discovery', 'pool_check', 'verify', 'reconcile')",
+            name="kind_known",
+        ),
+        CheckConstraint(
+            "state IN ('queued', 'running', 'done', 'failed', 'cancelled')",
+            name="state_known",
+        ),
+        CheckConstraint("attempts >= 0", name="attempts_not_negative"),
+        Index("ix_service_job_queue", "state", "created_at"),
+        Index(
+            "uq_service_job_one_at_a_time",
+            "kind",
+            "one_at_a_time",
+            unique=True,
+            postgresql_where=text("state IN ('queued', 'running') AND one_at_a_time IS NOT NULL"),
+        ),
+    )
+
+
+class AdminSession(Base):
+    """A session of the admin UI. The cookie holds a token; here is kept the
+    hash of it and never the token itself. ``csrf`` is the secret the CSRF
+    tokens of the session's forms are made from."""
+
+    __tablename__ = "admin_session"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    csrf: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # Who logged in, as the process saw them: behind a proxy, the proxy.
+    address: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_admin_session_token"),
+        Index("ix_admin_session_expires", "expires_at"),
+    )
+
+
+class AdminLoginThrottle(Base):
+    """Failed logins of the admin UI, counted per key over a window — a key
+    is the hash of an address, or ``all`` — and until when that key is
+    blocked."""
+
+    __tablename__ = "admin_login_throttle"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    failures: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Times in a row, window after window, that the key was blocked: each
+    # makes the block longer, until the key has been quiet for an hour.
+    blocks: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("failures >= 0", name="failures_not_negative"),
+        CheckConstraint("blocks >= 0", name="blocks_not_negative"),
+    )
+

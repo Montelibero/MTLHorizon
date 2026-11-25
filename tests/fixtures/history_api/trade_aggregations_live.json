@@ -1,0 +1,115 @@
+{
+ "_about": "Answers of the live Horizon (30.0.1-6f7cff39, 25 November 2026) to GET /trade_aggregations of the market EURMTL/MTLRECT and of the same market the other way round: the first two buckets of each, verbatim. Hourly buckets, ascending. Saved to compare the shape of a bucket with: the same members in the same types. The trades they were made from are not saved, so values cannot be recomputed.",
+ "EURMTL_MTLRECT": [
+  {
+   "timestamp": "1794952800000",
+   "trade_count": "2",
+   "base_volume": "0.0135749",
+   "counter_volume": "0.0045042",
+   "avg": "0.3318035",
+   "high": "0.3319660",
+   "high_r": {
+    "n": "14162",
+    "d": "42661"
+   },
+   "low": "0.3317291",
+   "low_r": {
+    "n": "30880",
+    "d": "93088"
+   },
+   "open": "0.3319660",
+   "open_r": {
+    "n": "14162",
+    "d": "42661"
+   },
+   "close": "0.3317291",
+   "close_r": {
+    "n": "30880",
+    "d": "93088"
+   }
+  },
+  {
+   "timestamp": "1794956400000",
+   "trade_count": "5",
+   "base_volume": "0.0303318",
+   "counter_volume": "0.0100397",
+   "avg": "0.3309959",
+   "high": "0.3313293",
+   "high_r": {
+    "n": "41333",
+    "d": "124749"
+   },
+   "low": "0.3304833",
+   "low_r": {
+    "n": "10243",
+    "d": "30994"
+   },
+   "open": "0.3313293",
+   "open_r": {
+    "n": "41333",
+    "d": "124749"
+   },
+   "close": "0.3304833",
+   "close_r": {
+    "n": "10243",
+    "d": "30994"
+   }
+  }
+ ],
+ "MTLRECT_EURMTL": [
+  {
+   "timestamp": "1794952800000",
+   "trade_count": "2",
+   "base_volume": "0.0045042",
+   "counter_volume": "0.0135749",
+   "avg": "3.0138315",
+   "high": "3.0145078",
+   "high_r": {
+    "n": "93088",
+    "d": "30880"
+   },
+   "low": "3.0123570",
+   "low_r": {
+    "n": "42661",
+    "d": "14162"
+   },
+   "open": "3.0123570",
+   "open_r": {
+    "n": "42661",
+    "d": "14162"
+   },
+   "close": "3.0145078",
+   "close_r": {
+    "n": "93088",
+    "d": "30880"
+   }
+  },
+  {
+   "timestamp": "1794956400000",
+   "trade_count": "5",
+   "base_volume": "0.0100397",
+   "counter_volume": "0.0303318",
+   "avg": "3.0211859",
+   "high": "3.0258713",
+   "high_r": {
+    "n": "30994",
+    "d": "10243"
+   },
+   "low": "3.0181453",
+   "low_r": {
+    "n": "124749",
+    "d": "41333"
+   },
+   "open": "3.0181453",
+   "open_r": {
+    "n": "124749",
+    "d": "41333"
+   },
+   "close": "3.0258713",
+   "close_r": {
+    "n": "30994",
+    "d": "10243"
+   }
+  }
+ ]
+}

@@ -1,0 +1,23 @@
+{% import "_macros.html" as m %}
+<div class="card" id="adopt">
+  <h2>Принять подписку, сделанную руками</h2>
+  <p>Если подписку для этой установки сделали у Notifier вручную, назовите её id здесь: она будет принята и с этого момента считается нашей. Такую подписку установка <strong>никогда не удалит</strong> — сделал человек, удаляет человек.</p>
+  {% if api.url %}
+    <p class="hint">API настроен: подписка сначала читается у Notifier и принимается, только если она там есть и у неё адрес вебхуков и фильтры, которые регистрирует эта установка.</p>
+  {% else %}
+    <div class="notice notice-error">API Notifier не настроен: подписка принимается <strong>на слово</strong> — у Notifier она не сверяется. Проверьте id и ключ сами.</div>
+  {% endif %}
+  <form method="post" action="/admin/notifier/adopt" class="form">
+    {{ m.csrf(csrf) }}
+    <label>Тип
+      <select name="kind">{% for value, words in kinds %}<option value="{{ value }}"{% if adopt.kind == value %} selected{% endif %}>{{ words }}</option>{% endfor %}</select>
+    </label>
+    <label>Ключ: для account — адрес аккаунта (G…), для asset — native или CODE:ISSUER
+      <input type="text" name="key" value="{{ adopt.key }}" required maxlength="80" autocomplete="off" spellcheck="false">
+    </label>
+    <label>id подписки у Notifier
+      <input type="text" name="id" required maxlength="64" autocomplete="off" spellcheck="false">
+    </label>
+    <button type="submit" class="btn">Принять</button>
+  </form>
+</div>

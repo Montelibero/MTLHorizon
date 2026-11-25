@@ -440,6 +440,11 @@ def token_of(record: Mapping[str, Any]) -> str:
     return str(record["paging_token"])
 
 
+def _asset_place(record: Mapping[str, Any]) -> tuple[str, str]:
+    """Where an asset stands in `/assets`: by its code, then its issuer."""
+    return (record["asset_code"], record["asset_issuer"])
+
+
 class FakeHorizon:
     def __init__(
         self,
@@ -467,6 +472,9 @@ class FakeHorizon:
         # The trustlines the network has now: asset id -> account -> balance
         # in stroops. A line with no balance is a line all the same.
         self.trustlines: dict[str, dict[str, int]] = {}
+        # The assets the network has: issuer -> the codes it issued, as
+        # `/assets?asset_issuer=` lists them.
+        self.issued: dict[str, set[str]] = {}
         self.requests: list[tuple[str, dict[str, str]]] = []
         self.faults: list[Fault] = []
         self.hidden_operations: set[str] = set()  # /operations/{id} answers 404
@@ -544,6 +552,8 @@ class FakeHorizon:
             return self._ledger(int(parts[1]))
         if parts[0] == "accounts" and len(parts) == 1:
             return "account", self._accounts(query.get("asset"))
+        if parts[0] == "assets" and len(parts) == 1:
+            return "asset", self._assets(query.get("asset_issuer"))
         if parts[0] == "trade_aggregations":
             return self._aggregations(query)
         if parts[0] == "trades" and len(parts) == 1:
@@ -574,6 +584,23 @@ class FakeHorizon:
         else:
             holders = set(self.trustlines.get("native" if asset_param == "native" else asset_param, {}))
         return [self._account_record(account) for account in sorted(holders)]
+
+    def _assets(self, issuer: str | None) -> list[dict[str, Any]]:
+        """The assets issued — by one issuer when asked — ordered by code and
+        issuer, as `/assets` answers; an asset's paging token names both."""
+        issued = sorted((code, owner) for owner, codes in self.issued.items() if issuer in (None, owner) for code in codes)
+        return [
+            {
+                "asset_type": "credit_alphanum4" if len(code) <= 4 else "credit_alphanum12",
+                "asset_code": code,
+                "asset_issuer": owner,
+                "paging_token": f"{code}_{owner}",
+                "amount": "1000000.0000000",
+                "num_accounts": len(self.trustlines.get(f"{code}:{owner}", {})),
+                "flags": {"auth_required": False, "auth_revocable": False, "auth_clawback_enabled": False},
+            }
+            for code, owner in issued
+        ]
 
     def _account_record(self, account: str) -> dict[str, Any]:
         balances: list[dict[str, Any]] = [{"balance": "10.0000000", "asset_type": "native", "min_balance": "0.0000000"}]
@@ -709,17 +736,21 @@ class FakeHorizon:
         self, path: str, query: dict[str, str], kind: str, records: list[dict[str, Any]], *, by_address: bool = False
     ) -> httpx.Response:
         """A page of a collection. ``by_address``: the accounts, which are
-        ordered by address and have no place in time."""
-        key = (lambda record: (record["account_id"],)) if by_address else (lambda record: key_of(record, kind))
+        ordered by address and have no place in time. An asset is ordered by
+        its code and its issuer, and its cursor names both."""
+        key = _asset_place if kind == "asset" else (lambda record: (record["account_id"],)) if by_address else (lambda record: key_of(record, kind))
         order, limit = query.get("order", "asc"), int(query.get("limit", 10))
         cursor = query.get("cursor", "")
-        view = sorted((record for record in records if record["id"] not in self.gone), key=key)
+        view = sorted((record for record in records if record.get("id") not in self.gone), key=key)
         if cursor:
-            position = (cursor,) if by_address else position_of(cursor, kind)
+            if kind == "asset":
+                position = tuple(cursor.split("_", 1))
+            else:
+                position = (cursor,) if by_address else position_of(cursor, kind)
             # A cursor at or below the elder ledger asks for what is not kept.
             # Reading backwards that is an error; reading forwards the source
             # starts where its history does, without a word.
-            if not by_address and position[0] <= self.elder << 32:
+            if kind != "asset" and not by_address and position[0] <= self.elder << 32:
                 if order == "desc":
                     return self._problem(410)
                 position = (self.elder << 32, INF) if kind in ("effect", "trade") else (self.elder << 32,)

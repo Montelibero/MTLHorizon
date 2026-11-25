@@ -4,20 +4,34 @@ each one slice after slice.
 A slice is one bounded run of the backfill for one subject: a budget of
 requests and seconds, kept before every page, so that a page once taken is
 stored whole. What it stores is committed page by page with its coverage and
-its checkpoint, so a slice that is cut short — by its budget, by a signal,
-by the worker dying — loses nothing, and the next slice goes on from there.
-The subject that waited longest gets the next slice: a week of history on
-one account delays nobody.
+its checkpoint — and with the job's count of what the page stored, in the
+same transaction — so a slice that is cut short, by its budget, by a signal,
+by the pause of the whole queue, by the worker dying, loses nothing and
+claims nothing, and the next slice goes on from there. The subject that
+waited longest gets the next slice, a job of priority sooner: a week of
+history on one account delays nobody.
 
 The job's state is written in short transactions of their own, never in one
 open while Horizon is asked. The lease is made longer before a request, from
 the client's hook; a job that was paused, or taken away because its lease ran
-out, is left where it stands at the next request.
+out, is left where it stands at the next request — and so is a slice that is
+on when the whole queue is paused.
 
 What a slice could not read is told apart. A server that answered with an
 error is the stream's failure and is counted; no server answering is the
 pool's state, and is waited for. While no job is due nothing is asked of
 anybody.
+
+The worker says of itself, in ``service_state`` under ``heartbeat.history``,
+that it is there and what it is doing: a dashboard tells a queue that is
+empty from a service that is not running. It says so when it is news, and
+at least every ``heartbeat_seconds`` while it runs; the time said is the
+worker's own clock.
+
+Every slice ends with one line in the log: the job, its subject, what became
+of each stream, where each one got to, what it cost and how it ended. The
+line is the same in the text and the JSON log; in JSON what a machine reads
+is next to the message, under ``slice``. Nothing is logged per record.
 """
 
 from __future__ import annotations
@@ -27,9 +41,9 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.engine import Engine
@@ -37,10 +51,11 @@ from sqlalchemy.orm import Session
 
 from app.backfill.jobs import StreamJob, stream_jobs
 from app.backfill.loader import CONTEXT_MODES, PARENTS, Backfill, Limits, RunStopped, StreamReport, Window
-from app.cli_common import LOGICAL_SOURCE, short_name
+from app.cli_common import LOGICAL_SOURCE
 from app.sources.horizon import HorizonClient, RateLimited, Scope, Unavailable
-from app.storage import coverage, history_jobs
+from app.storage import coverage, heartbeats, history_jobs, retry
 from app.storage.models import HistoryJob, TrackedAccount
+from app.storage.upsert import StoredCounts, checkpoints
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +77,29 @@ DEFAULT_LEASE = 300.0
 # minute or so (and longer each time), so asking again two minutes later
 # finds it back; an outage costs minutes, not the hour a failure may cost.
 DEFAULT_DEFER = 120.0
+# A slice the database aborted (a deadlock's victim: ``app.storage.retry``)
+# is asked again this soon: the other transaction is gone by then.
+ABORTED_RETRY = 2.0
+# How old the worker's word of itself (the heartbeat) may grow before it is
+# said again while the service runs.
+DEFAULT_HEARTBEAT = 15.0
 
 # What the reader says of a stream (``StreamReport.status``).
 VERIFIED, FAILED, STOPPED = "verified", "failed", "stopped"
+# ...and of a slice that was on when the whole queue was paused. The reader
+# takes it as its own stop, and ends the stream where it stands.
+LEFT_WHERE_IT_STANDS = "the history queue is paused: the slice is left where it stands"
 # ...and of a stream it could not read because no server could answer it.
 SERVERS_FAULT = ("Unavailable:", "RateLimited:")
+
+# What the heartbeat says the worker is: on nothing, on a job, or kept from
+# the queue by the pause of the whole queue.
+IDLE, WORKING, HELD = "idle", "working", "paused"
+# ...and what a slice is called whose job stopped being this worker's.
+LOST = "lost"
+LOST_TEXT = "the job is no longer this worker's: the slice is left where it stands"
+# The streams of a job, by its kind.
+STREAMS = {"account": ("transactions", "operations", "effects", "trades"), "market": ("trades",)}
 
 
 class JobLost(RunStopped):
@@ -82,6 +115,16 @@ class JobLost(RunStopped):
 class Stopped(RunStopped):
     """A signal asked the worker to stop. The slice ends where it stands, and
     is not a failure."""
+
+
+class Paused(RunStopped):
+    """The whole queue was paused (``history_jobs.pause_all``) while the slice
+    was on. The slice ends where it stands and is not a failure; the job is
+    not paused — the queue is — and goes back to waiting for the resume.
+
+    A stop for the reader, like a signal: no stream of the subject is marked
+    failed on its account, and nothing more is asked for it.
+    """
 
 
 def worker_name() -> str:
@@ -130,13 +173,17 @@ class Slice:
     job_id: int
     kind: str
     subject: str
-    # progress | finished | failed | error | deferred | paused, or lost: the
-    # job stopped being this worker's in the middle of the slice.
+    # progress | finished | failed | error | deferred | paused — or ``LOST``:
+    # the job stopped being this worker's in the middle of the slice.
     outcome: str
     # The state the job is in now.
     state: str
     requests: int
     error: str | None
+    # What the slice's committed pages stored, by data type, and how long the
+    # slice took from its beginning to its end.
+    stored: StoredCounts = field(default_factory=StoredCounts)
+    seconds: float = 0.0
 
 
 class HistoryWorker:
@@ -148,6 +195,10 @@ class HistoryWorker:
 
     A slice is read with the context its job was planned with. ``context`` is
     what a job is read with that says none.
+
+    ``heartbeat_seconds`` is how old the worker's word of itself
+    (``heartbeat.history``) may grow while it runs. ``clock`` is what time it
+    is for the queue and for that word; ``now`` in tests may be moved by hand.
     """
 
     def __init__(
@@ -164,6 +215,7 @@ class HistoryWorker:
         retry_base: float = DEFAULT_RETRY_BASE,
         retry_cap: float = DEFAULT_RETRY_CAP,
         lease_seconds: float = DEFAULT_LEASE,
+        heartbeat_seconds: float = DEFAULT_HEARTBEAT,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if context not in CONTEXT_MODES:
@@ -181,6 +233,7 @@ class HistoryWorker:
         self.retry_base = retry_base
         self.retry_cap = retry_cap
         self.lease_seconds = lease_seconds
+        self.heartbeat_seconds = heartbeat_seconds
         self._stop: threading.Event | None = None
         self._job: HistoryJob | None = None
         self._limits: Limits | None = None
@@ -192,6 +245,13 @@ class HistoryWorker:
         self._started = 0.0
         self._last_renewal = 0.0
         self._lost = False
+        # Whether the slice that is on was ended by the pause of the whole queue.
+        self._paused = False
+        # What the slice that is on — or the one that just ended — stored.
+        self._stored = StoredCounts()
+        # What was last said of the worker (the state and the job), and when.
+        self._said: tuple[str, int | None] | None = None
+        self._said_at: datetime | None = None
         # For the log: slices that finished a job, and slices that failed.
         self.done = 0
         self.failed = 0
@@ -219,7 +279,8 @@ class HistoryWorker:
 
     def once(self, *, stop: threading.Event | None = None) -> bool:
         """Take the job that waited longest, if one is due, and give it a
-        slice. False when there was none; the queue is not waited on here."""
+        slice. False when there was none — the queue is empty, nothing is
+        due, or the whole queue is paused; the queue is not waited on here."""
         self._stop, self.last = stop, None
         job = history_jobs.take(
             self.engine,
@@ -229,28 +290,30 @@ class HistoryWorker:
             now=self.clock(),
         )
         if job is None:
+            # The queue may have been paused or gone again since the last look.
+            self._say(self._resting(), None)
             return False
+        self._say(WORKING, job.id)
         try:
             self.last = self._slice(job)
         except JobLost:
             # Nothing of the job is written: it is somebody else's now.
             self.failed += 1
             state = history_jobs.get(self.engine, job.id)
+            said = state.state if state else "?"
             self.last = Slice(
-                job.id, job.kind, job.subject, "lost", state.state if state else "?", self._spent(), None
+                job.id, job.kind, job.subject, LOST, said, self._spent(), LOST_TEXT, self._stored, self._gone()
             )
-            logger.warning(
-                "job %s (%s %s) is no longer this worker's: the slice is left where it stands",
-                job.id,
-                job.kind,
-                short_name(job.subject),
-            )
+            self._tell(job, self.last, None, None)
+        self._say(self._resting(), None)
         return True
 
     def _slice(self, job: HistoryJob) -> Slice:
         """Give ``job`` one slice, and say how it went — whatever happened
         inside it."""
         self._job, self._started, self._lost = job, time.monotonic(), False
+        self._paused = False
+        self._stored = StoredCounts()
         self._first = self.client.stats.requests
         self._asked = self._first
         self._served_by = dict(self.client.stats.by_server)
@@ -270,6 +333,10 @@ class HistoryWorker:
             return self._read(job)
         except JobLost:
             raise
+        except Paused as pause:
+            # The whole queue was paused while the slice was on: it ends
+            # where it stands, as on a signal, and is gone on with.
+            return self._end(job, history_jobs.PROGRESS, str(pause), None)
         except RunStopped:
             # A signal, or the slice's time limit before its first page: the
             # slice ends where it stands, and is gone on with.
@@ -280,6 +347,20 @@ class HistoryWorker:
             # slice is not counted, and the job waits for them to return.
             return self._end(job, history_jobs.DEFERRED, f"{type(failure).__name__}: {failure}", None)
         except Exception as failure:  # noqa: BLE001 - one slice that failed: the job says why and is tried again later
+            code = retry.contention(failure)
+            if code is not None and job.attempts < self.max_attempts:
+                # The database chose this slice as the victim of a deadlock, or
+                # could not serialize it — the writer of history is the one
+                # aborted in a cycle, for it waits first. Not the subject's
+                # failure: what the slice stored is stored, and it is asked
+                # again soon. It counts as a try, so that it cannot go on.
+                return self._end(
+                    job,
+                    history_jobs.ERROR,
+                    f"the database aborted the slice ({retry.said(code)}): asked again in a moment",
+                    None,
+                    again_in=ABORTED_RETRY,
+                )
             return self._end(job, history_jobs.ERROR, f"{type(failure).__name__}: {failure}", None)
         finally:
             self.client.before_request = given
@@ -323,21 +404,36 @@ class HistoryWorker:
         # pool of many servers before the first page is taken.
         self._asked = self.client.stats.requests
         assert self._limits is not None
-        with Backfill(
-            self.client,
-            self.engine,
-            source=LOGICAL_SOURCE,
-            page_size=self.page_size,
-            limits=self._limits,
-            context=job.context or self.context,
-        ) as backfill:
-            # The reader puts the limits' check before every request; this
-            # worker's goes first and ends with it.
-            self.client.before_request = self._before_request
-            reports = backfill.run(window, streams, concurrency=1)
+        reading: Backfill | None = None
+        try:
+            with Backfill(
+                self.client,
+                self.engine,
+                source=LOGICAL_SOURCE,
+                page_size=self.page_size,
+                limits=self._limits,
+                context=job.context or self.context,
+                # What a page stored is the job's to count, and is counted in
+                # the transaction that stored the page: the two cannot part.
+                on_page_stored=lambda session, stored: history_jobs.add_stored_in(
+                    session, job.id, stored, at=self.clock()
+                ),
+            ) as reading:
+                # The reader puts the limits' check before every request; this
+                # worker's goes first and ends with it.
+                self.client.before_request = self._before_request
+                reports = reading.run(window, streams, concurrency=1)
+        finally:
+            # What the slice committed is the slice's, however it ended.
+            if reading is not None:
+                self._stored.add(reading.stored)
         if self._lost:
             raise JobLost()
         outcome, error = _outcome(reports)
+        if outcome == history_jobs.PROGRESS and self._paused:
+            # The reader took the pause as its stop; the slice is still to be
+            # said of as ended by the pause, not by its budget.
+            error = LEFT_WHERE_IT_STANDS
         if outcome == history_jobs.FINISHED and silent:
             outcome = history_jobs.DEFERRED
             error = (
@@ -353,14 +449,7 @@ class HistoryWorker:
             self._served_by,
             (job.result or {}).get("servers"),
         )
-        return self._end(
-            job,
-            outcome,
-            error,
-            result,
-            pages=sum(report.pages for report in reports),
-            records=sum(report.records for report in reports),
-        )
+        return self._end(job, outcome, error, result)
 
     def _end(
         self,
@@ -369,11 +458,14 @@ class HistoryWorker:
         error: str | None,
         result: dict[str, Any] | None,
         *,
-        pages: int = 0,
-        records: int = 0,
+        again_in: float | None = None,
     ) -> Slice:
-        """Write how the slice ended and what it cost, count it, and say so."""
-        if outcome == history_jobs.DEFERRED:
+        """Write how the slice ended and what it asked of the servers, count
+        it, and say so. ``again_in``: when the next try is due, when the
+        caller knows better than the failure's growing pause."""
+        if again_in is not None:
+            delay = again_in
+        elif outcome == history_jobs.DEFERRED:
             delay = min(self.retry_cap, DEFAULT_DEFER)
         else:
             delay = min(self.retry_base * 2 ** min(job.attempts, 16), self.retry_cap)
@@ -384,8 +476,7 @@ class HistoryWorker:
             error=error,
             result=result,
             requests=self._spent(),
-            pages=pages,
-            records=records,
+            seconds=self._gone(),
             delay=delay,
             max_attempts=self.max_attempts,
             now=self.clock(),
@@ -395,48 +486,133 @@ class HistoryWorker:
         elif outcome in (history_jobs.FAILED, history_jobs.ERROR):
             self.failed += 1
         waits = (history_jobs.FAILED, history_jobs.ERROR, history_jobs.DEFERRED)
-        again = outcome in waits and state == history_jobs.WAITING
-        if state in history_jobs.GAVE_UP:
+        again = delay if outcome in waits and state == history_jobs.WAITING else None
+        last = Slice(job.id, job.kind, job.subject, outcome, state, self._spent(), error, self._stored, self._gone())
+        self._tell(job, last, again, result)
+        return last
+
+    def _tell(self, job: HistoryJob, last: Slice, again_in: float | None, result: dict[str, Any] | None) -> None:
+        """One line for a slice that ended: the job, what became of each of
+        its streams, where each got to, what the slice stored and asked, how
+        long it took and how it ended. The same line in the text and the JSON
+        log; in JSON, the same as fields under ``slice``.
+
+        Nothing of a record is in it, and no secret: the subject is a public
+        address or a market, a cursor is the source's own paging token.
+        """
+        said = dict.fromkeys(STREAMS[job.kind])  # stream -> what became of it in this slice
+        for name, stream in ((result or {}).get("streams") or {}).items():
+            said[name.rpartition(" / ")[2]] = stream["status"]
+        # A frontier is named by the kind of its records — ``transaction``,
+        # not ``transactions`` — and the stream it belongs to.
+        names = STREAMS[job.kind]
+        with Session(self.engine) as session:
+            frontiers = checkpoints(
+                session, LOGICAL_SOURCE, [(name.removesuffix("s"), "desc", job.subject) for name in names]
+            )
+        cursor: dict[str, Any] = dict.fromkeys(names)
+        reached: dict[str, Any] = {}
+        for name in names:
+            found = frontiers.get((name.removesuffix("s"), "desc", job.subject))
+            if found is not None:
+                cursor[name], reached[name] = found
+        stored = self._stored.as_dict()
+        fields = {
+            "job_id": job.id,
+            "kind": job.kind,
+            "subject": job.subject,
+            "priority": job.priority,
+            "outcome": last.outcome,
+            "state": last.state,
+            "error": last.error,
+            "window": (result or {}).get("window"),
+            "streams": said,
+            "cursor": cursor,
+            "reached": reached,
+            "requests": last.requests,
+            "duration_seconds": round(last.seconds, 3),
+            "asked_again_in": None if again_in is None else round(again_in),
+            **stored,
+        }
+        message = (
+            f"job {job.id} ({job.kind} {job.subject}): {last.outcome}, the job is {last.state}: "
+            f"{last.requests} request(s), {stored['pages']} page(s), {stored['records']} record(s), "
+            f"{last.seconds:.1f}s; inserted {counted(stored['inserted'])}, repeated {counted(stored['repeated'])}; "
+            f"streams {keyed(said)}; at ledger {keyed(reached)}"
+        )
+        message += f"; asked again in {again_in:.0f}s" if again_in is not None else ""
+        message += f" — {last.error}" if last.error else ""
+        if last.state in history_jobs.GAVE_UP:
             level = logging.ERROR
-        elif error:
+        elif last.error:
             level = logging.WARNING
         else:
             level = logging.INFO
-        logger.log(
-            level,
-            "job %s (%s %s): %s, the job is %s: %d request(s), %d record(s), %.1fs%s%s",
-            job.id,
-            job.kind,
-            short_name(job.subject),
-            outcome,
-            state,
-            self._spent(),
-            records,
-            time.monotonic() - self._started,
-            f"; asked again in {delay:.0f}s" if again else "",
-            f" — {error}" if error else "",
-        )
-        return Slice(job.id, job.kind, job.subject, outcome, state, self._spent(), error)
+        logger.log(level, message, extra={"slice": fields})
 
     def _spent(self) -> int:
         """The requests of the slice so far: the pool's own included."""
         return self.client.stats.requests - self._first
 
+    def _gone(self) -> float:
+        """How long the slice has been going, or went."""
+        return time.monotonic() - self._started
+
+    # -- the worker's word of itself -------------------------------------------
+
+    def _say(self, state: str, job_id: int | None) -> None:
+        """Say that the worker is there and what it is doing, with the time by
+        the worker's clock — when it is news, or when the last word said is
+        as old as the worker lets it grow. Nothing is written otherwise: a
+        poll that changes nothing writes nothing."""
+        if self._said == (state, job_id) and not self._word_is_old():
+            return
+        heartbeats.beat(
+            self.engine,
+            heartbeats.HISTORY,
+            now=self.clock(),
+            name=self.name,
+            state=state,
+            job_id=job_id,
+            slices_done=self.done,
+            slices_failed=self.failed,
+        )
+        self._said, self._said_at = (state, job_id), self.clock()
+
+    def _word_is_old(self) -> bool:
+        """Whether nothing was said yet, or the last word is as old as the
+        worker lets it grow. A word is said again then, whatever it says;
+        otherwise only when what the worker is doing changed."""
+        return self._said_at is None or self.clock() - self._said_at >= timedelta(seconds=self.heartbeat_seconds)
+
+    def _resting(self) -> str:
+        """What the worker is when it is on no job: kept from the queue by the
+        pause of the whole queue, or waiting for a job."""
+        return HELD if history_jobs.is_paused(self.engine) else IDLE
+
+    # -- before every request ----------------------------------------------------
+
     def _before_request(self) -> None:
-        """Before every request of a slice: stop when asked, keep the lease
-        while the job is this worker's, and keep to the slice's limits."""
+        """Before every request of a slice: stop when asked; end the slice
+        where it stands when the whole queue is paused; keep the lease while
+        the job is this worker's; keep to the slice's limits."""
         if self._lost:
             raise JobLost()
         if self._stop is not None and self._stop.is_set():
             raise Stopped()
-        if self._job is not None and time.monotonic() - self._last_renewal >= self.lease_seconds / 3:
-            kept = history_jobs.renew(
-                self.engine, self._job.id, self.name, lease_seconds=self.lease_seconds, now=self.clock()
-            )
-            if not kept:
-                self._lost = True
-                raise JobLost()
-            self._last_renewal = time.monotonic()
+        if self._job is not None:
+            if history_jobs.is_paused(self.engine):
+                self._paused = True
+                raise Paused(LEFT_WHERE_IT_STANDS)
+            self._say(WORKING, self._job.id)
+            if time.monotonic() - self._last_renewal >= self.lease_seconds / 3:
+                kept = history_jobs.renew(
+                    self.engine, self._job.id, self.name, lease_seconds=self.lease_seconds, now=self.clock()
+                )
+                if not kept:
+                    self._lost = True
+                    raise JobLost()
+                self._last_renewal = time.monotonic()
         if self._limits is not None:
             self._limits.check()
 
@@ -529,3 +705,15 @@ def _named(report: StreamReport) -> str:
     """A stream by what tells it apart for its subject: transactions,
     operations, effects or trades."""
     return report.name.rpartition(" / ")[2]
+
+
+def keyed(values: Mapping[str, Any]) -> str:
+    """``name=value`` of what is known, in the order given; ``-`` when
+    nothing is."""
+    return " ".join(f"{name}={value}" for name, value in values.items() if value is not None) or "-"
+
+
+def counted(counts: Mapping[str, Any]) -> str:
+    """``name=value`` of a count by data type, the zeros left out; ``-`` when
+    there is nothing to say."""
+    return keyed({data_type: number for data_type, number in counts.items() if number}) or "-"

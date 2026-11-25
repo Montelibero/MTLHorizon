@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_import_macros.html" as own with context %}
+{% set counters = detail.counters %}
+{% set verified = detail.verified %}
+{% set base = "/admin/import/jobs/" ~ job.id %}
+
+{% block title %}Задание {{ job.id }} — импорт истории{% endblock %}
+{% block content %}
+<p><a href="/admin/import">← Импорт истории</a></p>
+<h1>Задание #{{ job.id }} <span class="hint">{{ words.kinds[job.kind] }}</span> {{ m.badge(job.state) }}</h1>
+<p>{{ m.copy(job.subject, job.subject) }}</p>
+{% if asked_task is not none %}
+<p class="notice notice-ok" data-part="task-link">Задача, о которой говорит уведомление: <a href="/admin/tasks/{{ asked_task }}">задача {{ asked_task }} — /admin/tasks/{{ asked_task }}</a>.</p>
+{% endif %}
+{% if not watched %}
+<div class="notice notice-error" data-watched="no">Субъект задания выключен или убран из списка наблюдения: задание не читается и в общих цифрах страницы импорта не считается.</div>
+{% endif %}
+{% if pause.paused %}
+<p class="hint">Вся очередь на паузе: ни одно задание не берётся, пока её не снимут, — на <a href="/admin/import">странице импорта</a>.</p>
+{% endif %}
+{% if again %}
+<p data-reading="{{ again }}"><span class="badge badge-wait">окно перечитывается</span> Задача <a href="/admin/tasks/{{ again }}">{{ again }}</a> читает окно этого субъекта заново. Пока она не кончилась, задание не возобновляют, не повторяют и не ставят заново: иначе воркер очереди и перечитывание прочитают одни потоки одновременно. Когда задача закончится, задание на паузе возобновляют вручную.</p>
+{% endif %}
+
+<section class="card" data-part="reason">
+{% if job.state == "paused" and job.paused_because %}
+<p>Причина паузы: {{ paused_because(job) }}</p>
+{% endif %}
+{% if job.last_error %}
+<div class="notice notice-error">Последняя ошибка: <span class="mono">{{ job.last_error }}</span></div>
+{% endif %}
+<p data-why="{{ job.reason.code }}">{{ words.why.get(job.reason.code, job.reason.code) }}{% if job.state == "done" %} — до леджера {{ job.window.top | num }}{% endif %}.{% if job.state == "done" and not job.boundary_final %} Выше него события не гарантированы: когда границу поднимут, заданию будет что дочитать.{% endif %}</p>
+{% if job.state == "done" %}
+<p class="hint"><strong>done</strong> значит: доступное окно проверено — не вся жизнь адреса. Ниже того, что хранит пул, проверить нельзя; такие леджеры названы ниже непроверяемыми и прочитанными не считаются.</p>
+{% endif %}
+</section>
+
+<section class="card" data-part="actions">
+<h2>Действия</h2>
+{{ own.actions(job, again) }}
+</section>
+
+<section class="card" data-part="header">
+<h2>Задание</h2>
+<dl class="props">
+  <dt>Состояние</dt><dd>{{ m.badge(job.state) }} — {{ words.states[job.state] }}</dd>
+  <dt>Окно</dt>
+  <dd data-bottom="{{ job.window.bottom if job.window.bottom is not none }}" data-top="{{ job.window.top }}">{% if job.window.bottom is not none %}от леджера {{ job.window.bottom | num }} до {{ job.window.top | num }}{% else %}? – {{ job.window.top | num }}{% endif %}. Низ: {{ how_bottom(job.window) }}.{% if job.window.read %} Последний срез читал {{ job.window.read[0] | num }}–{{ job.window.read[1] | num }}.{% endif %}</dd>
+  <dt>Контекст</dt><dd>{{ words.contexts.get(job.context, job.context) }}</dd>
+  <dt>Граница окончательная</dt><dd>{{ job.boundary_final | yesno }}{% if not job.boundary_final %} — события выше леджера {{ job.window.top | num }} не гарантированы; проход по списку наблюдения сделает границу окончательной, когда подтвердится подписка субъекта{% endif %}</dd>
+  <dt>Приоритет</dt><dd>{{ job.priority }}{{ " — как у всех" if job.priority == 0 }}</dd>
+  <dt>Начато</dt><dd>{% if job.started_at %}{{ m.when(job.started_at) }} ({{ m.ago(job.started_at, now) }}){% else %}ещё не бралось{% endif %}</dd>
+  <dt>Двигалось в последний раз</dt><dd>{% if job.last_progress_at %}{{ m.when(job.last_progress_at) }} ({{ m.ago(job.last_progress_at, now) }}){% else %}ещё не двигалось{% endif %}</dd>
+  <dt>Последний срез</dt><dd>{% if job.last_slice_at %}{{ m.when(job.last_slice_at) }}{% else %}—{% endif %}{% if job.last_slice_outcome %}; окончился: {{ job.last_slice_outcome }}{% endif %}</dd>
+  <dt>Закончено</dt><dd>{% if job.finished_at %}{{ m.when(job.finished_at) }}{% else %}—{% endif %}</dd>
+  <dt>Читает</dt><dd>{% if job.leased_by %}{{ job.leased_by | short(24) }} до {{ m.when(job.lease_expires_at) }}{% else %}—{% endif %}</dd>
+  <dt>Попыток подряд</dt><dd>{{ job.attempts | num }}. Неудачные срезы считаются подряд до тех пор, пока задание не откажется; срез, который продвинулся, начинает счёт заново.</dd>
+  <dt>Следующая попытка</dt><dd>{% if job.state == "waiting" %}{{ m.when(job.next_attempt_at) }} ({{ ahead(job.next_attempt_in_seconds) }}){% else %}—{% endif %}</dd>
+  <dt>Читали серверы</dt><dd>{% for url, number in job.servers.items() %}<span class="mono">{{ url }}</span> ({{ number | num }}){% if not loop.last %}; {% endif %}{% else %}ни один ещё не отвечал{% endfor %}</dd>
+</dl>
+</section>
+
+<section class="card" data-part="share">
+<h2>Сколько окна проверено</h2>
+{% if verified.share is none %}
+<p data-share="unknown"><strong>Доля задания: неизвестно</strong> — {{ unknown(verified.unknown_because) }}.</p>
+{% else %}
+<p data-share="known"><strong>Доля задания: {{ percent(verified.share) }}</strong> — {{ verified.verified | num }} из {{ verified.of | num }} леджеров окна.</p>
+<div class="bar"><span style="width: {{ (verified.share * 100) | int }}%"></span></div>
+{% endif %}
+<p class="hint">Как посчитано: леджеры, проверенные в каждом потоке задания, поделены на число леджеров окна задания. Проверенный леджер — такой, где поток прочитан (записи есть или их нет); запланированные и те, что проверить нельзя, проверенными не считаются.</p>
+</section>
+
+<h2>Потоки</h2>
+{% for name, stream in detail.streams.items() %}
+{{ own.stream(name, stream) }}
+{% endfor %}
+
+<section class="card" data-part="counters">
+<h2>Счётчики</h2>
+<div class="grid">
+  <div class="stat" data-counters="read">
+    <div class="label">Прочитано у пула</div>
+    <div class="value">{{ counters.records | num }}</div>
+    <div class="sub">записей; запросов {{ counters.requests | num }}; страниц {{ counters.pages | num }}</div>
+  </div>
+  <div class="stat" data-counters="inserted">
+    <div class="label">Сохранено: новых записей</div>
+    <div class="value">{{ (counters.inserted.values() | sum) | num }}</div>
+    <div class="sub">{% for name, number in counters.inserted.items() %}{{ words.streams[name] }} {{ number | num }}{{ "; " if not loop.last }}{% endfor %}</div>
+  </div>
+  <div class="stat" data-counters="repeated">
+    <div class="label">Встречено снова: уже было сохранено</div>
+    <div class="value">{{ (counters.repeated.values() | sum) | num }}</div>
+    <div class="sub">{% for name, number in counters.repeated.items() %}{{ words.streams[name] }} {{ number | num }}{{ "; " if not loop.last }}{% endfor %}</div>
+  </div>
+  <div class="stat" data-counters="slices">
+    <div class="label">Срезов</div>
+    <div class="value">{{ counters.slices | num }}</div>
+    <div class="sub">неудачных {{ counters.failed_slices | num }}; времени на срезы {{ length(counters.time_spent_seconds) }}</div>
+  </div>
+</div>
+<p data-speed="yes">Скорость: {% if counters.records_per_minute is none %}—{% else %}{{ counters.records_per_minute | num }} записей и {{ counters.pages_per_minute | num }} страниц в минуту{% endif %} — за минуту времени, которое срезы заняли; ожидание между срезами в неё не входит.</p>
+<p class="hint">Прочитано — то, что пришло от серверов пула. Сохранено — то, чего в базе раньше не было, по типам записей; туда входят и строки, подтянутые как контекст других записей. Встречено снова — то, что уже лежало в базе (записи общих транзакций встречаются в истории нескольких аккаунтов) и повторно не сохраняется. Сохранённое и встреченное считаются в той же транзакции, что хранит страницу.</p>
+{% if not counters.counts_what_was_read %}
+<p class="hint">Сохранённое и встреченное вместе меньше прочитанного: часть записей прочитана до того, как счётчики стали различать новое и повторное.</p>
+{% endif %}
+<p class="hint">Оценки времени окончания здесь нет: сколько записей осталось прочитать, из данных не известно, и дата по средней длине леджера не выводится.</p>
+</section>
+
+<section class="card" data-part="plan">
+<h2>Поставить заново или расширить окно</h2>
+<p class="hint">Границы двигаются только наружу — ниже и выше. Повторная постановка никогда не сбрасывает прогресс: что проверено, то проверено; задание дочитает только новое. Задание на паузе остаётся на паузе; отказавшееся или готовое возвращается в очередь, если окно выросло. Верхняя граница, поднятая здесь, не окончательная: окончательной её делает проход по списку наблюдения, когда подтвердится подписка субъекта.</p>
+{% if watched and not again %}
+{% call own.form(base ~ "/plan", csrf, "Изменить окно задания? Прогресс не сбросится; границы сдвинутся только наружу.") %}
+<label for="plan-from">Нижняя граница — леджер; меньше нынешней раздвинет окно вниз, пустое оставит как есть</label>
+<input type="number" id="plan-from" name="from_ledger" min="1" step="1" inputmode="numeric" value="{{ asked_low if asked_low is not none }}" placeholder="{{ 'низ задания — насколько хватает истории пула: ниже уже некуда' if asked_low is none }}">
+<label for="plan-to">Верхняя граница — леджер; больше нынешней раздвинет окно вверх</label>
+<input type="number" id="plan-to" name="to_ledger" min="1" step="1" inputmode="numeric" value="{{ job.window.top }}" required>
+<button type="submit" class="btn">Поставить заново с этим окном</button>
+{% endcall %}
+{% elif not watched %}
+<p class="muted" data-watched="no">Форма недоступна: субъект выключен или убран из списка наблюдения — его история не читается.</p>
+{% else %}
+<p class="muted" data-not-woken="yes">Форма недоступна, пока окно перечитывается (задача {{ again }}): расширенное окно разбудило бы задание под руками перечитывания.</p>
+{% endif %}
+</section>
+
+<section class="card" data-part="tasks">
+<h2>Сверка с пулом и перечитывание окна</h2>
+<p class="hint">Оба действия идут в фоне как <a href="/admin/tasks">задача</a>: запрос только ставит её в очередь, а выполняет её фоновый поток воркера (worker). Для одного субъекта одна такая задача стоит в очереди или идёт в каждый момент — вторая не добавляется.</p>
+<p><strong>Сверка</strong> читает у пула записи потоков субъекта за диапазон, ничего не сохраняя, и сравнивает их по идентификаторам с тем, что хранится здесь. <strong>Чего она не сравнивает:</strong> контекст каждой транзакции — то, что подтягивалось сверх потоков, чтобы запись сохранить. Не уложившись в бюджет, задача так и говорит, и совпадением это не считается.</p>
+<p><strong>Перечитывание</strong> ставит покрытие диапазона обратно в «запланировано» и читает его заново тем же чтением, что и очередь. Запись хранится один раз: сохранённое сохранится снова без дублей. Вне диапазона ничего не трогается. <strong>Оно доступно только для задания, которое очередь не берёт</strong> — на паузе, отказавшегося или готового: воркер очереди и перечитывание не должны читать одни потоки одновременно. Задание в работе сначала ставят на паузу; когда задача закончится, его возобновляют вручную.</p>
+{% if not watched %}
+<p class="muted">Субъект выключен или убран из списка наблюдения: сверять и перечитывать его историю не для чего.</p>
+{% else %}
+<div class="grid">
+{% call own.form(base ~ "/verify", csrf, "Поставить сверку с пулом в очередь? Задача прочитает диапазон у Horizon в рамках бюджета и сравнит с базой; ничего не сохранит.") %}
+<h3>Сверка с пулом</h3>
+{{ own.ledgers("verify", job.window.bottom, job.window.top, usual) }}
+{% if job.window.bottom is none %}<p class="hint">Низ окна задания ещё неизвестен — укажите леджер сами.</p>{% endif %}
+<button type="submit" class="btn">Сверить с пулом</button>
+{% endcall %}
+{% if job.state in ("waiting", "running") %}
+<div class="form" data-reading-refused="yes">
+<h3>Перечитывание окна</h3>
+<p>Недоступно, пока задание в работе ({{ job.state }}): сначала поставьте его на паузу — кнопка выше, — иначе воркер очереди и перечитывание прочитают одни потоки одновременно.</p>
+</div>
+{% else %}
+{% call own.form(base ~ "/recover", csrf, "Поставить перечитывание в очередь? Покрытие диапазона будет прочитано заново — с обращениями к Horizon в рамках бюджета.") %}
+<h3>Перечитывание окна</h3>
+{{ own.ledgers("recover", job.window.bottom, job.window.top, usual) }}
+{% if job.window.bottom is none %}<p class="hint">Низ окна задания ещё неизвестен — укажите леджер сами.</p>{% endif %}
+<button type="submit" class="btn btn-danger">Прочитать окно заново</button>
+{% endcall %}
+{% endif %}
+</div>
+{% endif %}
+
+<h3>Задачи этого субъекта</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>#</th><th>Что</th><th>Состояние</th><th>Диапазон</th><th class="num">Бюджет</th><th>Поставлена</th><th>Как прошло</th></tr></thead>
+  <tbody>
+  {% for task in tasks %}
+    <tr data-task="{{ task.id }}" data-task-state="{{ task.state }}">
+      <td><a href="/admin/tasks/{{ task.id }}">{{ task.id }}</a></td>
+      <td>{{ words.modes.get(task.params.get("mode") or "verify", "Сверка с пулом") }}</td>
+      <td>{{ m.badge(task.state) }}</td>
+      <td class="nowrap">{{ task.params.get("from_ledger") | num }}–{{ task.params.get("to_ledger") | num }}</td>
+      <td class="num">{{ task.params.get("max_requests") | num }}</td>
+      <td>{{ m.ago(task.created_at, now) }}</td>
+      <td>{{ own.came_to(task) }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7" class="muted">Сверок и перечитываний этого субъекта ещё не запускали.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="hint">Что в очереди и идёт — затем до {{ recent | num }} последних закончившихся; подробности — на странице каждой.</p>
+</section>
+{% endblock %}

@@ -26,14 +26,14 @@ from app.sources.horizon import HorizonSettings
 from app.sources.pool import HorizonPool, PoolSettings
 from app.storage import events as journal
 from app.storage import history_jobs
-from app.storage.models import HistoryJob, TrackedAccount, WatchSubscription
+from app.storage.models import HistoryJob, TrackedAccount, TrackedMarket, WatchSubscription
 from app.subscriptions import reconcile
 from app.watch import accounts as watched
 from app.watch import cli as watch_cli
 from app.watch import provision
 from app.worker.loader import Worker
 from tests.factories import address
-from tests.fake_horizon import A, B, C, D, EUR, ISSUER, LATEST, FakeHorizon, paid, serve
+from tests.fake_horizon import A, B, C, D, EUR, ISSUER, LATEST, RECT, FakeHorizon, paid, serve
 from tests.fake_notifier import FakeNotifier
 from tests.fake_notifier_api import FakeNotifierApi
 from tests.test_backfill import WATCH_LIST, WINDOW
@@ -51,6 +51,7 @@ class Life:
     def __init__(self, url: str, *fakes: FakeHorizon) -> None:
         self.engine = __import__("sqlalchemy").create_engine(url)
         self.fake = fakes[0] if fakes else FakeHorizon()
+        self.fakes: tuple[FakeHorizon, ...] = fakes or (self.fake,)
         self.wall, self.clock = Wall(), Clock()
         with Session(self.engine) as session, session.begin():
             watch_lists.apply(session, WATCH_LIST)
@@ -60,15 +61,8 @@ class Life:
                 tracked = session.get(TrackedAccount, account.address)
                 assert tracked is not None
                 tracked.origin, tracked.boundary_due = "legacy", False
-        self.pool = HorizonPool(
-            tuple(fake.origin for fake in (fakes or (self.fake,))),
-            HorizonSettings(**SETTINGS),
-            network_passphrase=PUBLIC_NETWORK_PASSPHRASE,
-            pool_settings=PoolSettings(health_check_interval=60, failover_cooldown=5),
-            transports={fake.origin: httpx.MockTransport(fake._handle) for fake in (fakes or (self.fake,))},
-            clock=self.clock,
-            sleeper=self.clock.sleep,
-        )
+        self.pools: list[HorizonPool] = []
+        self.pool = self.another_pool()
         self.signer = FakeNotifier()
         self.api_fake = FakeNotifierApi(self.signer.public_key)
         self.settings = Settings(
@@ -78,6 +72,21 @@ class Life:
             notifier_api_url="http://notifier.test",
             notifier_callback_url=CALLBACK,
         )
+
+    def another_pool(self) -> HorizonPool:
+        """A pool of its own, as a thread of a service would have: the same
+        fake servers, the same clocks."""
+        pool = HorizonPool(
+            tuple(fake.origin for fake in self.fakes),
+            HorizonSettings(**SETTINGS),
+            network_passphrase=PUBLIC_NETWORK_PASSPHRASE,
+            pool_settings=PoolSettings(health_check_interval=60, failover_cooldown=5),
+            transports={fake.origin: httpx.MockTransport(fake._handle) for fake in self.fakes},
+            clock=self.clock,
+            sleeper=self.clock.sleep,
+        )
+        self.pools.append(pool)
+        return pool
 
     def api(self) -> NotifierClient:
         return NotifierClient(self.settings.notifier_api_url, transport=self.api_fake.transport)
@@ -112,7 +121,8 @@ class Life:
             return None if row is None else TrackedAccount(**{c.name: getattr(row, c.name) for c in TrackedAccount.__table__.columns})
 
     def close(self) -> None:
-        self.pool.close()
+        for pool in self.pools:
+            pool.close()
         self.engine.dispose()
 
 
@@ -239,6 +249,34 @@ def test_switched_off_and_on_again(life: Life) -> None:
     assert life.rows_state(E) == {"active"}
 
 
+def test_a_market_switched_off_has_its_import_paused_and_on_again_it_goes_back_to_work(life: Life) -> None:
+    """The pause is made with the reason of a market — for that is what
+    lifts it. With the reason of an account it never was lifted, and the
+    import stayed paused for good after the market was switched on again."""
+    from app.backfill.jobs import market_key
+    from tests.fake_horizon import sale
+
+    key = market_key(EUR, RECT)
+    job_id = history_jobs.plan(life.engine, kind="market", subject=key, to_ledger=130, boundary_final=True, now=life.wall())[0].id
+    with Session(life.engine) as session, session.begin():
+        for row in session.scalars(select(TrackedMarket)):
+            if market_key(row.base_asset_id, row.counter_asset_id) == key:
+                row.enabled = False
+    life.pass_()
+    job = next(job for job in history_jobs.list(life.engine) if job.id == job_id)
+    assert job.state == "paused" and job.paused_because == "market disabled"
+    # While it is off, the market moves on.
+    life.fake.close(sale(133, offer_owner=D), latest=134)
+    with Session(life.engine) as session, session.begin():
+        for row in session.scalars(select(TrackedMarket)):
+            if market_key(row.base_asset_id, row.counter_asset_id) == key:
+                row.enabled = True
+    life.pass_()
+    job = next(job for job in history_jobs.list(life.engine) if job.id == job_id)
+    assert (job.state, job.boundary_final, job.paused_because) == ("waiting", True, None)
+    assert job.to_ledger >= 134, "the time it was off is covered"
+
+
 def test_a_crash_between_planning_the_import_and_writing_the_boundary_loses_nothing(
     life: Life, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -319,57 +357,102 @@ def test_a_crash_after_the_subscription_is_confirmed_and_before_the_upper_bounda
     assert kept == 1, "the ledger of the time the boundary was not final is read, once"
 
 
-def test_the_worker_runs_the_pass_while_no_event_is_waiting(make_database: Callable[[], str]) -> None:
-    life = Life(make_database())
+def test_the_pass_that_keeps_accounts_in_step_runs_while_events_keep_coming(make_database: Callable[[], str]) -> None:
+    """Until stage 06 the pass ran only while no event was waiting: under a
+    steady stream of events a new account could wait for its boundary, its
+    history import and its subscription for as long as the stream lasted.
+    Now it runs on its schedule, in a thread of the worker's own, and the
+    worker of events is never idle for it."""
+    from app.notifier import format as notifier_format
+    from app.worker.background import Background
+    from tests.fake_notifier import notification
+
+    life = Life(make_database(), FakeHorizon(stall=0.02))
     try:
+        own = life.another_pool()  # the background's, as a service would have
+        # A backlog that keeps the worker of events busy for the whole test.
+        life.fake.close(*[paid(131 + number, A, B) for number in range(400)], latest=531)
+        for number in range(400):
+            notice = notifier_format.read(notification(life.fake, str(((131 + number) << 32) | 1), subscription="s"))
+            journal.receive(life.engine, notice, received_at=life.wall(), headers={}, signed_by="G-test")
         add(life)
         stop = threading.Event()
+        api = life.api()
+        calls: list[int] = []
         with Worker(life.pool, life.engine, name="w", clock=life.wall) as worker:
-            calls: list[int] = []
+            idle: list[int] = []
+            taking = worker.once
+
+            def counting(**options: Any) -> bool:
+                taken = taking(**options)
+                if taken is False:
+                    idle.append(1)
+                return taken
+
+            worker.once = counting  # type: ignore[method-assign]
 
             def pass_() -> provision.PassReport:
                 calls.append(1)
-                return provision.run(life.engine, life.settings, client=life.pool, api=life.api(), now=life.wall())
+                return provision.run(life.engine, life.settings, client=own, api=api, now=life.wall())
 
-            runner = threading.Thread(
-                target=worker.run, kwargs={"stop": stop, "poll_seconds": 0.01, "provision": pass_, "provision_every": 0}
-            )
+            background = Background(
+                life.engine, life.settings, stop=stop, client=own, api=api, clock=life.wall, pass_=pass_, provision_every=0.02
+            ).start()
+            runner = threading.Thread(target=worker.run, kwargs={"stop": stop, "poll_seconds": 0.01})
             runner.start()
             try:
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and life.job(E) is None:
-                    time.sleep(0.05)
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline and not (life.job(E) is not None and life.job(E).boundary_final):
+                    time.sleep(0.02)
+                time.sleep(0.3)
             finally:
                 stop.set()
                 runner.join(30)
-        assert calls and life.job(E) is not None and not life.account(E).boundary_due
+                background.close()
+        job = life.job(E)
+        assert job is not None and job.boundary_final, "the account got its boundary, its import and its subscription"
+        assert life.rows_state(E) == {"active"} and not life.account(E).boundary_due
+        assert len(calls) >= 5, f"the pass ran {len(calls)} time(s) while the events kept coming"
+        assert not idle, f"the worker of events was idle {len(idle)} time(s): the stream was not steady enough to prove anything"
     finally:
         life.close()
 
 
 def test_discovery_runs_on_its_schedule_only_when_it_is_on(make_database: Callable[[], str]) -> None:
+    """Off, which is the default: nothing is put anywhere. On: a pass is put
+    in the queue of tasks for every asset marked, when its last pass began
+    longer ago than the interval — once, however often it is looked at; and
+    again when the time has come."""
     from app.discovery import scan
+    from app.storage import service_jobs
     from app.storage.models import TrackedAsset
-    from app.worker import cli as worker_cli
+    from app.tasks.runner import TaskRunner
+    from app.worker.background import Background
 
     life = Life(make_database())
     try:
-        assert worker_cli._discovery_thread(life.settings, life.pool, life.engine, threading.Event()) is None  # off by default
         with Session(life.engine) as session, session.begin():
             session.get(TrackedAsset, EUR).discover = True  # type: ignore[union-attr]
         life.fake.trustlines[EUR] = {address(600): 10**7}
-        life.settings = Settings(**{**life.settings.__dict__, "discovery_interval_seconds": 3600})
         stop = threading.Event()
-        thread = worker_cli._discovery_thread(life.settings, life.pool, life.engine, stop)
-        assert thread is not None
-        thread.start()
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and life.account(address(600)) is None:
-            time.sleep(0.05)
-        stop.set()
-        thread.join(30)
+        background = Background(
+            life.engine, life.settings, stop=stop, client=life.another_pool(), api=life.api(), clock=life.wall, pass_=lambda: None
+        )
+        background.run_pass()
+        assert service_jobs.counts(life.engine)["queued"] == 0  # off by default
+
+        life.settings = Settings(**{**life.settings.__dict__, "discovery_interval_seconds": 3600})
+        background.settings = life.settings
+        assert background._schedule_discovery() == 1
+        assert background._schedule_discovery() == 0, "a pass queued already is not put twice"
+        runner = TaskRunner(life.engine, life.settings, client=life.another_pool(), api=life.api(), clock=life.wall, name="t")
+        task = runner.once()
+        assert task is not None and task.state == "done" and task.requested_by == "schedule"
         found = life.account(address(600))
         assert found is not None and found.origin == "discovery"
+        assert background._schedule_discovery() == 0, "the pass began just now: not again before the interval"
+        life.wall.wait(3601)
+        assert background._schedule_discovery() == 1
     finally:
         life.close()
 

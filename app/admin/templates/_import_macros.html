@@ -1,0 +1,326 @@
+{#- What the two pages of the history import share: a form that carries the
+    token and asks before it is sent, and the blocks that say the same things.
+    Imported `with context`: the words of the page (``words``), its helpers
+    and the names every page has (``now``, ``csrf``) are used here. -#}
+{% import "_macros.html" as m %}
+
+{#- A form that changes something. What is inside it is the caller's. -#}
+{% macro form(action, csrf_token, message, class="") -%}
+<form method="post" action="{{ action }}" class="form {{ class }}" data-confirm="{{ message }}">
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  {{ caller() }}
+</form>
+{%- endmacro %}
+
+{#- Ledgers as ranges are written: lowest first, joined. -#}
+{% macro spans(ranges) -%}{% for low, high in ranges %}{{ low | num }}–{{ high | num }}{{ ", " if not loop.last }}{% endfor %}{%- endmacro %}
+
+{#- The range a task is asked for, and its budget. -#}
+{% macro ledgers(prefix, low, high, usual) %}
+<label for="{{ prefix }}-from">Нижняя граница — леджер</label>
+<input type="number" id="{{ prefix }}-from" name="from_ledger" min="1" step="1" inputmode="numeric" value="{{ low if low is not none }}" required>
+<label for="{{ prefix }}-to">Верхняя граница — леджер</label>
+<input type="number" id="{{ prefix }}-to" name="to_ledger" min="1" step="1" inputmode="numeric" value="{{ high if high is not none }}" required>
+<label for="{{ prefix }}-budget">Бюджет — сколько запросов к пулу позволено</label>
+<input type="number" id="{{ prefix }}-budget" name="max_requests" min="1" max="1000000" step="1" inputmode="numeric" placeholder="пусто — {{ usual | num }}">
+{% endmacro %}
+
+{#- The queue as a whole: its pause, and whether the service that works it is there. -#}
+{% macro queue(pause, service) %}
+<section class="card" data-part="queue">
+<h2>Очередь</h2>
+{% if pause.paused %}
+<p data-paused="yes"><span class="badge badge-wait">вся очередь на паузе</span> с {{ m.when(pause.at) }} ({{ m.ago(pause.at, now) }}){% if pause.by %}, поставил: {{ pause.by }}{% endif %}.</p>
+<p>Причина: {{ pause.because or "не указана" }}</p>
+<p>Ни один воркер не берёт задания, пока паузу не снимут. Срез, который читался в этот момент, закончился там, где стоял, и прочитанное сохранено.</p>
+{{ m.confirm("/admin/import/resume", csrf, "Снять паузу", "Снять паузу всей очереди? Воркеры истории снова начнут брать задания.") }}
+{% else %}
+<p data-paused="no"><span class="badge badge-ok">очередь идёт</span>{% if pause.resumed_at %} — последняя пауза снята {{ m.when(pause.resumed_at) }}; её ставил {{ pause.by }}{% if pause.because %}: {{ pause.because }}{% endif %}{% endif %}.</p>
+{% call form("/admin/import/pause", csrf, "Поставить всю очередь на паузу? Ни один воркер истории не возьмёт задание, пока паузу не снимут.") %}
+<label for="queue-because">Причина паузы — хранится вместе с ней и показывается здесь</label>
+<input type="text" id="queue-because" name="because" maxlength="200" required placeholder="Например: серверы переносят на другую машину">
+<button type="submit" class="btn btn-danger">Поставить всю очередь на паузу</button>
+{% endcall %}
+{% endif %}
+<p class="hint">Пауза всей очереди хранится в базе и переживает перезапуск службы. Отдельные задания она не трогает — одно задание ставят на паузу на его странице, — и живой сбор событий (worker) она не останавливает.</p>
+
+<h3>Служба истории</h3>
+{% if service.word is none %}
+<p data-service="never"><span class="badge badge-bad">не слышна</span> Служба истории ещё ни разу не сказала о себе: насколько здесь видно, она не запущена.</p>
+{% elif service.stale %}
+<p data-service="stale"><span class="badge badge-bad">не слышно {{ length(service.age_seconds) }}</span> <strong>Служба истории не работает или зависла.</strong> Последнее слово — {{ m.when(service.word.at) }}.</p>
+{% else %}
+{% set word = service.word %}
+<p data-service="alive"><span class="badge badge-ok">жива</span> {{ words.service.get(word.state, word.state) }}{% if word.state == "working" and word.job_id is not none %} <a href="/admin/import/jobs/{{ word.job_id }}">#{{ word.job_id }}</a>{% endif %}. Последнее слово {{ m.ago(word.at, now) }}{% if word.name %}, воркер {{ word.name }}{% endif %}{% if word.slices_done is defined %}; срезов сделано {{ word.slices_done | num }}{% if word.slices_failed is defined %}, из них неудачных {{ word.slices_failed | num }}{% endif %}{% endif %}.</p>
+{% endif %}
+<p class="hint">Пустая очередь и остановленная служба в заданиях выглядят одинаково. Поэтому здесь видно последнее слово самой службы: работающая говорит о себе каждые несколько секунд, а та, которой не слышно дольше {{ stale_after.seconds | int }} секунд, не работает или зависла.</p>
+</section>
+{% endmacro %}
+
+{#- Every subject of one kind that needs history, by what its import came to. -#}
+{% macro subjects(kind, said) %}
+<section class="card" data-kind="{{ kind }}">
+<h2>{{ words.titles[kind] }}</h2>
+<div class="grid">
+  <div class="stat">
+    <div class="label">Нужна история</div>
+    <div class="value" data-figure="subjects">{{ said.subjects | num }}</div>
+    <div class="sub">с заданием: <span data-figure="with_job">{{ said.with_job | num }}</span> · без задания: <span data-figure="no_job">{{ said.no_job | num }}</span></div>
+  </div>
+  <div class="stat">
+    <div class="label">Завершили доступное окно</div>
+    <div class="value" data-figure="finished">{{ said.finished.window_available | num }}</div>
+    <div class="sub">из них без недоступного: {{ said.finished.nothing_unavailable | num }}; с недоступными леджерами: {{ said.finished.with_unavailable | num }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Доля завершённых — доля {{ words.of_all[kind] }}, не записей</div>
+    <div class="value" data-figure="share">{{ percent(said.completion.share) }}</div>
+    <div class="sub">{{ said.completion.completed | num }} из {{ said.completion.planned | num }}: задания в состоянии done, поделённые на все включённые {{ words.every[kind] }}, которым нужна история, — с заданием и без</div>
+  </div>
+  <div class="stat">
+    <div class="label">Граница ещё не окончательная</div>
+    <div class="value" data-figure="not_final">{{ said.boundary_not_final.total | num }}</div>
+    <div class="sub">выше границы события не гарантированы; когда её поднимут, заданию будет что дочитать</div>
+  </div>
+</div>
+<table>
+  <thead><tr><th>Состояние</th><th>Что значит</th><th class="num">Заданий</th></tr></thead>
+  <tbody>
+  {% for state in states %}
+    <tr data-state="{{ state }}"><td>{{ m.badge(state) }}</td><td class="hint">{{ words.states[state] }}</td><td class="num">{{ said.states[state] | num }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<h3>Почему ждут</h3>
+<table>
+  <tbody>
+  {% for code, label in words.waiting %}
+    <tr data-reason="{{ code }}"><td>{{ label }}</td><td class="num">{{ said.waiting_reasons[code] | num }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if said.paused_reasons %}
+<h3>Почему на паузе</h3>
+<ul data-paused-reasons="{{ kind }}">
+  {% for reason, number in said.paused_reasons.items() %}<li data-paused-reason>{{ words.switched_off.get(reason, reason) }}: {{ number | num }}</li>{% endfor %}
+</ul>
+{% endif %}
+{% if said.unavailable.subjects %}
+<p data-unavailable="yes">Заданий с недоступными леджерами (ниже того, что хранит пул): {{ said.unavailable.subjects | num }}; всего таких леджеров: {{ said.unavailable.ledgers | num }}. Прочитанными они не считаются.</p>
+{% endif %}
+{% set counted = [] %}
+{% for state in states %}{% if said.not_counted[state] %}{% set _ = counted.append((state, said.not_counted[state])) %}{% endif %}{% endfor %}
+{% if counted %}
+<p class="hint">Задания выключенных или убранных из списка {{ words.of_all[kind] }} не считаются среди нуждающихся в истории:{% for state, number in counted %} {{ state }} {{ number | num }};{% endfor %}</p>
+{% endif %}
+</section>
+{% endmacro %}
+
+{#- What the last check of the pool found, and the windows the jobs are asked for. Nothing here asked a server. -#}
+{% macro pool(pool, windows) %}
+<section class="card" data-part="pool">
+<h2>Пул Horizon и окна</h2>
+{% if not pool.servers %}
+<p>Пул ещё ни разу не проверен из этой установки: с какого леджера он хранит историю — неизвестно. Проверить его можно на странице <a href="/admin/horizon">Horizon</a>.</p>
+{% else %}
+<div class="grid">
+  <div class="stat">
+    <div class="label">Насколько глубоко хранит пул</div>
+    <div class="value" data-figure="elder">{{ pool.elder_ledger | num }}</div>
+    <div class="sub">самый старый леджер среди серверов — по последнему слову каждого о себе</div>
+  </div>
+  <div class="stat">
+    <div class="label">Последний леджер пула</div>
+    <div class="value" data-figure="latest">{{ pool.latest_ledger | num }}</div>
+    <div class="sub">самый высокий среди серверов</div>
+  </div>
+  <div class="stat">
+    <div class="label">Последняя проверка</div>
+    <div class="value value-time" data-figure="checked">{{ pool.checked_at | when }}</div>
+    <div class="sub">Horizon не спрашивался: эта страница читает только базу</div>
+  </div>
+</div>
+<table>
+  <thead><tr><th>Сервер</th><th class="num">№</th><th>Состояние</th><th class="num">Хранит с леджера</th><th class="num">Последний леджер</th><th class="num">Отстаёт</th><th>Проверен</th><th>Ошибка</th><th>Охлаждение до</th></tr></thead>
+  <tbody>
+  {% for server in pool.servers %}
+    <tr data-server="{{ loop.index }}" data-available="{{ 'yes' if server.available else 'no' }}">
+      <td class="mono">{{ server.url }}</td>
+      <td class="num">{{ server.position }}</td>
+      <td class="nowrap">{% if server.available %}<span class="badge badge-ok">доступен</span>{% else %}<span class="badge badge-bad">недоступен</span>{% endif %}{% if server.elder_ledger is none %} <span class="badge badge-wait">молчит</span>{% endif %}</td>
+      <td class="num">{{ server.elder_ledger | num }}</td>
+      <td class="num">{{ server.latest_ledger | num }}</td>
+      <td class="num">{{ server.lag_ledgers | num }}</td>
+      <td class="nowrap">{% if server.checked_at %}{{ m.when(server.checked_at) }}{% else %}не проверен{% endif %}</td>
+      <td class="hint">{{ server.last_error or "" }}</td>
+      <td class="nowrap">{% if server.cooling_until %}{{ m.when(server.cooling_until) }}{% else %}—{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="hint">Retention движется: серверы со временем перестают хранить самые старые леджеры. Все цифры — на момент последней проверки каждого сервера и с тех пор могли измениться.</p>
+{% if pool.unavailable %}
+<p data-servers="unavailable">Недоступные серверы: {% for url in pool.unavailable %}<span class="mono">{{ url }}</span>{{ ", " if not loop.last }}{% endfor %}.</p>
+{% endif %}
+{% if pool.silent %}
+<p data-servers="silent">Молчащие серверы (не сказали, с какого леджера хранят): {% for url in pool.silent %}<span class="mono">{{ url }}</span>{{ ", " if not loop.last }}{% endfor %}. Они могут держать более старую историю: задания с низом «насколько хватает истории пула» ждут их и без них не завершаются.</p>
+{% endif %}
+<h3>Окна заданий</h3>
+<table>
+  <thead><tr><th></th><th class="num">Заданий</th><th>Нижняя граница</th><th class="num">Верхняя</th><th class="num">Проверенное начинается с</th><th class="num">Пул ушёл выше</th></tr></thead>
+  <tbody>
+  {% for kind in ("account", "market") %}
+  {% set window = windows[kind] %}
+    <tr data-window="{{ kind }}">
+      <td>{{ words.titles[kind] }}</td>
+      <td class="num">{{ window.jobs | num }}</td>
+      <td>{% if window.lowest_from is not none %}самая низкая заданная: {{ window.lowest_from | num }}{% else %}явно не задана ни у одного задания{% endif %}{% if window.as_far_back_as_the_pool_keeps %}; «насколько хватает истории пула»: {{ window.as_far_back_as_the_pool_keeps | num }}{% endif %}</td>
+      <td class="num">{{ window.highest_to | num }}</td>
+      <td class="num">{{ window.verified_starts_at | num }}</td>
+      <td class="num">{{ window.elder_above_verified_start | num }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="hint">«Пул ушёл выше» — на сколько леджеров нижняя граница пула (по последней проверке) уже выше самого старого проверенного леджера.</p>
+{% endif %}
+</section>
+{% endmacro %}
+
+{#- The table of jobs: what is being worked on first. -#}
+{% macro jobs_table(table) %}
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    <th>#</th><th>Субъект</th><th>Состояние</th><th>Причина</th><th>Окно</th><th>Курсор</th><th>Подтверждено</th><th>Осталось</th><th>Время</th><th>Попытки</th><th>Серверы</th><th>Действия</th>
+  </tr></thead>
+  <tbody>
+  {#- ``items`` is said as a key: as an attribute it would be the dict's method. -#}
+  {% for item in table["items"] %}
+    <tr data-job="{{ item.id }}" data-state="{{ item.state }}" data-reason="{{ item.reason.code }}">
+      <td class="num"><a href="/admin/import/jobs/{{ item.id }}">{{ item.id }}</a></td>
+      <td>{{ m.copy(item.subject, item.subject | short(14)) }}<div><a href="/admin/import/jobs/{{ item.id }}">детали</a> <span class="hint">{{ words.kinds[item.kind] }}</span></div></td>
+      <td class="nowrap">{{ m.badge(item.state) }}{% if item.priority %}<div class="hint">приоритет {{ item.priority }}</div>{% endif %}</td>
+      <td>
+        {% set why = words.why.get(item.reason.code, item.reason.code) %}
+        {% if item.state in ("waiting", "running", "paused", "partial", "error") or item.last_error %}
+        <a class="why" href="/admin/import/jobs/{{ item.id }}">{{ why }} →</a>
+        {% else %}
+        {{ why }}
+        {% endif %}
+        {% if item.state == "paused" and item.paused_because %}<div>Причина: {{ paused_because(item) }}</div>{% endif %}
+        {% if item.state == "running" and item.leased_by %}<div class="hint">воркер {{ item.leased_by | short(24) }}</div>{% endif %}
+        {% if item.last_error %}<div class="hint mono">{{ item.last_error | short(140) }}</div>{% endif %}
+        {% if item.state == "done" and not item.boundary_final %}<div class="hint">события выше леджера {{ item.window.top | num }} не гарантированы</div>{% endif %}
+      </td>
+      <td class="nowrap">{% if item.window.bottom is not none %}{{ item.window.bottom | num }} – {{ item.window.top | num }}{% else %}? – {{ item.window.top | num }}{% endif %}<div class="hint">низ: {{ how_bottom(item.window) }}</div><div class="hint">контекст {{ item.context }}; граница {{ "окончательная" if item.boundary_final else "не окончательная" }}</div></td>
+      <td class="nowrap">{% if item.reached_ledger is not none %}леджер {{ item.reached_ledger | num }}<div class="hint">{% if item.reached_ledger_time %}{{ m.when(item.reached_ledger_time) }}{% else %}когда закрылся — неизвестно{% endif %}</div>{% else %}—<div class="hint">ещё не читался</div>{% endif %}</td>
+      <td class="nowrap">{% for name, stream in item.streams.items() %}<div>{{ name }}: {% if stream.verified.from is not none %}{{ stream.verified.from | num }}–{{ stream.verified.to | num }}{% else %}—{% endif %}</div>{% endfor %}</td>
+      <td>{% if item.streams_left is none %}<span class="hint">окно не определено</span>{% elif item.streams_left %}{{ item.streams_left | join(", ") }}{% else %}<span class="hint">все потоки проверены</span>{% endif %}</td>
+      <td class="nowrap"><div>начато {% if item.started_at %}{{ m.ago(item.started_at, now) }}{% else %}—{% endif %}</div><div>двигалось {% if item.last_progress_at %}{{ m.ago(item.last_progress_at, now) }}{% else %}ещё нет{% endif %}</div><div>затрачено {{ length(item.counters.time_spent_seconds) }}</div></td>
+      <td class="nowrap"><div>попыток {{ item.attempts | num }}</div><div class="hint">срезов {{ item.counters.slices | num }}{% if item.counters.failed_slices %}, неудачных {{ item.counters.failed_slices | num }}{% endif %}</div><div>{% if item.state == "waiting" %}следующая {{ m.when(item.next_attempt_at) }} ({{ ahead(item.next_attempt_in_seconds) }}){% else %}—{% endif %}</div></td>
+      <td class="hint mono">{% for url, number in item.servers.items() %}<div>{{ url }} ({{ number | num }})</div>{% else %}—{% endfor %}</td>
+      <td class="nowrap">
+        {% if item.state == "paused" %}
+        {{ m.confirm("/admin/import/jobs/" ~ item.id ~ "/resume", csrf, "Возобновить", "Вернуть задание " ~ item.id ~ " в очередь? Счёт попыток начнётся заново; прочитанное раньше не читается снова.", class="btn-small") }}
+        {% elif item.state in ("partial", "error") %}
+        {{ m.confirm("/admin/import/jobs/" ~ item.id ~ "/retry", csrf, "Повторить", "Взять задание " ~ item.id ~ " обратно в очередь? Счёт попыток начнётся заново.", class="btn-small") }}
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="12" class="muted">Заданий с такими условиями нет.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{{ m.pager(request, table.total, table.page, table.per_page) }}
+{% endmacro %}
+
+{#- What a person does to one job, by hand. ``again`` is the task that reads
+    the subject's window anew, if there is one: while it runs the job is not woken. -#}
+{% macro actions(job, again) %}
+<div class="grid">
+  {% if job.state == "paused" and not again %}
+  <p>{{ m.confirm("/admin/import/jobs/" ~ job.id ~ "/resume", csrf, "Возобновить", "Вернуть задание " ~ job.id ~ " в очередь? Счёт попыток начнётся заново; прочитанное раньше не читается снова.") }}</p>
+  {% elif job.state != "done" %}
+  {% call form("/admin/import/jobs/" ~ job.id ~ "/pause", csrf, "Поставить задание " ~ job.id ~ " на паузу? Воркер перестанет его читать; прочитанное сохранено.") %}
+  <label for="job-because">Причина паузы — хранится с заданием</label>
+  <input type="text" id="job-because" name="because" maxlength="200" required placeholder="Например: чиню серверы">
+  <button type="submit" class="btn btn-danger">Поставить на паузу</button>
+  {% endcall %}
+  {% endif %}
+  {% if not again and job.state in ("partial", "error") %}
+  <p>{{ m.confirm("/admin/import/jobs/" ~ job.id ~ "/retry", csrf, "Повторить", "Взять задание " ~ job.id ~ " обратно в очередь? Счёт попыток начнётся заново; прочитанное раньше не читается снова.") }}</p>
+  {% endif %}
+  {% if again %}
+  <p class="hint" data-not-woken="yes">Возобновить, повторить или поставить заново нельзя, пока окно перечитывается (задача <a href="/admin/tasks/{{ again }}">{{ again }}</a>): иначе воркер очереди и перечитывание прочитают одни потоки одновременно.</p>
+  {% endif %}
+  {% call form("/admin/import/jobs/" ~ job.id ~ "/priority", csrf, "Изменить приоритет задания?") %}
+  <label for="job-priority">Приоритет — насколько раньше остальных задание идёт после каждого среза</label>
+  <select id="job-priority" name="priority">
+    {% for number in priorities %}<option value="{{ number }}"{% if number == job.priority %} selected{% endif %}>{{ number }}{{ " — как у всех" if number == 0 }}</option>{% endfor %}
+  </select>
+  <button type="submit" class="btn">Поставить приоритет</button>
+  {% endcall %}
+</div>
+<p class="hint">Приоритет меняет только то, кто идёт следующим, никогда — кто идёт вообще. Один пункт — десять минут форы после каждого среза: приоритетному субъекту достаётся больше срезов, а остальные всё равно получают свои по очереди.</p>
+{% endmacro %}
+
+{#- One stream of a job: its coverage, its gaps, its checkpoint — and how much of the window is verified. -#}
+{% macro stream(name, stream) %}
+<section class="card" data-stream="{{ name }}">
+<h3>{{ words.streams[name] }} <span class="hint">{{ name }}</span></h3>
+<dl class="props">
+  <dt>Доля потока</dt>
+  <dd data-share="{{ 'unknown' if stream.share.share is none else 'known' }}">{% if stream.share.share is none %}неизвестно — {{ unknown(stream.share.unknown_because) }}{% else %}{{ percent(stream.share.share) }}: {{ stream.share.verified | num }} из {{ stream.share.of | num }} леджеров окна{% endif %}</dd>
+  <dt>Как посчитано</dt>
+  <dd class="hint">проверенные леджеры потока (прочитан, или прочитан и записей нет) поделены на леджеры окна этого потока; запланированные и те, что проверить нельзя, проверенными не считаются</dd>
+  <dt>Подтверждённый диапазон</dt>
+  <dd>{% if stream.verified.from is not none %}{{ stream.verified.from | num }}–{{ stream.verified.to | num }} ({{ stream.verified.ledgers | num }} леджеров){% else %}—{% endif %}</dd>
+  <dt>Осталось прочитать</dt>
+  <dd>{% if stream.left is none %}неизвестно: окно не определено{% else %}{{ stream.left | num }} леджеров, из них запланированных {{ stream.pending_ledgers | num }}{% if stream.unplanned_ledgers %} и выше запланированного {{ stream.unplanned_ledgers | num }}{% endif %}{% endif %}</dd>
+  <dt>Проверить нельзя</dt>
+  <dd>{% if stream.unverifiable_ledgers %}{{ stream.unverifiable_ledgers | num }} леджеров — ниже того, что хранит пул; прочитанными не считаются{% else %}—{% endif %}</dd>
+  <dt>Курсор</dt>
+  <dd>{% if stream.cursor.at_ledger is not none %}леджер {{ stream.cursor.at_ledger | num }} ({{ how_cursor(stream.cursor) }}){% if stream.cursor.ledger_time %}, закрылся {{ m.when(stream.cursor.ledger_time) }}{% else %}; когда закрылся — неизвестно: транзакций этого леджера здесь не сохранено{% endif %}{% else %}—{% endif %}</dd>
+  {% if stream.cursor.token %}<dt>Чекпоинт</dt><dd>{{ m.copy(stream.cursor.token, stream.cursor.token | short(24)) }}</dd>{% endif %}
+  {% if stream.last_slice %}<dt>Последний срез</dt><dd>{{ stream.last_slice.status }}{% if stream.last_slice.error %}: <span class="mono">{{ stream.last_slice.error }}</span>{% endif %}</dd>{% endif %}
+</dl>
+<table>
+  <thead><tr><th class="num">От</th><th class="num">До</th><th>Состояние</th><th>Что значит</th><th>В окне</th><th>Кто ответил</th><th>Проверено</th><th>Подробность</th></tr></thead>
+  <tbody>
+  {% for piece in stream.pieces %}
+    <tr data-state="{{ piece.state }}">
+      <td class="num">{{ piece.from | num }}</td>
+      <td class="num">{{ piece.to | num }}</td>
+      <td>{{ m.badge(piece.state) }}</td>
+      <td class="hint">{{ words.coverage[piece.state] }}</td>
+      <td class="num nowrap">{% if piece.in_window %}{{ piece.in_window[0] | num }}–{{ piece.in_window[1] | num }}{% else %}—{% endif %}</td>
+      <td>{{ piece.served_by or "—" }}</td>
+      <td class="nowrap">{% if piece.verified_at %}{{ m.when(piece.verified_at) }}{% else %}—{% endif %}</td>
+      <td>{{ piece.detail or "" }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="8" class="muted">Покрытия ещё нет: ни один срез не читал этот поток.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p data-gaps="pending">Пробелы — запланировано, не прочитано: {% if stream.gaps.pending %}{{ spans(stream.gaps.pending) }}{% else %}нет{% endif %}.</p>
+<p data-gaps="unverifiable">Пробелы — проверить нельзя: {% if stream.gaps.unverifiable %}{{ spans(stream.gaps.unverifiable) }}{% else %}нет{% endif %}.</p>
+<p class="hint">Леджеров по состояниям:{% for state, number in stream.ledgers.items() %} {{ state }} {{ number | num }};{% endfor %}</p>
+</section>
+{% endmacro %}
+
+{#- What a comparison or a new reading came to, in a few words; the task's page says the rest. -#}
+{% macro came_to(task) -%}
+{% set result = task.result or {} %}
+{% set mode = task.params.get("mode") or "verify" %}
+{%- if task.state == "queued" %}в очереди
+{%- elif task.state == "running" %}идёт
+{%- elif task.state == "cancelled" %}остановлена
+{%- elif task.state == "failed" %}<span class="mono">{{ task.last_error or "не удалось" }}</span>
+{%- elif mode == "recover" %}прочитано заново: {{ "да" if result.get("read_again") else "нет" }}{% if result.get("stopped") %}; остановлено: {{ result.stopped }}{% endif %}
+{%- else %}совпадает: {{ result.get("matches") | yesno }}{% if result.get("stopped") %}; не закончено: {{ result.stopped }}{% endif %}
+{%- endif %}
+{%- endmacro %}

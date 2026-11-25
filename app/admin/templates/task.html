@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Задача {{ job.id }}{% endblock %}
+{% block content %}
+<h1>Задача {{ job.id }} <span class="hint">{{ job.kind }}</span></h1>
+<p>{{ describe(job) }} · {{ m.badge(job.state) }} · запросил {{ job.requested_by }}</p>
+{% if job.state in ("queued", "running") %}
+  {{ m.confirm("/admin/tasks/" ~ job.id ~ "/cancel", csrf, "Остановить", "Остановить задачу " ~ job.id ~ "?") }}
+{% else %}
+  {{ m.confirm("/admin/tasks/" ~ job.id ~ "/again", csrf, "Поставить ещё раз", "Поставить задачу заново?") }}
+{% endif %}
+<div class="card">
+<dl class="props">
+  <dt>Поставлена</dt><dd>{{ m.when(job.created_at) }} ({{ job.created_at | ago(now) }})</dd>
+  <dt>Начата</dt><dd>{% if job.started_at %}{{ m.when(job.started_at) }}{% else %}—{% endif %}</dd>
+  <dt>Закончена</dt><dd>{% if job.finished_at %}{{ m.when(job.finished_at) }}{% else %}—{% endif %}</dd>
+  <dt>Длилась</dt><dd>{{ duration }}</dd>
+  <dt>Попыток взята</dt><dd>{{ job.attempts }}</dd>
+  <dt>Аренда</dt><dd>{% if job.leased_by %}{{ job.leased_by | short(24) }} до {{ m.when(job.lease_expires_at) }}{% else %}—{% endif %}</dd>
+  <dt>Остановка</dt><dd>{{ "запрошена" if job.cancel_requested else "не запрошена" }}</dd>
+</dl>
+{% if job.last_error %}<div class="notice notice-error">{{ job.last_error }}</div>{% endif %}
+</div>
+<h2>Как прошло</h2>
+<div class="card"><dl class="props">
+{% for name, value in figures.items() %}<dt>{{ name }}</dt><dd>{{ value }}</dd>{% endfor %}
+</dl>{% if not figures %}<p class="hint">Пока нечего показать.</p>{% endif %}</div>
+<h2>Параметры</h2>
+{{ m.json(job.params) }}
+{% if job.progress %}<h2>Что задача говорит о себе</h2>{{ m.json(job.progress) }}{% endif %}
+{% if job.result %}<h2>Результат</h2>{{ m.json(job.result) }}{% endif %}
+{% if job.kind == "discovery" and job.result and job.result.run %}<p><a href="/admin/discovery">Проходы discovery →</a></p>{% endif %}
+{% endblock %}

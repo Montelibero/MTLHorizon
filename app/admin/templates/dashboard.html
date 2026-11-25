@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_dashboard_bits.html" as d %}
+{% block title %}Дашборд{% endblock %}
+{% block content %}
+<h1>Дашборд</h1>
+<p class="hint">Состояние установки одним взглядом, прочитанное из базы в {{ m.when(shown.measured_at) }}. У Horizon и у Notifier ничего не спрашивалось — и при автообновлении не спрашивается. У каждого числа сказано, <strong>точно</strong> оно посчитано или это <strong>оценка</strong>; у чисел в карточках — и когда оно измерено: оценка и число из кэша могут быть старше самой страницы.</p>
+
+<h2>Службы</h2>
+<p class="hint">Сигнал службы (heartbeat) — её слово о себе в базе, обновляемое каждые несколько секунд. Он доказывает только то, что кто-то там есть, а не то, что работа идёт правильно. Молчит дольше минуты — служба не работает или застряла, и тогда сказано, что в её очереди: пустая очередь и остановленная служба — разные вещи.</p>
+<div class="grid">
+  {{ d.service("Живой воркер", "события", worker, now) }}
+  {{ d.service("Служба истории", "импорта", history, now) }}
+</div>
+
+<h2>Очередь событий <span class="hint">задания на транзакции, о которых сообщил Notifier</span></h2>
+<p>{{ queue_said }}</p>
+<div class="grid">
+  {% for state in queue_states %}
+  <div class="stat"><div class="label">{{ state }}</div>{{ d.measured(shown.queue[state], "queue." ~ state, how) }}</div>
+  {% endfor %}
+</div>
+<p class="hint">pending — ждёт своего времени; running — взято воркером под аренду; done — сделано и никогда не удаляется; partial и dead — отдалось после попыток и ждёт человека (retry) или нового уведомления о той же транзакции.</p>
+<dl class="props">
+  <dt>Готовы к взятию</dt><dd>{{ d.figure(shown.queue.pending_due, "queue.pending_due", how) }} <span class="hint">из pending: время следующей попытки пришло</span></dd>
+  <dt>Брошенных под арендой</dt><dd>{{ d.figure(shown.queue.running_past_lease, "queue.running_past_lease", how) }} <span class="hint">из running: воркер взял и не вернулся — задание вернётся в очередь</span></dd>
+  <dt>Ждут человека</dt><dd>{{ d.figure(shown.queue.waiting_for_a_person, "queue.waiting_for_a_person", how) }} <span class="hint">partial и dead вместе</span></dd>
+  <dt>Старейшее</dt><dd>{{ d.oldest(shown.queue.oldest_pending, oldest) }}</dd>
+</dl>
+<h3>Что отдалось после попыток <span class="hint">с ошибкой последней попытки</span></h3>
+{% if shown.queue.errors %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>#</th><th>Состояние</th><th>Транзакция</th><th class="num">Леджер</th><th class="num">Попыток</th><th>Ошибка последней попытки</th><th>Отдалось</th></tr></thead>
+  <tbody>
+  {% for error in shown.queue.errors %}
+    <tr>
+      <td>{{ error.job_id }}</td>
+      <td>{{ m.badge(error.state) }}</td>
+      <td>{{ m.copy(error.transaction_hash, error.transaction_hash | short(12), 12) }}</td>
+      <td class="num">{{ error.ledger_sequence | num }}</td>
+      <td class="num">{{ error.attempts }}</td>
+      <td>{{ error.last_error or "—" }}</td>
+      <td>{{ m.ago(error.finished_at, now) if error.finished_at else "—" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="hint">Показаны новейшие, не больше {{ errors_shown }}.</p>
+{% else %}<p class="hint">Заданий, которые отдались, нет.</p>{% endif %}
+<p class="hint">Полностью эта очередь видна командами — они читают ту же базу и ничего не спрашивают у серверов: <code>python -m app.worker status</code> (очередь и журнал), <code>python -m app.worker events</code> (последние уведомления), <code>python -m app.worker retry</code> (вернуть отдавшиеся задания в очередь). Страницы этой очереди в админке нет.</p>
+
+<h2>Свежесть данных</h2>
+<div class="card">
+{% set last = shown.freshness.last_notification %}
+{% if last %}
+  <dl class="props">
+    <dt>Последнее уведомление</dt><dd>{{ m.when(last.received_at) }} · {{ m.ago(last.received_at, now) }}</dd>
+    <dt>Что принёс Notifier</dt><dd>состояние {{ m.badge(last.state) }} · леджер {{ last.ledger_sequence | num }} · {{ last.operation_type or "тип операции не назван" }}</dd>
+  </dl>
+{% else %}<p>Уведомлений ещё не приходило.</p>{% endif %}
+{% set ledger = shown.freshness.last_ledger_among_finished_jobs %}
+  <dl class="props">
+    <dt>Последний леджер среди обработанных заданий</dt><dd><strong>{{ ledger.ledger_sequence | num }}</strong> <span class="hint">наибольший леджер среди {{ ledger.sampled_jobs | num }} новейших завершённых заданий{% if ledger.finished_at %}; самое новое из них завершено {{ m.when(ledger.finished_at) }}{% endif %}</span></dd>
+  </dl>
+  <p><strong>последний леджер среди обработанных заданий — не фронтир</strong>: из него не следует, что всё ниже увидено. Ни о транзакциях, уведомления о которых не приходили, ни о последнем леджере сети отсюда ничего не известно.</p>
+</div>
+
+<h2>Импорт истории <a href="/admin/import">страница импорта →</a></h2>
+<p class="hint">Состояние службы — выше. Здесь только число заданий по состояниям; окна, покрытие, счётчики прочитанного и добавленного, причины ожидания и действия — на странице импорта.</p>
+<div class="grid">
+  {% for state in history_states %}
+  <div class="stat"><div class="label">{{ state }}</div>{{ d.measured(shown.history.jobs[state], "history.jobs." ~ state, how) }}</div>
+  {% endfor %}
+</div>
+{% if shown.history.queue_paused %}
+<p>Вся очередь истории на паузе.{% if shown.history.pause.because %} Причина: {{ shown.history.pause.because }}.{% endif %}{% if shown.history.pause.by %} Поставил: {{ shown.history.pause.by }}{% if paused_at %} {{ m.when(paused_at) }}{% endif %}.{% endif %}</p>
+{% endif %}
+<p>{{ d.oldest(shown.history.oldest_waiting, oldest) }}</p>
+
+<h2>Подписки <a href="/admin/notifier">страница Notifier →</a></h2>
+<div class="grid">
+  {% for state in subscription_states %}
+  <div class="stat"><div class="label">{{ state }}</div>{{ d.measured(shown.subscriptions.counts[state], "subscriptions.counts." ~ state, how) }}</div>
+  {% endfor %}
+</div>
+<h3>Что не так <span class="hint">подписки в error и ambiguous: причина и следующая попытка</span></h3>
+{% if shown.subscriptions.problems %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>#</th><th>Вид</th><th>Ключ</th><th>Состояние</th><th class="num">Попыток</th><th>Причина</th><th>Следующая попытка</th><th>ID у Notifier</th></tr></thead>
+  <tbody>
+  {% for problem in shown.subscriptions.problems %}
+    <tr>
+      <td>{{ problem.id }}</td>
+      <td>{{ problem.kind }}</td>
+      <td><code>{{ problem.key }}</code></td>
+      <td>{{ m.badge(problem.state) }}</td>
+      <td class="num">{{ problem.attempts }}</td>
+      <td>{{ problem.last_error or "—" }}</td>
+      <td>{{ m.when(problem.next_attempt_at) }}{% if problem.next_attempt_at %} <span class="hint">({{ till(problem.next_attempt_at, now) }})</span>{% endif %}</td>
+      <td>{{ problem.remote_id or "—" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if shown.subscriptions.problems | length >= problems_shown %}<p class="hint">Показаны первые {{ problems_shown }} — по времени следующей попытки; остальные на странице Notifier.</p>{% endif %}
+{% else %}<p class="hint">Подписок в error и ambiguous нет.</p>{% endif %}
+<p class="hint">active значит, что подписка нашла себя в списке Notifier с адресом и фильтрами этой установки. Подтверждение — не гарантия непрерывной доставки.</p>
+
+<h2>Discovery <a href="/admin/discovery">страница discovery →</a></h2>
+<p>Активов помечено для discovery: {{ d.figure(shown.discovery.marked, "discovery.marked", how) }}. Аккаунтов в списке: {{ d.figure(shown.discovery.accounts, "discovery.accounts", how) }}, из них включены {{ d.figure(shown.discovery.accounts_enabled, "discovery.accounts_enabled", how) }}.</p>
+{% if passes %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Актив</th><th>Последний проход</th><th>Начат</th><th>Закончен</th><th class="num">Страниц</th><th class="num">Найдено</th><th class="num">Добавлено</th><th class="num">Уже наблюдались</th><th class="num">Отключены и оставлены</th><th>Ошибка</th></tr></thead>
+  <tbody>
+  {% for asset, pass in passes %}
+    <tr>
+      <td>{{ m.copy(asset, asset | short(20), 20) }}</td>
+      {% if pass %}
+      <td>{{ m.badge(pass.state) }}</td>
+      <td>{{ m.ago(pass.started_at, now) }}</td>
+      <td>{{ m.ago(pass.finished_at, now) if pass.finished_at else "—" }}</td>
+      <td class="num">{{ pass.pages | num }}</td>
+      <td class="num">{{ pass.found | num }}</td>
+      <td class="num">{{ pass.added | num }}</td>
+      <td class="num">{{ pass.already | num }}</td>
+      <td class="num">{{ pass.disabled | num }}</td>
+      <td>{{ pass.last_error or "—" }}</td>
+      {% else %}
+      <td colspan="9" class="muted">прохода ещё не было</td>
+      {% endif %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}<p class="hint">Проходов discovery ещё не было.</p>{% endif %}
+<dl class="props">
+  {% for origin, entry in shown.discovery.accounts_by_origin.items() %}
+  <dt>{{ origin }}</dt><dd>всего {{ d.figure(entry.total, "discovery.accounts_by_origin." ~ origin ~ ".total", how) }} · включены {{ d.figure(entry.enabled, "discovery.accounts_by_origin." ~ origin ~ ".enabled", how) }}</dd>
+  {% endfor %}
+</dl>
+
+<h2>PostgreSQL</h2>
+<div class="grid">
+  <div class="stat"><div class="label">База целиком</div><div class="value">{{ size(shown.database.size_bytes.value) }}</div><div class="sub"><span class="badge badge-ok">точно</span> · измерено {{ m.when(shown.database.size_bytes.measured_at) }} · pg_database_size</div></div>
+  {% for words, table, figure in unique %}
+  <div class="stat"><div class="label">Уникальные {{ words }}</div>{{ d.measured(figure, "database.rows." ~ table, how) }}</div>
+  {% endfor %}
+</div>
+<p class="hint">Каждая запись хранится один раз под своим естественным ключом, поэтому строки этих таблиц — разные транзакции, операции, эффекты и сделки. Пока таблица невелика, она пересчитывается точно; выросшую показывает число планировщика (<code>pg_class.reltuples</code>) — это оценка.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Таблица</th><th class="num">Всего</th><th class="num">Данные</th><th class="num">Вне основной кучи (TOAST)</th><th class="num">Индексы</th><th class="num">Строк по планировщику</th></tr></thead>
+  <tbody>
+  {% for table in tables %}
+    <tr><td>{{ table.name }}</td><td class="num">{{ size(table.total_bytes) }}</td><td class="num">{{ size(table.heap_bytes) }}</td><td class="num">{{ size(table.toast_bytes) }}</td><td class="num">{{ size(table.index_bytes) }}</td><td class="num">{% if table.planner_rows < 0 %}<span class="hint">не анализировалась</span>{% else %}{{ table.planner_rows | int | num }}{% endif %}</td></tr>
+  {% endfor %}
+  {% if other_tables %}
+    <tr><td class="muted">ещё {{ other_tables }} таблиц</td><td class="num">{{ size(other_bytes) }}</td><td colspan="5" class="muted hint">мельче остальных</td></tr>
+  {% endif %}
+  </tbody>
+</table>
+</div>
+
+<h2>Задачи <a href="/admin/tasks">все задачи →</a></h2>
+{% if tasks_running or ended %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>#</th><th>Что</th><th>Состояние</th><th>Поставлена</th><th>Длилась</th><th>Как прошло</th></tr></thead>
+  <tbody>
+  {% for job in tasks_running %}{{ d.task(job, describe, figures, duration, now) }}{% endfor %}
+  {% for job in ended %}{{ d.task(job, describe, figures, duration, now) }}{% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="hint">Показаны активные задачи (не больше 25, новейшие первыми) и новейшая закончившаяся.</p>
+{% else %}<p class="hint">Задач из админки ещё не запускали.</p>{% endif %}
+{% endblock %}

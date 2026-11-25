@@ -50,6 +50,15 @@ x-api-environment: &api-environment
   # What a history import fetches for a record before storing it: parents
   # or full. Live events always bring the whole transaction.
   MTL_HORIZON_HISTORY_CONTEXT: ${MTL_HORIZON_HISTORY_CONTEXT:-parents}
+  # Stage 06: the admin UI (closed without a secret), where the installation
+  # is reached from, who reads the history API, and — only for a check of the
+  # real servers its owner allowed — the most attempts of the whole run.
+  MTL_HORIZON_ADMIN_SECRET: ${MTL_HORIZON_ADMIN_SECRET:-}
+  MTL_HORIZON_ADMIN_SESSION_SECONDS: ${MTL_HORIZON_ADMIN_SESSION_SECONDS:-43200}
+  MTL_HORIZON_PUBLIC_ORIGIN: ${MTL_HORIZON_PUBLIC_ORIGIN:-}
+  MTL_HORIZON_API_ACCESS: ${MTL_HORIZON_API_ACCESS:-token}
+  MTL_HORIZON_API_TOKENS: ${MTL_HORIZON_API_TOKENS:-}
+  MTL_HORIZON_LIVE_BUDGET: ${MTL_HORIZON_LIVE_BUDGET:-0}
   # Live collection: one cycle every so many seconds.
   MTL_HORIZON_COLLECTOR_INTERVAL: ${MTL_HORIZON_COLLECTOR_INTERVAL:-900}
 

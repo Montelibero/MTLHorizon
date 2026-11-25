@@ -1,0 +1,155 @@
+/* MTL Horizon — the admin UI. One stylesheet of its own: nothing is fetched
+   from outside this installation when a page opens. */
+
+:root {
+  --bg: #f6f7f9;
+  --paper: #ffffff;
+  --ink: #16202b;
+  --ink-soft: #566577;
+  --line: #d9dee5;
+  --accent: #1f5fbf;
+  --accent-ink: #ffffff;
+  --ok: #1f7a3f;
+  --ok-bg: #e3f4e8;
+  --work: #1f5fbf;
+  --work-bg: #e5eefc;
+  --wait: #8a5a00;
+  --wait-bg: #fff2d6;
+  --bad: #b42318;
+  --bad-bg: #fde8e6;
+  --mute: #566577;
+  --mute-bg: #eceff3;
+  --note: #5b3fa8;
+  --note-bg: #efe9fb;
+  --radius: 6px;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html { font-size: 15px; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  line-height: 1.45;
+}
+code, pre, .mono { font-family: var(--mono); font-size: 0.92em; }
+a { color: var(--accent); }
+h1 { font-size: 1.45rem; margin: 0 0 0.2rem; }
+h2 { font-size: 1.1rem; margin: 1.4rem 0 0.5rem; }
+h3 { font-size: 1rem; margin: 1rem 0 0.4rem; }
+p { margin: 0.4rem 0; }
+
+/* -- the top ------------------------------------------------------------------ */
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 1rem;
+  padding: 0.5rem 1rem;
+  background: #101820;
+  color: #e8edf2;
+}
+.brand { color: #fff; font-weight: 700; text-decoration: none; letter-spacing: 0.02em; }
+.nav { display: flex; flex-wrap: wrap; gap: 0.15rem; flex: 1 1 auto; }
+.nav a { color: #c4cfda; text-decoration: none; padding: 0.25rem 0.55rem; border-radius: var(--radius); white-space: nowrap; }
+.nav a:hover { background: #22303d; color: #fff; }
+.nav a.is-active { background: var(--accent); color: #fff; }
+.logout { margin-left: auto; }
+
+/* -- layout ------------------------------------------------------------------- */
+.main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
+.narrow { max-width: 560px; margin: 2rem auto; }
+.foot {
+  display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; align-items: center;
+  padding: 0.8rem 1rem 2rem; color: var(--ink-soft); font-size: 0.88rem; max-width: 1400px; margin: 0 auto;
+}
+.grid { display: grid; gap: 0.8rem; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); margin: 0.6rem 0 1rem; }
+.row { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; margin: 0.4rem 0; }
+.inline { display: inline; }
+.grow { flex: 1 1 auto; }
+.hint { color: var(--ink-soft); font-size: 0.9rem; }
+.muted { color: var(--ink-soft); }
+.right { text-align: right; }
+.nowrap { white-space: nowrap; }
+details { margin: 0.5rem 0; }
+summary { cursor: pointer; color: var(--ink-soft); }
+
+/* -- cards, notices, tables ----------------------------------------------------- */
+.card {
+  background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 0.8rem 1rem; margin: 0.6rem 0;
+}
+.stat { background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius); padding: 0.7rem 0.9rem; }
+.stat .label { color: var(--ink-soft); font-size: 0.86rem; }
+.stat .value { font-size: 1.5rem; font-weight: 650; font-variant-numeric: tabular-nums; }
+.stat .sub { color: var(--ink-soft); font-size: 0.86rem; }
+.notice { padding: 0.6rem 1rem; margin: 0.6rem 1rem; border-radius: var(--radius); border: 1px solid transparent; }
+.notice-ok { background: var(--ok-bg); color: var(--ok); border-color: #b7dfc3; }
+.notice-error { background: var(--bad-bg); color: var(--bad); border-color: #f3b9b3; }
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius); }
+table { border-collapse: collapse; width: 100%; font-size: 0.94rem; }
+th, td { padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th { color: var(--ink-soft); font-weight: 600; font-size: 0.86rem; white-space: nowrap; background: #fafbfc; }
+tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: #f7f9fb; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+dl.props { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 1rem; margin: 0.4rem 0; }
+dl.props dt { color: var(--ink-soft); }
+dl.props dd { margin: 0; word-break: break-all; }
+
+/* -- badges, buttons, forms ----------------------------------------------------- */
+.badge { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px; font-size: 0.82rem; font-weight: 600; white-space: nowrap; }
+.badge-ok { background: var(--ok-bg); color: var(--ok); }
+.badge-work { background: var(--work-bg); color: var(--work); }
+.badge-wait { background: var(--wait-bg); color: var(--wait); }
+.badge-bad { background: var(--bad-bg); color: var(--bad); }
+.badge-mute { background: var(--mute-bg); color: var(--mute); }
+.badge-note { background: var(--note-bg); color: var(--note); }
+.btn {
+  display: inline-block; padding: 0.32rem 0.75rem; border-radius: var(--radius); border: 1px solid var(--line);
+  background: var(--paper); color: var(--ink); font: inherit; font-size: 0.92rem; cursor: pointer; text-decoration: none;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn-primary:hover { filter: brightness(1.08); color: #fff; }
+.btn-danger { color: var(--bad); border-color: #e6b3ad; }
+.btn-danger:hover { background: var(--bad-bg); color: var(--bad); }
+.btn-quiet { background: transparent; color: #c4cfda; border-color: #3a4a5a; }
+.btn-quiet:hover { color: #fff; border-color: #fff; }
+.btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+.btn-small { padding: 0.1rem 0.45rem; font-size: 0.84rem; }
+.form label { display: block; margin: 0.6rem 0 0.2rem; color: var(--ink-soft); font-size: 0.9rem; }
+.form input[type="text"], .form input[type="password"], .form input[type="number"], .form select, .form input[type="url"] {
+  width: 100%; max-width: 34rem; padding: 0.4rem 0.55rem; border: 1px solid var(--line); border-radius: var(--radius);
+  font: inherit; background: #fff; color: var(--ink);
+}
+.form input:focus, .form select:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: var(--accent); }
+.form .btn { margin-top: 0.7rem; }
+.check { display: inline-flex; gap: 0.35rem; align-items: center; margin: 0.3rem 0.6rem 0.3rem 0; }
+.filter { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; align-items: end; margin: 0.4rem 0; }
+.filter label { display: block; font-size: 0.84rem; color: var(--ink-soft); }
+.filter select, .filter input { padding: 0.3rem 0.4rem; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; background: #fff; }
+.ago { color: var(--ink-soft); font-size: 0.88rem; white-space: nowrap; }
+
+/* -- addresses to copy, raw data ------------------------------------------------- */
+.copy { display: inline-flex; align-items: center; gap: 0.2rem; max-width: 100%; }
+.copy code { word-break: break-all; }
+.btn-copy { border: 0; background: transparent; cursor: pointer; color: var(--ink-soft); padding: 0 0.15rem; font-size: 0.95em; }
+.btn-copy:hover { color: var(--accent); }
+.json { background: #f3f5f8; border: 1px solid var(--line); border-radius: var(--radius); padding: 0.6rem 0.8rem; overflow-x: auto; max-height: 32rem; font-size: 0.84rem; }
+.pager { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; align-items: center; margin: 0.6rem 0; color: var(--ink-soft); font-size: 0.92rem; }
+.zone { display: inline-flex; gap: 0.3rem; align-items: center; }
+.bar { height: 0.5rem; background: var(--mute-bg); border-radius: 999px; overflow: hidden; min-width: 6rem; }
+.bar > span { display: block; height: 100%; background: var(--accent); }
+.chart { width: 100%; height: auto; background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius); }
+
+/* -- narrow screens --------------------------------------------------------------- */
+@media (max-width: 640px) {
+  html { font-size: 14px; }
+  .main { padding: 0.6rem; }
+  .nav a { padding: 0.3rem 0.5rem; }
+  th, td { padding: 0.35rem 0.45rem; }
+  .stat .value { font-size: 1.25rem; }
+}

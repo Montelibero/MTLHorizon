@@ -355,6 +355,19 @@ class FakeNotifierApi:
         """The active subscriptions, as the API returns them."""
         return [copy.deepcopy(record) for record in self._active()]
 
+    def switch_off(self, **where: Any) -> int:
+        """What happens at the Notifier when it gives up on a subscription —
+        ten deliveries in a row nobody answered — or when somebody deletes
+        one by hand there: its status becomes 1 and it is gone from the list;
+        of that nobody is told. ``where`` names the subscriptions (``id``, or
+        ``account``, ``asset_code``…). Returns how many were switched off."""
+        gone = 0
+        for record in self._stored:
+            if record.get("status", 0) == 0 and all(record.get(name) == value for name, value in where.items()):
+                record["status"] = 1
+                gone += 1
+        return gone
+
     def fail(self, times: int, status: int) -> None:
         self._failures.extend([status] * times)
 

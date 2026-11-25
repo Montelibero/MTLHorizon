@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% import "_activity_bits.html" as d %}
+{% block title %}Активность{% endblock %}
+{% block content %}
+<h1>Активность аккаунтов</h1>
+<p class="hint">Что каждый наблюдаемый аккаунт делал в период — по <strong>времени леджера</strong>, то есть когда закрылся леджер, а не когда запись попала в базу: импорт, шедший сегодня, приносит активность двухлетней давности как активность двухлетней давности. Страница только показывает и даёт отключить наблюдение руками: сама она ничего не блокирует, ни о чём не предупреждает и ничего не удаляет.</p>
+{% if period.trouble %}<div class="notice notice-error" role="alert">{{ period.trouble }}</div>{% endif %}
+
+{{ d.controls(periods, period, sorts, sort, descending, enabled, orders, per_page, default_per_page) }}
+
+<p>Период — <strong>{{ period_words }}</strong>: с {{ m.when(table.window.start) }} по {{ m.when(table.window.end) }}, правая граница не входит. Для сравнения — прежнее окно той же длины: с {{ m.when(table.previous.start) }} по {{ m.when(table.previous.end) }}. Посчитано в {{ m.when(table.measured_at) }}.</p>
+
+<h2>Уникальные записи установки за период</h2>
+<p class="hint">Посчитаны отдельно, каждая запись один раз, и <strong>никогда</strong> как сумма по аккаунтам: транзакция, в которой участвовали два наблюдаемых аккаунта, — одна запись.</p>
+<div class="grid">
+  {% for kind, words in kinds %}
+  <div class="stat"><div class="label">{{ words }}</div><div class="value" data-figure="totals.{{ kind }}">{{ table.totals[kind] | num }}</div><div class="sub">среди аккаунтов под фильтром</div></div>
+  {% endfor %}
+</div>
+
+<h2>Аккаунты <span class="hint">{{ table.accounts | num }} под фильтром</span></h2>
+<p class="hint">В каждом счётчике: сколько за период, в скобках — изменение против прежнего окна той же длины (на сколько и в процентах; «—», когда в прежнем окне был ноль), и сколько было в прежнем окне.</p>
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th{% if sort == 'account' %} aria-sort="{{ 'descending' if descending else 'ascending' }}"{% endif %}><a href="{{ request.url.path }}{{ request | query(sort='account', order='asc' if sort == 'account' and descending else 'desc', page=None) }}">Аккаунт{% if sort == 'account' %} {{ '↓' if descending else '↑' }}{% endif %}</a></th>
+      <th>Наблюдение</th>
+      {% for kind, words in kinds %}
+      <th class="num"{% if sort == kind %} aria-sort="{{ 'descending' if descending else 'ascending' }}"{% endif %}><a href="{{ request.url.path }}{{ request | query(sort=kind, order='asc' if sort == kind and descending else 'desc', page=None) }}">{{ words }}{% if sort == kind %} {{ '↓' if descending else '↑' }}{% endif %}</a></th>
+      {% endfor %}
+      <th>Последнее событие <span class="hint">по времени леджера</span></th>
+      <th>Свои / чужие активы <span class="hint">из операций периода</span></th>
+      <th class="num">Объём данных <span class="hint">примерно</span></th>
+      <th>Действие</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in table.rows %}
+    <tr data-account="{{ row.account_id }}" data-enabled="{{ 'on' if row.enabled else 'off' }}">
+      <td>
+        <span class="copy"><a href="/admin/accounts/{{ row.account_id }}" data-copy="{{ row.account_id }}" title="Страница аккаунта">{{ row.account_id | short(8) }}</a><button type="button" class="btn-copy" title="Скопировать адрес" aria-label="Скопировать адрес">⧉</button></span>
+        <div class="hint">{{ row.origin }}</div>
+      </td>
+      <td>{% if row.enabled %}<span class="badge badge-ok">включён</span>{% else %}<span class="badge badge-mute">отключён</span>{% endif %}</td>
+      {% for kind, words in kinds %}{{ d.count(row, kind, percent) }}{% endfor %}
+      <td>{% if row.last_event_at %}{{ m.when(row.last_event_at) }}<div class="hint">{{ row.last_event_at | ago(now) }} · леджер {{ row.last_ledger | num }}</div>{% else %}—<div class="hint">сохранённых событий нет</div>{% endif %}</td>
+      {{ d.assets(row.assets, why, share) }}
+      <td class="num" data-volume="{{ 'known' if row.volume_bytes is not none else 'unknown' }}">{% if row.volume_bytes is none %}<span class="badge badge-mute">неизвестно</span>{% else %}{{ size(row.volume_bytes) }}{% endif %}</td>
+      <td>{% if row.enabled %}{{ d.disable_form(row, csrf, back, reason_limit) }}{% else %}<span class="hint">—</span>{% endif %}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="10" class="muted">Наблюдаемых аккаунтов с такими условиями нет.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{{ m.pager(request, table.accounts, table.page, table.per_page) }}
+
+<p><strong>Записи двух наблюдаемых аккаунтов общие, и объёмы складывать нельзя.</strong> {{ volume_warning }}</p>
+{% if volume_trouble %}<p class="hint">{{ volume_trouble }}</p>{% endif %}
+<details>
+  <summary>По какой формуле считается объём</summary>
+  <p class="hint">{{ volume_formula }}</p>
+</details>
+<details>
+  <summary>Свои и чужие активы: по какому правилу и когда «неизвестно»</summary>
+  <p class="hint">{{ assets_rule }}</p>
+</details>
+
+<h2>Скорость загрузки <span class="hint">другое, чем активность</span></h2>
+<p class="hint">Активность выше считается по времени леджера, а это — по <strong>времени сохранения</strong> строк в базу: скорость импорта, другое, чем активность. {{ import_note }}</p>
+<div class="grid">
+  <div class="stat">
+    <div class="label">Строк в час за последние {{ speed.hours }} ч</div>
+    <div class="value" data-figure="speed.rows_per_hour">{% if speed.rows_per_hour is none %}неизвестно{% else %}{{ decimal(speed.rows_per_hour) }}{% endif %}</div>
+    <div class="sub">всего строк: <span data-figure="speed.rows">{% if speed.rows is none %}неизвестно{% else %}{{ speed.rows | num }}{% endif %}</span> · измерено {{ m.when(speed.measured_at) }} · таблиц измерено: {{ speed.measured_tables }} из {{ speed.tables | length }}</div>
+  </div>
+</div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Таблица</th><th>Откуда взято время строки</th><th class="num">Строк сохранено</th><th class="num">Строк в час</th></tr></thead>
+  <tbody>
+  {% for name, item in speed.tables.items() %}
+    <tr><td>{{ name }}</td><td>{{ item.column }}</td><td class="num">{% if item.rows is none %}<span class="hint">{{ why_not(item) }}</span>{% else %}{{ item.rows | num }}{% endif %}</td><td class="num">{{ decimal(item.rows_per_hour) }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<h3>По часам <span class="hint">строк сохранено за час, UTC; последний час ещё не кончился</span></h3>
+<div class="table-wrap">
+<table>
+  <tbody>
+  {% for hour in speed.series %}
+    <tr><td class="nowrap">{{ m.when(hour.hour) }}</td><td><div class="bar"><span style="width: {{ (100 * hour.rows / busiest) | round | int if busiest else 0 }}%"></span></div></td><td class="num" data-hour="{{ hour.hour | when }}">{{ hour.rows | num }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

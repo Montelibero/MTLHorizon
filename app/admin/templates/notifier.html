@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Notifier{% endblock %}
+{% block content %}
+<style>
+  /* Only this page: the table has to stay readable with long keys in it. Its columns are
+     given their widths, so that a long reason cannot squeeze the rest; on a narrow screen
+     the table keeps its width and scrolls inside its frame. */
+  .nt-table { table-layout: fixed; min-width: 85rem; }
+  .nt-rules, .nt-reason { overflow-wrap: anywhere; }
+  .nt-acts form { margin: 0.25rem 0; }
+</style>
+<h1>Notifier</h1>
+<p class="hint">Что эта установка хочет получать от Operations Notifier и что там действительно зарегистрировано и подтверждено. Страница читает только базу — то, что записали проходы сверки; самого Notifier она не спрашивает. Узнать, что у него на самом деле, может только задача: кнопки ниже.</p>
+
+{% if tasks.job %}
+  <div class="notice notice-ok" role="status">Задача <a href="/admin/tasks/{{ tasks.job.id }}">#{{ tasks.job.id }}</a> — {{ m.badge(tasks.job.state) }}{% if tasks.job.state in ("queued", "running") %}; итог появится здесь, когда она закончится{% endif %}.</div>
+{% endif %}
+
+<div class="grid">
+  <div class="stat"><div class="label">Нужно подписок</div><div class="value">{{ wanted | num }}</div><div class="sub">по правилам наблюдения</div></div>
+  <div class="stat"><div class="label">Из них подтверждено</div><div class="value">{{ confirmed | num }}</div><div class="sub">active и manual</div></div>
+  <div class="stat"><div class="label">С ошибкой</div><div class="value">{{ counts.error | num }}</div><div class="sub"><a href="{{ links.error }}">показать</a></div></div>
+  <div class="stat"><div class="label">Решает человек</div><div class="value">{{ counts.ambiguous | num }}</div><div class="sub"><a href="{{ links.ambiguous }}">показать</a></div></div>
+  <div class="stat"><div class="label">Пришло время попытки</div><div class="value">{{ due | num }}</div><div class="sub">ждут прохода</div></div>
+</div>
+
+<div class="card">
+  <h2>Сверить с Notifier</h2>
+  <div class="row">
+    {% if api.url %}
+      <form method="post" action="/admin/notifier/look" class="inline">{{ m.csrf(csrf) }}<button type="submit" class="btn">Что там сейчас?</button></form>
+      <form method="post" action="/admin/notifier/reconcile" class="inline">{{ m.csrf(csrf) }}<button type="submit" class="btn btn-primary">Сверить</button></form>
+    {% else %}
+      <span class="hint">API Notifier не настроен — сверки выключены: задачи закончились бы ошибкой. Подписки делают у Notifier вручную и принимают ниже по id.</span>
+    {% endif %}
+  </div>
+  <p class="hint">Обе кнопки только ставят задачу в очередь; выполняет её воркер в фоне, и только он говорит с Notifier. «Что там сейчас?» — сухой прогон: читает у Notifier список и говорит, что сделал бы проход, ничего не меняя. «Сверить» — сам проход: зарегистрирует недостающее, подтвердит, прочитав список, снимет лишнее из сделанного этой установкой.</p>
+  {% if api.url and not api.callback %}<div class="notice notice-error">Адрес вебхуков (MTL_HORIZON_NOTIFIER_CALLBACK_URL) не задан: проход ничего не зарегистрирует, пока его нет.</div>{% endif %}
+  {% if api.url and not api.signers %}<div class="notice notice-error">Ключи подписи вебхуков (MTL_HORIZON_NOTIFIER_KEYS) не заданы: вебхуки этого Notifier будут отвергнуты, и проход ничего не зарегистрирует.</div>{% endif %}
+  {% if tasks.running %}<p>С Notifier сейчас работает задача <a href="/admin/tasks/{{ tasks.running.id }}">#{{ tasks.running.id }}</a> ({{ m.badge(tasks.running.state) }}): ещё одна такая не ставится, дождитесь её конца.</p>{% endif %}
+</div>
+
+<h2>Хотим против подтверждённого</h2>
+<form method="get" action="/admin/notifier" class="filter">
+  <label>Состояние
+    <select name="state"><option value="">любое</option>{% for name in states %}<option value="{{ name }}"{% if state == name %} selected{% endif %}>{{ name }} ({{ counts[name] | num }})</option>{% endfor %}</select>
+  </label>
+  <label>Ключ содержит <input type="search" name="q" value="{{ q }}" maxlength="200"></label>
+  <button type="submit" class="btn">Показать</button>
+  {% if state or q %}<a href="/admin/notifier">сбросить</a>{% endif %}
+</form>
+<p class="hint">Вверху — то, что ждёт человека или своей очереди; ниже — активное и снятое. «Трогалась» — время последнего изменения строки: каждая попытка его меняет. Причины показаны теми словами, какими их записал проход.</p>
+<div class="table-wrap">
+  <table class="nt-table">
+    <colgroup>
+      <col style="width:4rem"><col style="width:10rem"><col><col style="width:10rem"><col style="width:7.5rem"><col style="width:15.5rem"><col><col style="width:12rem">
+    </colgroup>
+    <thead><tr><th>Тип</th><th>Ключ</th><th>Почему хотим</th><th>У Notifier</th><th>Состояние</th><th>Времена</th><th>Причина</th><th>Действия</th></tr></thead>
+    <tbody>
+    {% for line in lines %}
+      {% set row = line.row %}
+      <tr>
+        <td>{{ line.kind }}</td>
+        <td class="nowrap">{{ m.copy(line.key, kept=14) }}</td>
+        <td class="nt-rules">
+          {% if line.rules %}
+            {% for rule in line.rules %}<span title="{{ rule.rule }}">{{ rule.said }}</span>{% if not loop.last %}, {% endif %}{% endfor %}
+          {% else %}<span class="muted">уже не хотим: ни одно правило её не хочет</span>{% endif %}
+        </td>
+        <td class="nowrap">
+          {% if row and row.remote_id %}{{ m.copy(row.remote_id, kept=8) }}{% else %}—{% endif %}
+          <div class="hint">filter version: {% if row and row.filter_version is not none %}{{ row.filter_version }}{% else %}—{% endif %}</div>
+          {% if row and not row.managed %}<div class="hint">сделана руками</div>{% endif %}
+        </td>
+        <td>
+          {{ m.badge(line.state) }}
+          {% if row %}<div class="hint">попыток: {{ row.attempts }}</div>{% endif %}
+          {% if not row %}<div class="hint">строки ещё нет: её заведёт проход</div>
+          {% elif line.state == "retired" and line.wanted %}<div class="hint">снова нужна: проход вернёт её в работу</div>{% endif %}
+        </td>
+        <td>
+          {% if row %}
+            <div class="hint nowrap">трогалась {{ m.when(row.updated_at) }}</div>
+            {% if row.confirmed_at %}<div class="hint nowrap">подтверждена {{ m.when(row.confirmed_at) }}</div>{% endif %}
+            {% if line.state in ("wanted", "error", "retiring") %}
+              <div class="hint nowrap">следующая {{ m.when(row.next_attempt_at) }}</div>
+              {% if line.due %}<div class="hint">время пришло</div>{% endif %}
+            {% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td class="nt-reason">{% if row and row.last_error %}{{ row.last_error | short(160) }}{% else %}—{% endif %}</td>
+        <td class="nt-acts">
+          {% if line.state in ("error", "ambiguous") %}
+            <form method="post" action="/admin/notifier/retry">{{ m.csrf(csrf) }}<input type="hidden" name="row" value="{{ row.id }}"><button type="submit" class="btn btn-small">Повторить</button></form>
+            {% if line.state == "error" %}
+              <div class="hint">повтор — тот же проход; он возьмёт строку, когда подойдёт время попытки</div>
+            {% else %}
+              <div class="hint">какая из подписок наша — решает человек: <a href="/admin/notifier?kind={{ line.kind }}&key={{ line.key | urlencode }}#adopt">принять верную по id</a>; лишнюю снимите у Notifier сами</div>
+            {% endif %}
+          {% endif %}
+          {% if line.state == "manual" %}
+            {{ m.confirm("/admin/notifier/" ~ row.id ~ "/release", csrf, "Забыть здесь", "Забыть подписку " ~ row.remote_id ~ " здесь? У Notifier она останется — удалять её там, если нужно, придётся руками.", class="btn-small") }}
+            <div class="hint">у Notifier она останется</div>
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="muted">{% if not total and not wanted %}Подписок ещё нет: здесь появится то, что захотят правила наблюдения — аккаунты, активы и рынки.{% else %}По таким условиям ничего не найдено.{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{{ m.pager(request, total, page, per_page) }}
+
+{% include "_notifier_look.html" %}
+
+{% if tasks.pass %}
+  {% set words = {"wanted": "нужно", "created": "создано", "taken": "найдено уже готовыми", "confirmed": "подтверждено", "failed": "не получилось", "ambiguous": "неоднозначных", "retired": "снято"} %}
+  <div class="card" id="last-pass">
+    <h2>Как прошла последняя сверка</h2>
+    <p>Задача <a href="/admin/tasks/{{ tasks.pass.job.id }}">#{{ tasks.pass.job.id }}</a> · {{ m.badge(tasks.pass.job.state) }} · закончена {% if tasks.pass.job.finished_at %}{{ m.when(tasks.pass.job.finished_at) }}{% else %}—{% endif %}</p>
+    {% if tasks.pass.done %}
+      <dl class="props">
+        {% for name, value in tasks.pass.figures %}<dt>{{ words[name] }}</dt><dd>{{ value | num }}</dd>{% endfor %}
+      </dl>
+      {% if tasks.pass.unreachable %}<div class="notice notice-error">С Notifier не удалось поговорить: {{ tasks.pass.unreachable }}</div>{% endif %}
+      {% if tasks.pass.problems %}
+        <p>Что не получилось:</p>
+        <ul>{% for problem in tasks.pass.problems %}<li>{{ problem }}</li>{% endfor %}</ul>
+      {% endif %}
+    {% else %}
+      <div class="notice notice-error">{{ tasks.pass.error }}</div>
+    {% endif %}
+    <p class="hint">Итог прохода в числах; что осталось с ошибкой и почему — в таблице выше, у каждой строки.</p>
+  </div>
+{% endif %}
+
+{% include "_notifier_adopt.html" %}
+
+<div class="card">
+  <h2>Как эта установка говорит с Notifier</h2>
+  <dl class="props">
+    <dt>API Notifier</dt><dd>{% if api.url %}{{ api.url }}{% else %}<span class="muted">не настроен (MTL_HORIZON_NOTIFIER_API_URL пуст): ничего не регистрируется автоматически</span>{% endif %}</dd>
+    <dt>Токен API</dt><dd>{{ "задан" if api.token else "не задан" }} <span class="hint">(секрет; на странице не показывается)</span></dd>
+    <dt>Адрес вебхуков</dt><dd>{% if api.callback %}{{ api.callback }}{% else %}<span class="muted">не задан</span>{% endif %} <span class="hint">— его установка ставит в каждую свою подписку и по нему узнаёт свои в списке у Notifier</span></dd>
+    <dt>Ключи подписи вебхуков</dt><dd>{% if api.signers %}задано: {{ api.signers | num }}{% else %}<span class="muted">не заданы: вебхуки не принимаются</span>{% endif %}</dd>
+  </dl>
+</div>
+
+{% include "_notifier_requirements.html" %}
+
+<details>
+  <summary>Что означают состояния</summary>
+  <dl class="props">
+    <dt>wanted</dt><dd>нужна; будет зарегистрирована, когда подойдёт время попытки</dd>
+    <dt>active</dt><dd>зарегистрирована и подтверждена: прочитана в списке Notifier с адресом и фильтрами этой установки</dd>
+    <dt>error</dt><dd>последняя попытка не удалась — почему, сказано в причине; повторяется с растущей паузой</dd>
+    <dt>ambiguous</dt><dd>подходит больше одной подписки, или она не такая, какую регистрирует установка: решает человек</dd>
+    <dt>retiring</dt><dd>больше не нужна: проход снимет её у Notifier — это сделала сама установка</dd>
+    <dt>manual</dt><dd>сделана руками и принята по id: установка её никогда не удалит</dd>
+    <dt>retired</dt><dd>снята у Notifier или забыта здесь; строка осталась для памяти</dd>
+  </dl>
+</details>
+{% endblock %}

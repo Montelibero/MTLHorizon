@@ -30,7 +30,7 @@ raised it), costs nothing but time: nothing is forgotten.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -48,6 +48,7 @@ from app.notifier.client import (
     same_subscription,
     subscription_params,
 )
+from app.storage import service_state
 from app.storage.locks import AdvisoryLock
 from app.storage.models import WatchSubscription
 from app.subscriptions import desired
@@ -72,6 +73,11 @@ PASS_ACTIONS = 50
 # an asset's type is written by the service, not by the request).
 ONE_AT_A_TIME = "mtl-horizon:subscriptions"
 WAIT_FOR_THE_OTHER = timedelta(seconds=2)
+# The subscriptions registered here as active are read back at the
+# Notifier this often, to find one deleted or switched off there: of that
+# nobody tells, the Notifier simply sends nothing for it any more.
+AUDITED = "subscriptions_audited_at"
+AUDIT_EVERY = timedelta(minutes=10)
 
 
 @dataclass
@@ -174,7 +180,8 @@ def _run(
     wanted = ensure(engine, callback_url, now=now)
     report.wanted = len(wanted)
     due = _due(engine, now, actions)
-    if not due:
+    audit_due = _audit_due(engine, now)
+    if not due and not audit_due:
         return report
     try:
         listing = api.list_subscriptions()
@@ -188,6 +195,8 @@ def _run(
         _postpone(engine, [row.id for row in due], now, "the answer could not be read", error=str(error))
         return report
 
+    _audit(engine, listing, callback_url, now, report)
+    _audited(engine, now)
     for row in due:
         want = wanted.get((row.kind, row.key))
         try:
@@ -319,8 +328,37 @@ def _confirm(
         )
         report.ambiguous += 1
     else:
-        _set(engine, row.id, state=ACTIVE, attempts=0, last_error=None, confirmed_at=now, next_attempt_at=now)
+        _set(
+            engine,
+            row.id,
+            state=ACTIVE,
+            attempts=0,
+            last_error=None,
+            confirmed_at=now,
+            next_attempt_at=now,
+            filter_version=_version_of(found),
+        )
         report.confirmed += 1
+
+
+def _version_of(subscription: Mapping[str, Any]) -> int:
+    """The rules a subscription at the Notifier is matched by, as it says of
+    itself; 1 when it says nothing (the subscriptions made before v0.12.0)."""
+    version = subscription.get("filter_version")
+    return version if isinstance(version, int) and not isinstance(version, bool) else 1
+
+
+def try_now(engine: Engine, row_id: int, *, now: datetime | None = None) -> bool:
+    """The next attempt of a row that waits for its pause is brought forward
+    to now — for a person who asked for a retry. False when the row is not
+    one that waits: active, gone, or one a person is to decide about."""
+    now = now or datetime.now(UTC)
+    with Session(engine) as session, session.begin():
+        row = session.get(WatchSubscription, row_id)
+        if row is None or row.state not in (ERROR, WANTED):
+            return False
+        row.next_attempt_at = now
+        return True
 
 
 def _retire(engine: Engine, api: NotifierClient, row: WatchSubscription, now: datetime, report: Report) -> None:
@@ -410,10 +448,12 @@ def adopt(
     now = now or datetime.now(UTC)
     if kind not in (ACCOUNT, ASSET):
         raise ValueError(f"kind is one of {ACCOUNT}, {ASSET}")
+    version: int | None = None  # the rules it is matched by, when the Notifier said
     if api is not None:
         found = next((sub for sub in api.list_subscriptions() if str(remote_id(sub)) == remote), None)
         if found is None:
             raise NotifierRejected(f"subscription {remote} is not in the Notifier's list", 404, "not found")
+        version = _version_of(found)
         if callback_url and not same_subscription(found, subscription_params(kind, key, callback_url)):
             raise NotifierRejected(
                 f"subscription {remote} does not have the address and filters this installation registers for {kind} {key}",
@@ -435,6 +475,7 @@ def adopt(
             session.flush()
         row.remote_id, row.state, row.managed = remote, MANUAL, False
         row.confirmed_at, row.last_error, row.attempts = now, None, 0
+        row.filter_version = version
         session.flush()
         return int(row.id)
 
@@ -451,3 +492,141 @@ def release(engine: Engine, row_id: int, *, now: datetime | None = None) -> str:
             raise ValueError(f"subscription row {row_id} is {row.state}, not adopted by hand")
         row.state, row.next_attempt_at = RETIRED, now
         return f"forgotten; it stays at the Notifier as {row.remote_id} — delete it there by hand if it is to go"
+
+
+# -- what is really there ------------------------------------------------------
+
+
+def _audit_due(engine: Engine, now: datetime) -> bool:
+    with Session(engine) as session:
+        kept = service_state.get(session, AUDITED)
+    try:
+        last = datetime.fromisoformat(kept["at"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return now - last >= AUDIT_EVERY
+
+
+def _audited(engine: Engine, now: datetime) -> None:
+    with Session(engine) as session, session.begin():
+        service_state.put(session, AUDITED, {"at": now.isoformat(timespec="seconds")})
+
+
+def _by_id(listing: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {str(remote_id(sub)): sub for sub in listing if remote_id(sub) is not None}
+
+
+def _audit(engine: Engine, listing: list[dict[str, Any]], callback_url: str, now: datetime, report: Report) -> None:
+    """Registered here as active — is it still at the Notifier? One deleted
+    there, or switched off by the Notifier itself after ten deliveries nobody
+    answered, is heard of from nobody: the Notifier sends nothing more for
+    it. Such a subscription is wanted again and is registered on a later
+    pass — once: the list is read before anything is created — after a pause
+    that grows, for a subscription the Notifier keeps switching off is not to
+    be remade in a tight loop. One made by hand and gone is a person's to
+    decide about: it is marked ``ambiguous`` and nothing is made in its place.
+    A subscription there that is no longer what this installation registers
+    is a person's decision too."""
+    by_id = _by_id(listing)
+    gone: list[str] = []
+    with Session(engine) as session, session.begin():
+        for row in session.scalars(select(WatchSubscription).where(WatchSubscription.state.in_(CONFIRMED))):
+            found = by_id.get(row.remote_id or "")
+            params = subscription_params(row.kind, row.key, callback_url)
+            if found is not None and same_subscription(found, params):
+                continue
+            if not row.managed:
+                row.state, row.attempts = AMBIGUOUS, row.attempts + 1
+                row.last_error = (
+                    f"subscription {row.remote_id} is gone from the Notifier" if found is None else
+                    f"subscription {row.remote_id} at the Notifier is no longer what was adopted: a person decides"
+                )
+                report.ambiguous += 1
+                report.problems.append(f"{row.kind} {row.key[:12]}…: {row.last_error}")
+            elif found is None:
+                row.state, row.remote_id, row.managed = WANTED, None, True
+                row.attempts += 1
+                row.next_attempt_at = now + _pause(row.attempts)
+                row.last_error = "gone from the Notifier (deleted or switched off there): to be registered again"
+                gone.append(f"{row.kind} {row.key[:12]}…")
+            else:
+                row.state, row.last_error = AMBIGUOUS, (
+                    f"subscription {row.remote_id} at the Notifier is no longer what this installation registered: a person decides"
+                )
+                report.ambiguous += 1
+                report.problems.append(f"{row.kind} {row.key[:12]}…: {row.last_error}")
+    if gone:
+        report.problems.append("gone from the Notifier, to be registered again: " + ", ".join(gone[:5]) + (" …" if len(gone) > 5 else ""))
+        logger.warning("%d subscription(s) are gone from the Notifier; they are registered again after a pause", len(gone))
+
+
+def plan(
+    engine: Engine,
+    api: NotifierClient,
+    callback_url: str,
+    *,
+    keys: Collection[str] = (),
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """What a pass would do — create, take, retire, register again — read
+    from the Notifier and written nowhere; and what the Notifier says of
+    itself. For a dry run, and for a button that asks what is really there
+    rather than what is kept here.
+
+    ``keys`` are the keys this installation takes webhooks from: a Notifier
+    that signs with another key would have its webhooks refused here, and
+    nothing should be registered with it.
+    """
+    now = now or datetime.now(UTC)
+    with Session(engine) as session:
+        wanted = desired.wanted(session)
+        rows = list(session.scalars(select(WatchSubscription).where(WatchSubscription.state != RETIRED)))
+    status = api.status()
+    listing = api.list_subscriptions()
+    by_id = _by_id(listing)
+    steps: list[dict[str, Any]] = []
+    for row in sorted(rows, key=lambda row: (row.kind, row.key)):
+        want = wanted.get((row.kind, row.key))
+        params = subscription_params(row.kind, row.key, callback_url)
+        found = by_id.get(row.remote_id or "")
+        if row.state in CONFIRMED:
+            if found is None and row.managed:
+                _step(steps, row, "register again", "gone from the Notifier (deleted or switched off there)")
+            elif found is None:
+                _step(steps, row, "a person decides", "made by hand, and gone from the Notifier: nothing is made in its place")
+            elif not same_subscription(found, params):
+                _step(steps, row, "a person decides", f"subscription {row.remote_id} is no longer what this installation registers")
+            continue
+        if want is None:
+            _step(steps, row, "retire" if row.managed and row.remote_id else "forget", "nothing wants it any more")
+            continue
+        if row.state == RETIRING:
+            _step(steps, row, "retire", "no longer wanted at the Notifier")
+            continue
+        fits = [sub for sub in listing if same_subscription(sub, params)]
+        if not fits:
+            what = "create"
+        elif len(fits) == 1:
+            what = f"take {remote_id(fits[0])}"
+        else:
+            what = f"a person decides: {len(fits)} fit"
+        _step(steps, row, what, "wanted, and not confirmed yet")
+    for key, want in sorted(wanted.items()):
+        if all((row.kind, row.key) != key for row in rows):
+            steps.append({"what": "create", "kind": want.kind, "key": want.key, "why": ", ".join(want.rules)})
+    signer = status.get("publicKey")
+    return {
+        "at": now.isoformat(timespec="seconds"),
+        "signer": signer,
+        # None when no keys were given: not this question's to answer.
+        "signer_known": None if not keys else signer in keys,
+        "at_notifier": len(listing),
+        "foreign": sum(1 for sub in listing if sub.get("reaction_url") != callback_url),
+        "wanted": len(wanted),
+        "steps": steps,
+        "would_do_nothing": not steps,
+    }
+
+
+def _step(steps: list[dict[str, Any]], row: WatchSubscription, what: str, why: str) -> None:
+    steps.append({"what": what, "kind": row.kind, "key": row.key, "why": why, "state": row.state})

@@ -19,6 +19,11 @@ Two ways of getting what a record needs before it can be stored
   operation and transaction of an effect or a trade. Nothing is then known
   about the rest of the transaction, and ``context_loaded`` stays empty.
 
+A run keeps count of what it stored (``Backfill.stored``), and may tell its
+caller of every page the moment it is stored, in the transaction that
+stored it (``on_page_stored``): whoever counts elsewhere what was stored is
+to count it there and then, so that a crash cannot part the two.
+
 The stream reading here is backwards; :mod:`app.collector` reads forward with
 the same pieces.
 """
@@ -42,10 +47,14 @@ from app.sources import horizon_records as records
 from app.sources.horizon import BeforeHistory, HorizonClient, OrderKey, Page, RateLimited, Unavailable
 from app.sources.horizon_cursors import InvalidCursor, after_ledger, order_key, parse_cursor
 from app.storage import coverage
-from app.storage.upsert import checkpoint, set_checkpoint
+from app.storage.upsert import StoredCounts, checkpoint, count_stored, set_checkpoint
 from app.storage.writer import HistoryWriter
 
 logger = logging.getLogger(__name__)
+
+# Called inside the transaction that stored a page, after everything of the
+# page is stored and before the commit: the session, and what the page stored.
+PageStored = Callable[[Session, StoredCounts], None]
 
 CONTEXT_STREAMS = frozenset(records.CONTEXT_STREAMS)
 # The context streams in the order a transaction is brought in when it is
@@ -488,6 +497,11 @@ class Backfill:
 
     ``context`` says what is fetched for a record before it is stored:
     ``full`` or ``parents`` (see the module).
+
+    ``stored`` is what the run stored so far: its committed pages, and in
+    them the records read and the rows inserted or found stored, by data
+    type. ``on_page_stored`` is told of each page inside the transaction
+    that stored it.
     """
 
     def __init__(
@@ -499,6 +513,7 @@ class Backfill:
         page_size: int = 200,
         limits: Limits | None = None,
         context: str = FULL,
+        on_page_stored: PageStored | None = None,
     ) -> None:
         if context not in CONTEXT_MODES:
             raise ValueError(f"unknown context mode {context!r}")
@@ -507,6 +522,8 @@ class Backfill:
         self.page_size = page_size
         self.context = context
         self.limits = limits if limits is not None else Limits(requests=client_stats(client))
+        self.on_page_stored = on_page_stored
+        self.stored = StoredCounts()
         client.before_request = self.limits.check
         self.writer = HistoryWriter(engine)
         self._read_lock = threading.Lock()
@@ -632,16 +649,22 @@ class Backfill:
             # The source's history may have moved up past ledgers of this range
             # that were never read: an empty page does not tell.
             elder = None if hand_over else (self._elder_if_reachable(lower) if finished else None)
+            page_stored = StoredCounts(pages=1, records=len(inside))
             try:
                 with self.writer.transaction() as session:
+                    count_stored(session, page_stored)
                     self._store_page(
                         session, job, inside, inside_ledgers, floor, upper, last_ledger, elder, segment_has_records,
                         finished, page.served_by,
                     )
+                    if self.on_page_stored is not None:
+                        self.on_page_stored(session, page_stored)
             except Exception:
                 self.contexts.discarded()
                 raise
             self.contexts.committed()
+            # Committed: only now is it the run's.
+            self.stored.add(page_stored)
             report.records += len(inside)
 
             if finished and not hand_over:

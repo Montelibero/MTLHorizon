@@ -24,6 +24,7 @@ from app.storage import pace, pool_state
 from app.storage.pace import Pace
 from app.storage.db import create_db_engine
 from app.storage.network import NetworkMismatch, assert_network
+from app.sources import live
 from app.sources.horizon import HorizonClient, HorizonSettings
 from app.sources.pool import HorizonPool, PoolSettings
 
@@ -116,6 +117,7 @@ def make_client(settings: Settings, engine: Engine | None = None, *, share: str 
     the process does: the worker that handles events has the right of way,
     everything else reads in the background.
     """
+    live.configure(settings.live_budget, engine)
     return HorizonPool(
         settings.horizon_urls,
         HorizonSettings(requests_per_second=settings.horizon_requests_per_second),

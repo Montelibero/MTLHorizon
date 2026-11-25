@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}График рынка{% endblock %}
+{% block content %}
+<h1>График рынка</h1>
+<p class="hint">Цена и объём сделок рынка по корзинам времени — из того, что архив этой установки успел собрать. Корзины те же, что отдаёт исторический API, и по тем же формулам. Внешних библиотек и внешних серверов здесь нет: рисунок строит сама установка из чисел, и открытие страницы ничего ни у кого не спрашивает. Интервал без сделок не рисуется и не выдумывается.</p>
+
+<form method="get" action="/admin/chart" class="card form">
+  <div class="row">
+    <label>Базовый актив (base): native или CODE:ISSUER
+      <input type="text" name="base" value="{{ asked.base }}" placeholder="native" maxlength="80" autocomplete="off" spellcheck="false">
+    </label>
+    <label>Актив котировки (counter): native или CODE:ISSUER
+      <input type="text" name="counter" value="{{ asked.counter }}" placeholder="CODE:ISSUER" maxlength="80" autocomplete="off" spellcheck="false">
+    </label>
+  </div>
+  <div class="row">
+    <label>Период
+      <select name="period">{% for value, words in periods %}<option value="{{ value }}"{% if (asked.period or "day") == value %} selected{% endif %}>{{ words }}</option>{% endfor %}</select>
+    </label>
+    <label>Разрешение (размер корзины)
+      <select name="resolution">{% for value, words in resolutions %}<option value="{{ value }}"{% if (asked.resolution or "auto") == value %} selected{% endif %}>{{ words }}</option>{% endfor %}</select>
+    </label>
+  </div>
+  <div class="row">
+    <label>Концы своего периода
+      <select name="unit">{% for value, words in units %}<option value="{{ value }}"{% if (asked.unit or "time") == value %} selected{% endif %}>{{ words }}</option>{% endfor %}</select>
+    </label>
+    <label>От
+      <input type="text" name="from" value="{{ asked.from }}" placeholder="{{ '104' if (asked.unit or 'time') == 'ledger' else '2026-01-01 00:00' }}" maxlength="40" autocomplete="off">
+    </label>
+    <label>До (не включая)
+      <input type="text" name="to" value="{{ asked.to }}" placeholder="{{ '118' if (asked.unit or 'time') == 'ledger' else '2026-02-01' }}" maxlength="40" autocomplete="off">
+    </label>
+  </div>
+  <button type="submit" class="btn btn-primary">Нарисовать</button>
+  <p class="hint">Время — в UTC: <code>2026-01-31</code> (с начала дня) или <code>2026-01-31 12:30</code>. «До» не входит в период; если оно не задано, период кончается сразу после последнего леджера архива. Для леджеров — их номера: время берётся у тех из них, что архив знает. Период ограничен: больше {{ most_bins | num }} корзин не рисуется.</p>
+</form>
+
+{% if chart %}
+  <h2>{{ chart.base | short(20) }} → {{ chart.counter | short(20) }}</h2>
+  <p>Каноническая пара (меньший актив первым): {{ m.copy(chart.key, kept=44) }}. Рисунок — в спрашиваемой ориентации: base — <code>{{ chart.base | short(24) }}</code>, counter — <code>{{ chart.counter | short(24) }}</code>; цена — counter за единицу base. <a href="{{ chart.flip }}">Перевернуть пару</a>.</p>
+  <p>{{ chart.kind }}: {{ m.when(chart.start) }} — {{ m.when(chart.end) }} (не включая) · корзина {{ chart.resolution }} · корзин в периоде {{ chart.period.bins | num }}, из них со сделками {{ chart.found | num }} · {{ chart.period.bounds }}.</p>
+
+  {% if chart.coverage.tracked is none %}
+    <div class="notice notice-error">Этот рынок не наблюдается установкой: его история не импортируется, и то, что попало в архив, принесли только сделки наблюдаемых аккаунтов. <a href="/admin/markets">Добавить рынок →</a></div>
+  {% elif not chart.coverage.tracked.enabled %}
+    <div class="notice notice-error">Рынок есть в списке наблюдения, но выключен: его история не импортируется.</div>
+  {% endif %}
+  {% if not chart.found %}
+    <div class="notice notice-error">За этот период в архиве нет сделок этого рынка. Это значит «здесь нет», а не «в сети не было»: смотрите покрытие ниже.</div>
+  {% endif %}
+
+  <div class="card">{{ chart.svg | safe }}</div>
+  <p class="hint">
+    <span class="badge" style="background:#1f7a3f;color:#fff">рост</span>
+    <span class="badge" style="background:#b42318;color:#fff">падение</span> — цена: открытие, максимум, минимум и закрытие корзины;
+    <span style="color:#1f5fbf">■</span> объём base и <span style="color:#a9c3ea">■</span> объём counter по корзинам (каждый ряд — от своего максимума).
+  </p>
+  <p class="hint">Полоса под ценой — покрытие архива по этому рынку на той же оси времени:
+    <span class="badge" style="background:#1f7a3f;color:#fff">проверено</span>
+    <span class="badge" style="background:#b7dfc3;color:#1f7a3f">проверено, пусто</span>
+    <span class="badge" style="background:#e0a400;color:#fff">не прочитано</span>
+    <span class="badge" style="background:#b42318;color:#fff">недоступно для проверки</span>
+    <span class="badge" style="background:#eceff3;color:#566577">ничего не утверждается</span>
+  </p>
+
+  {% include "_chart_coverage.html" %}
+
+  {% if chart.rows %}
+    <details>
+      <summary>Корзины таблицей: {{ chart.rows | length | num }} из {{ chart.found | num }}{% if chart.unpriced %}; в {{ chart.unpriced | num }} из них нет цен — на стороне base ноль, и делить объёмы не на что{% endif %}</summary>
+      <p class="hint">Всего за период: сделок {{ chart.totals.trades | num }}, объём base {{ chart.totals.base }}, объём counter {{ chart.totals.counter }}. Суммы и цены — семь знаков, как у исторического API.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Начало корзины (UTC)</th><th class="num">Сделок</th><th class="num">Объём base</th><th class="num">Объём counter</th><th class="num">Средняя</th><th class="num">Открытие</th><th class="num">Максимум</th><th class="num">Минимум</th><th class="num">Закрытие</th></tr></thead>
+          <tbody>
+            {% for row in chart.rows %}
+              <tr>
+                <td>{{ m.when(row.at) }}</td>
+                <td class="num">{{ row.count }}</td>
+                <td class="num">{{ row.base }}</td>
+                <td class="num">{{ row.counter }}</td>
+                <td class="num">{{ row.avg or "—" }}</td>
+                <td class="num">{{ row.open or "—" }}</td>
+                <td class="num">{{ row.high or "—" }}</td>
+                <td class="num">{{ row.low or "—" }}</td>
+                <td class="num">{{ row.close or "—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if chart.rows | length < chart.found %}<p class="hint">Показаны последние {{ chart.rows | length | num }} корзин.</p>{% endif %}
+    </details>
+  {% endif %}
+
+  <p>Для программ те же корзины отдаёт исторический API: <a href="{{ chart.api }}"><code>/trade_aggregations</code></a> — этот же рынок, период и разрешение (в браузере без токена API ответит 401; корзины идут страницами по 200, параметр <code>offset</code>). Что проверено, говорит <a href="{{ chart.coverage_query }}"><code>/v1/coverage</code></a>. Описание — в <code>docs/history-api.md</code>, разделы 9 и 10; все маршруты — в <a href="/docs" rel="noopener">OpenAPI</a>.</p>
+{% endif %}
+{% endblock %}
