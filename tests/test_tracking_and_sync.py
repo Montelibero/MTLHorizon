@@ -15,6 +15,7 @@ from app.storage.models import (
     SyncCoverage,
     SyncState,
     TrackedAccount,
+    TrackedAsset,
     TrackedMarket,
 )
 from app.storage.upsert import set_checkpoint, upsert_row
@@ -113,35 +114,33 @@ def test_ranges_are_per_data_type_and_policy(session: Session) -> None:
     assert session.scalar(select(func.count()).select_from(SyncCoverage)) == 4
 
 
-def test_account_mode_changes_keep_collected_history(session: Session) -> None:
+def test_switching_an_account_off_keeps_collected_history(session: Session) -> None:
     f.add_account(session, f.ALICE)
-    upsert_row(
-        session, TrackedAccount.__table__, {"account_id": f.ALICE}, {"mode": "FULL", "reason": "test"}
-    )
+    upsert_row(session, TrackedAccount.__table__, {"account_id": f.ALICE}, {"enabled": True, "reason": "test"})
     transaction_id = f.add_transaction(session, 1, source_account=f.ALICE)
     f.add_operation(session, transaction_id)
 
-    for mode in ("ASSETS_ONLY", "FULL"):
-        session.execute(
-            update(TrackedAccount).where(TrackedAccount.account_id == f.ALICE).values(mode=mode)
-        )
+    for enabled in (False, True):
+        session.execute(update(TrackedAccount).where(TrackedAccount.account_id == f.ALICE).values(enabled=enabled))
 
-    assert session.get(TrackedAccount, f.ALICE).mode == "FULL"
+    assert session.get(TrackedAccount, f.ALICE).enabled is True
     assert session.get(HistoryTransaction, transaction_id) is not None
     assert session.scalar(select(func.count()).select_from(HistoryOperation)) == 1
 
 
-def test_unknown_mode_is_refused(session: Session) -> None:
+def test_the_watch_lists_are_independent(session: Session) -> None:
+    """Switching an account off switches off neither its assets nor a market."""
     f.add_account(session, f.ALICE)
-    assert f.is_refused(
-        session,
-        lambda: upsert_row(
-            session,
-            TrackedAccount.__table__,
-            {"account_id": f.ALICE},
-            {"mode": "SOMETIMES", "reason": "test"},
-        ),
-    )
+    upsert_row(session, TrackedAccount.__table__, {"account_id": f.ALICE}, {"enabled": True, "reason": "test"})
+    f.add_asset(session, f.EUR)
+    f.add_asset(session, f.USD)
+    upsert_row(session, TrackedMarket.__table__, {"base_asset_id": f.EUR, "counter_asset_id": f.USD}, {"reason": "test"})
+    upsert_row(session, TrackedAsset.__table__, {"asset_id": f.EUR}, {"reason": "test"})
+    session.execute(update(TrackedAccount).where(TrackedAccount.account_id == f.ALICE).values(enabled=False))
+
+    assert session.get(TrackedAccount, f.ALICE).enabled is False
+    assert session.scalar(select(TrackedAsset.enabled)) is True
+    assert session.scalar(select(TrackedMarket.enabled)) is True
 
 
 def test_market_history_does_not_depend_on_the_account_watch_list(session: Session) -> None:

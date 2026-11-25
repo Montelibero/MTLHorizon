@@ -7,6 +7,10 @@ The pace is kept by this client. The public server limits requests per
 address and says so only once it refuses: a 429 carries ``X-RateLimit-*``
 headers and no ``Retry-After``. So the pace is set below what the server
 allows, and a 429 is waited out for as long as the server asks.
+
+A pool of several servers is this client with a few hooks replaced. They
+are marked ``hook`` below and do here what one server needs: nothing, or
+what was always done (:mod:`app.sources.pool`).
 """
 
 from __future__ import annotations
@@ -20,11 +24,12 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 import httpx
 
 from app import __version__
+from app.config import shown_url
 from app.sources.horizon_cursors import InvalidCursor, order_key
 
 # Worth asking again: the answer may differ next time. 404 and 410 are final.
@@ -61,7 +66,14 @@ class NotFound(ResponseError):
 
 
 class BeforeHistory(ResponseError):
-    """410: the request reaches older than the history this server keeps."""
+    """410: the request reaches older than the history this server keeps.
+
+    ``history`` is what the servers that so answered keep (a ``History``),
+    when the client knows; a reader closes the range against it without
+    asking again.
+    """
+
+    history: "History | None" = None
 
 
 class RateLimited(HorizonError):
@@ -70,6 +82,10 @@ class RateLimited(HorizonError):
 
 class RequestFailed(HorizonError):
     """A status that will not change on retry, or no answer after every attempt."""
+
+
+class WrongNetwork(HorizonError):
+    """Every server that could answer belongs to another Stellar network."""
 
 
 class MalformedResponse(HorizonError):
@@ -92,6 +108,10 @@ class RequestStats:
     rate_limited: int = 0
     # Requests given up on at the deadline and repeated on a new connection.
     abandoned: int = 0
+    # Answers (2xx) per server, by the name it is shown under.
+    by_server: Counter[str] = field(default_factory=Counter)
+    # How often a server had to be given up for another one.
+    failovers: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +121,8 @@ class RequestStats:
             "waited_seconds": round(self.waited_seconds, 3),
             "rate_limited": self.rate_limited,
             "abandoned": self.abandoned,
+            "by_server": dict(sorted(self.by_server.items())),
+            "failovers": self.failovers,
         }
 
 
@@ -125,12 +147,37 @@ class HorizonSettings:
 
 
 @dataclass(frozen=True)
+class Scope:
+    """The ledgers a reading sequence is about: from ``from_ledger`` up to
+    ``through``. A server that keeps none of it, or has not got as far as
+    its top, is not asked. None is where the sequence does not care."""
+
+    from_ledger: int | None = None
+    through: int | None = None
+
+
+@dataclass(frozen=True)
+class History:
+    """What a server, or a pool of them, keeps: ``elder`` the oldest ledger
+    some available server still answers for, ``latest`` the newest ledger
+    any of them has, and what the newest of them says of itself."""
+
+    elder: int
+    latest: int
+    name: str = ""
+    network_passphrase: str | None = None
+    latest_closed_at: str | None = None
+
+
+@dataclass(frozen=True)
 class Page:
     """One page of a collection.
 
     ``query`` is what was asked for. ``next_query`` is the same request with
     the cursor of `_links.next`, after that link has been checked; it is None
-    on the last page.
+    on the last page. ``served_by`` is the server that answered, as it is
+    shown to people, and ``history_from`` the oldest ledger it keeps when it
+    has said so: a page that ends above it says nothing about what lies below.
     """
 
     records: tuple[Mapping[str, Any], ...]
@@ -138,6 +185,8 @@ class Page:
     resource_type: str
     query: Mapping[str, Any]
     next_query: Mapping[str, Any] | None
+    served_by: str | None = None
+    history_from: int | None = None
 
     @property
     def next_cursor(self) -> str | None:
@@ -175,8 +224,14 @@ class HorizonClient:
         self._pace_lock = threading.Lock()
         self._clock = clock
         self._next_slot = clock()
+        # Of the request the current thread is making: which server is to
+        # answer it (``server``) and which one did. The attempt itself runs in
+        # a thread of its own, so the server is handed to it by name.
+        self._local = threading.local()
         # Called before every attempt; a run uses it to stop between requests.
         self.before_request: Callable[[], None] | None = None
+        # What a reading sequence is about, for whoever chooses the server.
+        self.scope: Scope | None = None
         # The last request answered and how many times it was the same one
         # (see _repeated).
         self._answered: str | None = None
@@ -184,11 +239,16 @@ class HorizonClient:
         self._sleep = sleeper
         self._rng = rng or random.Random()
 
-    def _new_client(self) -> httpx.Client:
+    @property
+    def name(self) -> str:
+        """The server as it is shown to people: no user name, no password."""
+        return shown_url(self.settings.base_url)
+
+    def _new_client(self, base_url: str | None = None, transport: httpx.BaseTransport | None = None) -> httpx.Client:
         return httpx.Client(
-            base_url=self.settings.base_url.rstrip("/") + "/",
+            base_url=(base_url or self.settings.base_url).rstrip("/") + "/",
             timeout=httpx.Timeout(self.settings.timeout_seconds, connect=10.0),
-            transport=self._transport,
+            transport=transport if transport is not None else self._transport,
             follow_redirects=False,
             headers={
                 "Accept": "application/hal+json, application/json",
@@ -206,42 +266,55 @@ class HorizonClient:
         self._http.close()
 
     def _send(self, path: str, query: Mapping[str, Any]) -> httpx.Response:
-        """GET on the shared client, under a deadline.
+        """GET on the shared client, under a deadline (see _under_deadline)."""
+        server = self._local.server
+        return self._under_deadline(
+            path, lambda: self._exchange(path, query, server), lambda: self._stalled(server)
+        )
 
-        The request runs in a thread of its own, so that a read that never
-        returns cannot hold up its stream. At the deadline the client, with
-        its connections, is dropped for a new one and the read counts as a
-        transport failure, which is worth a retry.
+    def _under_deadline(
+        self,
+        what: str,
+        request: Callable[[], httpx.Response],
+        stalled: Callable[[], None],
+        deadline: float | None = None,
+    ) -> httpx.Response:
+        """One attempt of ``request`` in a thread of its own, under the deadline.
+
+        A read that never returns cannot hold up its stream. At the deadline
+        ``stalled`` drops the connection with everything on it, and the
+        request counts as a transport failure, which is worth a retry.
+        ``deadline`` None is the setting; a pool asks a server's root under
+        a shorter one.
         """
         outcome: dict[str, Any] = {}
 
         def run() -> None:
             try:
-                outcome["response"] = self._http.get(path, params=dict(query))
+                outcome["response"] = request()
             except BaseException as error:  # noqa: BLE001 - handed to the caller
                 outcome["error"] = error
 
-        deadline = self.settings.request_deadline_seconds
+        limit = self.settings.request_deadline_seconds if deadline is None else deadline
         started = time.monotonic()
-        if deadline is None:
+        if limit is None:
             run()
         else:
             worker = threading.Thread(target=run, name="horizon-request", daemon=True)
             worker.start()
-            worker.join(deadline)
+            worker.join(limit)
             if worker.is_alive():
-                stuck, self._http = self._http, self._new_client()
-                stuck.close()
+                stalled()
                 self.stats.abandoned += 1
                 logger.warning(
                     "no answer to GET %s within %.0fs: the connection is dropped and the request repeated",
-                    path,
-                    deadline,
+                    what,
+                    limit,
                 )
-                raise httpx.ReadTimeout(f"no answer within {deadline:.0f}s")
+                raise httpx.ReadTimeout(f"no answer within {limit:.0f}s")
         spent = time.monotonic() - started
         if spent > 10:
-            logger.info("GET %s answered in %.1fs", path, spent)
+            logger.info("GET %s answered in %.1fs", what, spent)
         error, response = outcome.get("error"), outcome.get("response")
         if error is not None:
             raise error
@@ -332,9 +405,11 @@ class HorizonClient:
         asked = "&".join(f"{key}={value}" for key, value in sorted(query.items()) if value is not None)
         label = path + (f"?{asked}" if asked else "")
         attempts = self.settings.max_attempts
+        self._begin(path, query)
         for attempt in range(1, attempts + 1):
             if self.before_request is not None:
                 self.before_request()
+            self._prepare(path, query)
             self._pace()
             self.stats.requests += 1
             started = time.monotonic()
@@ -342,6 +417,7 @@ class HorizonClient:
                 response = self._send(path, query)
             except httpx.TransportError as error:
                 # Timeouts and connection problems are included.
+                self._note_transport_error(path, query, error)
                 if attempt == attempts:
                     raise RequestFailed(
                         f"no answer from Horizon for GET {label} after {attempts} attempts: {error}"
@@ -353,11 +429,20 @@ class HorizonClient:
             self.stats.responses_by_status[status] += 1
             logger.debug("GET %s -> %s in %.2fs", label, status, time.monotonic() - started)
             problem = _problem(response)
+            missing: ResponseError | None = None
             if status == 410:
-                raise BeforeHistory(label, status, problem)
-            if status == 404:
-                raise NotFound(label, status, problem)
+                missing = BeforeHistory(label, status, problem)
+            elif status == 404:
+                missing = NotFound(label, status, problem)
+            if missing is not None:
+                body = self._resource_missing(path, query, missing)
+                if body is None:
+                    raise missing
+                self._note_answered(label)
+                self._note_answer(path, body)
+                return body
             if status in RETRYABLE_STATUS:
+                self._note_status(path, status, response)
                 if attempt == attempts:
                     raise RequestFailed(
                         f"Horizon answered {status} to GET {label} on all {attempts} attempts"
@@ -385,9 +470,75 @@ class HorizonClient:
                 title, detail = problem.get("title", ""), problem.get("detail", "")
                 raise RequestFailed(f"Horizon answered {status} to GET {label}: {title} {detail}".strip())
             body = self._decode(response, label)
+            if not self._take(path, body):
+                # Answered, but by a server that is not to be used.
+                continue
             self._note_answered(label)
+            self._note_answer(path, body)
             return body
         raise AssertionError("unreachable")
+
+    # -- hooks: what a pool of servers replaces ------------------------------
+    # Here each is what one server needs: nothing, or what was always done.
+
+    def _begin(self, path: str, query: Mapping[str, Any]) -> None:
+        """A new request starts."""
+
+    def _prepare(self, path: str, query: Mapping[str, Any]) -> None:
+        """Before an attempt: name the server that is to answer it."""
+        self._local.server = self._http
+        self._local.served_by, self._local.history_from = self.name, None
+
+    def _exchange(self, path: str, query: Mapping[str, Any], server: httpx.Client) -> httpx.Response:
+        """One attempt of one request, on the server named by ``_prepare``."""
+        return server.get(path, params=dict(query))
+
+    def _stalled(self, server: httpx.Client) -> None:
+        """The attempt hit the deadline: drop its connection."""
+        stuck, self._http = self._http, self._new_client()
+        stuck.close()
+
+    def _note_transport_error(self, path: str, query: Mapping[str, Any], error: Exception) -> None:
+        """No answer at all."""
+
+    def _note_status(self, path: str, status: int, response: httpx.Response) -> None:
+        """A status that is worth asking again."""
+
+    def _resource_missing(
+        self, path: str, query: Mapping[str, Any], error: ResponseError
+    ) -> dict[str, Any] | None:
+        """404 or 410: is there another server to ask? Its answer, or None."""
+        return None
+
+    def _take(self, path: str, body: Mapping[str, Any]) -> bool:
+        """Whether an answer is from a server that is to be used."""
+        return True
+
+    def _note_answer(self, path: str, body: Mapping[str, Any]) -> None:
+        """A usable answer."""
+        served_by = getattr(self._local, "served_by", None)
+        if served_by is not None:
+            self.stats.by_server[served_by] += 1
+
+    def _links_origin(self) -> SplitResult:
+        """The server `_links.next` has to name: the one that answered."""
+        return self._origin
+
+    def history(self) -> History:
+        """What the server keeps, as of now. A request."""
+        root = self.root()
+        return History(
+            int(root["history_elder_ledger"]),
+            int(root["history_latest_ledger"]),
+            self.name,
+            root.get("network_passphrase"),
+            root.get("history_latest_ledger_closed_at"),
+        )
+
+    def lacks(self, ledger: int) -> bool:
+        """Whether nothing this client can ask keeps ``ledger`` or anything
+        below it: what lies there can no longer be read."""
+        return True
 
     def forget_answered(self) -> None:
         """A new reading sequence begins: forget what was answered last.
@@ -468,7 +619,15 @@ class HorizonClient:
         links = body.get("_links")
         href = None if last else (links.get("next", {}).get("href") if isinstance(links, dict) else None)
         next_query = self._next_query(href, path, query) if href else None
-        return Page(tuple(records), path, resource_type, query, next_query)
+        return Page(
+            tuple(records),
+            path,
+            resource_type,
+            query,
+            next_query,
+            getattr(self._local, "served_by", None),
+            getattr(self._local, "history_from", None),
+        )
 
     def _next_query(self, href: object, path: str, query: Mapping[str, Any]) -> dict[str, Any]:
         """Turn `_links.next` into a request to this same server.
@@ -479,7 +638,7 @@ class HorizonClient:
         refused.
         """
         target = urlsplit(href if isinstance(href, str) else "")
-        origin = self._origin
+        origin = self._links_origin()
         if (
             (target.scheme, target.hostname, target.port) != (origin.scheme, origin.hostname, origin.port)
             or target.username
@@ -527,6 +686,10 @@ def _problem(response: httpx.Response) -> dict[str, Any]:
 
 
 def _retry_after(response: httpx.Response) -> float | None:
+    return retry_after_in(response.headers)
+
+
+def retry_after_in(headers: Mapping[str, str]) -> float | None:
     """Seconds the server asks to wait before asking again.
 
     Retry-After first. Horizon sends none: it tells the wait in
@@ -535,7 +698,7 @@ def _retry_after(response: httpx.Response) -> float | None:
     """
     value = ""
     for header in ("Retry-After", "X-RateLimit-Retry-After", "X-RateLimit-Reset"):
-        value = response.headers.get(header, "").strip()
+        value = headers.get(header, "").strip()
         if value:
             break
     if not value:
@@ -549,6 +712,32 @@ def _retry_after(response: httpx.Response) -> float | None:
     if when is None or when.tzinfo is None:
         return None
     return max(0.0, when.timestamp() - time.time())
+
+
+def ledger_of(path: str, query: Mapping[str, Any]) -> int | None:
+    """The lowest ledger a request needs, when it says.
+
+    A ledger's own path names it; a cursor or an operation id carries it; a
+    start cursor that asks for everything after a ledger needs the one after
+    it. A request that says none of that — a transaction by its hash — needs
+    nothing in particular here: a server that has not got it is asked what
+    it has, and the others are asked in its place.
+    """
+    parts = [part for part in path.split("/") if part]
+    if len(parts) == 2 and parts[1].isdigit():
+        if parts[0] == "ledgers":
+            return int(parts[1])
+        if parts[0] == "operations":
+            return int(parts[1]) >> 32
+    cursor = str(query.get("cursor") or "")
+    first, separator, _ = cursor.partition("-")
+    if first.isdigit() and len(first) <= 19:
+        value = int(first)
+        ledger = value >> 32
+        if query.get("order") != "desc" and not separator and value & 0xFFFFFFFF == 0xFFFFFFFF:
+            ledger += 1  # everything after that ledger
+        return ledger
+    return None
 
 
 def _record_key(record: Mapping[str, Any], resource_type: str) -> OrderKey:

@@ -43,7 +43,7 @@ from app.backfill.loader import (
 )
 from app.config import ConfigError
 from app.sources import horizon_records as records
-from app.sources.horizon import BeforeHistory, HorizonClient, RateLimited
+from app.sources.horizon import BeforeHistory, HorizonClient, RateLimited, Scope, WrongNetwork
 from app.sources.horizon_cursors import InvalidCursor, after_ledger, parse_cursor
 from app.storage import collector_state, coverage
 from app.storage.collector_state import StreamKey, StreamState
@@ -55,10 +55,6 @@ logger = logging.getLogger(__name__)
 VERIFIED, FAILED, STOPPED, WAITING = "verified", "failed", "stopped", "waiting"
 # However often a stream failed, it is asked again after at most a day.
 MAX_RETRY_WAIT = 24 * 3600
-
-
-class WrongNetwork(Exception):
-    """The source serves another network than this database belongs to."""
 
 
 @dataclass
@@ -211,17 +207,17 @@ class Collector:
         self.pages = 0
         report = CycleReport()
         self.client.forget_answered()
-        root = self.client.root()
-        if root.get("network_passphrase") != self.network_passphrase:
+        history = self.client.history()  # of a pool: asked of every server that could answer
+        if history.network_passphrase != self.network_passphrase:
             raise WrongNetwork(
-                f"{self.client.settings.base_url} serves the network {root.get('network_passphrase')!r}, "
+                f"{history.name} serves the network {history.network_passphrase!r}, "
                 f"this database belongs to {self.network_passphrase!r}"
             )
-        latest, elder = int(root["history_latest_ledger"]), int(root["history_elder_ledger"])
+        latest, elder = history.latest, history.elder
         if start_from is not None and start_from > latest:
             raise ConfigError(f"--start-ledger {start_from} lies ahead of the source: its latest ledger is {latest}")
         report.latest_ledger, report.elder_ledger = latest, elder
-        report.latest_closed_at = _moment(root.get("history_latest_ledger_closed_at"))
+        report.latest_closed_at = _moment(history.latest_closed_at)
 
         # One transaction: every new stream gets its start ledger, and what
         # the source looks like in this cycle is kept.
@@ -239,6 +235,12 @@ class Collector:
             )
         report.started = [job.name for job in jobs if (job.resource_type, job.stream_key) in created]
         report.start_ledger = (latest if start_from is None else start_from) if created else None
+        # This cycle reads every stream up to ``latest``, from the lowest
+        # frontier there is. A server is asked for a page only if it keeps
+        # that far back and has got as far as that: of a pool, the one that
+        # does answers, whichever it is.
+        if states:
+            self.client.scope = Scope(from_ledger=min(state.frontier_ledger for state in states.values()) + 1, through=latest)
 
         # Markets first. A stream that fails does not stop the others.
         ordered = sorted(jobs, key=lambda job: job.key.subject_type != "market")
@@ -284,7 +286,9 @@ class Collector:
             frontier = self._skip_verified(job, state.frontier_ledger, latest)
             for attempt in (1, 2):
                 try:
-                    if frontier + 1 < elder:
+                    # Below the history of every server of the pool; while one
+                    # may keep it, it is read, from that one.
+                    if frontier + 1 < elder and self.client.lacks(frontier + 1):
                         frontier = self._out_of_reach(job, frontier + 1, min(elder - 1, latest))
                     if frontier < latest:
                         frontier = self._read(job, frontier + 1, latest, result)
@@ -360,9 +364,9 @@ class Collector:
                         store.store_stream_record(session, job, record, parents_only=context == PARENTS)
                     pieces = []
                     if first > lower:
-                        pieces.append(coverage.empty(lower, first - 1))
+                        pieces.append(coverage.empty(lower, first - 1, page.served_by))
                     if top >= first:
-                        pieces.append(coverage.complete(first, top) if has_records else coverage.empty(first, top))
+                        pieces.append(coverage.complete(first, top, page.served_by) if has_records else coverage.empty(first, top, page.served_by))
                     if pieces:
                         end = max(top, first - 1)
                         coverage.replace(session, job.key, self.source, lower, end, pieces)
@@ -444,7 +448,7 @@ class Collector:
         return top
 
     def _source_elder(self) -> int:
-        return int(self.client.root()["history_elder_ledger"])
+        return self.client.history().elder
 
     def _due(self, state: StreamState) -> bool:
         """Whether a stream that failed is to be asked again now."""

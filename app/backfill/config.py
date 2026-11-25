@@ -1,9 +1,12 @@
 """Importing the watch lists from a YAML file.
 
-One file names assets, markets and accounts. Importing it again changes
-nothing unless the file did. An account's mode is changed only when asked
-for. Nothing is removed because a later file leaves it out: history once
-collected stays, and so does the record of what was collected.
+One file names assets, markets and accounts. Each entry is switched on or
+off by itself: an enabled account, an enabled asset and an enabled market
+are three independent rules, and a record is collected when any of them says
+so. Importing the file again changes nothing unless the file did, and a
+stored flag changes only when asked for. Nothing is removed because a later
+file leaves it out: history once collected stays, and so does the record of
+what was collected.
 
 ::
 
@@ -16,15 +19,19 @@ collected stays, and so does the record of what was collected.
         counter: native
     accounts:
       - address: G...
-        mode: FULL
+        enabled: true
         reason: why this account is watched
+
+``enabled`` may be left out: a new entry is then enabled, and an entry that
+is stored already keeps the flag it has. Accounts used to have ``mode``
+instead; a file that still names one is read with FULL as enabled and every
+other mode as disabled, and the import says so line by line.
 """
 
 from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Mapping
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,10 +52,9 @@ from app.storage.models import (
 )
 from app.storage.upsert import upsert_row
 
-MODES = ("FULL", "ASSETS_ONLY", "CANDIDATE", "DISABLED")
-# Policies whose history the backfill reads. The others are stored as given
-# and skipped: they are not quietly treated as FULL.
-LOADED_BY_BACKFILL = frozenset({"FULL"})
+# What an account's former mode means for its flag: only FULL was ever
+# collected, so nothing that was inactive becomes active by the rename.
+LEGACY_MODES = {"FULL": True, "ASSETS_ONLY": False, "CANDIDATE": False, "DISABLED": False}
 
 _CODE = re.compile(r"[A-Za-z0-9]{1,12}")
 
@@ -65,6 +71,9 @@ class ConfigError(ValueError):
 class AssetRule:
     asset_id: str
     reason: str
+    # None: the file says nothing, so a new asset is enabled and a stored one
+    # keeps what it has.
+    enabled: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -72,13 +81,14 @@ class MarketRule:
     base_asset_id: str
     counter_asset_id: str
     reason: str
+    enabled: bool | None = None
 
 
 @dataclass(frozen=True)
 class AccountRule:
     address: str
-    mode: str
     reason: str
+    enabled: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,8 @@ class TrackingConfig:
     assets: tuple[AssetRule, ...]
     markets: tuple[MarketRule, ...]
     accounts: tuple[AccountRule, ...]
+    # How former modes were read, one line each.
+    notices: tuple[str, ...] = ()
 
 
 @dataclass
@@ -97,8 +109,7 @@ class ImportResult:
     changed: Counter[str] = field(default_factory=Counter)
     # Entries left as they were, with the reason.
     skipped: list[str] = field(default_factory=list)
-    # Accounts stored with a mode the backfill does not load.
-    not_loaded: list[str] = field(default_factory=list)
+    notices: list[str] = field(default_factory=list)
 
     def lines(self) -> list[str]:
         def count(kind: str) -> str:
@@ -112,7 +123,7 @@ class ImportResult:
             f"markets:  {count('market')}",
             f"accounts: {count('account')}, {len(self.skipped)} skipped",
             *self.skipped,
-            *self.not_loaded,
+            *self.notices,
         ]
 
 
@@ -134,13 +145,14 @@ def parse(document: Any, source: str = "config") -> TrackingConfig:
         raise ConfigError([f"{source}: the file is not a mapping"])
     errors += [f"{source}: unknown section {name!r}" for name in sorted(set(document) - set(SECTIONS))]
 
+    notices: list[str] = []
     rules = {
-        name: parser(_section(document, name, errors, source), errors, source)
+        name: parser(_section(document, name, errors, source), errors, source, notices)
         for name, parser in (("assets", _assets), ("markets", _markets), ("accounts", _accounts))
     }
     if errors:
         raise ConfigError(errors)
-    return TrackingConfig(tuple(rules["assets"]), tuple(rules["markets"]), tuple(rules["accounts"]))
+    return TrackingConfig(tuple(rules["assets"]), tuple(rules["markets"]), tuple(rules["accounts"]), tuple(notices))
 
 
 SECTIONS = ("assets", "markets", "accounts")
@@ -202,13 +214,16 @@ def parse_asset_id(value: str, where: str, errors: list[str]) -> str | None:
     return asset_id(code, issuer, where, errors)
 
 
-def _assets(items: list[Any], errors: list[str], source: str) -> list[AssetRule]:
+def _assets(items: list[Any], errors: list[str], source: str, notices: list[str]) -> list[AssetRule]:
     rules: list[AssetRule] = []
     seen: set[str] = set()
     for index, raw in enumerate(items):
         where = f"{source}: assets[{index}]"
-        entry = _entry(raw, index, "assets", {"code", "issuer", "native", "reason"}, errors, source)
+        entry = _entry(raw, index, "assets", {"code", "issuer", "native", "reason", "enabled", "mode"}, errors, source)
         if entry is None:
+            continue
+        enabled = _flag(entry, where, errors, notices)
+        if enabled is None and ("enabled" in entry or "mode" in entry):
             continue
         asset = None
         if entry.get("native") is True:
@@ -229,17 +244,20 @@ def _assets(items: list[Any], errors: list[str], source: str) -> list[AssetRule]
             errors.append(f"{where}: asset {asset} is listed twice")
             continue
         seen.add(asset)
-        rules.append(AssetRule(asset, _reason(entry, "imported from config")))
+        rules.append(AssetRule(asset, _reason(entry, "imported from config"), enabled))
     return rules
 
 
-def _markets(items: list[Any], errors: list[str], source: str) -> list[MarketRule]:
+def _markets(items: list[Any], errors: list[str], source: str, notices: list[str]) -> list[MarketRule]:
     rules: list[MarketRule] = []
     seen: dict[str, str] = {}
     for index, raw in enumerate(items):
         where = f"{source}: markets[{index}]"
-        entry = _entry(raw, index, "markets", {"base", "counter", "reason"}, errors, source)
+        entry = _entry(raw, index, "markets", {"base", "counter", "reason", "enabled", "mode"}, errors, source)
         if entry is None:
+            continue
+        enabled = _flag(entry, where, errors, notices)
+        if enabled is None and ("enabled" in entry or "mode" in entry):
             continue
         given = _text(entry, "base", where, errors), _text(entry, "counter", where, errors)
         if None in given:
@@ -256,16 +274,16 @@ def _markets(items: list[Any], errors: list[str], source: str) -> list[MarketRul
             errors.append(f"{where}: market {base}/{counter} is {seen[key]} the other way round")
             continue
         seen[key] = f"{base}/{counter}"
-        rules.append(MarketRule(base, counter, _reason(entry, "imported from config")))
+        rules.append(MarketRule(base, counter, _reason(entry, "imported from config"), enabled))
     return rules
 
 
-def _accounts(items: list[Any], errors: list[str], source: str) -> list[AccountRule]:
+def _accounts(items: list[Any], errors: list[str], source: str, notices: list[str]) -> list[AccountRule]:
     rules: list[AccountRule] = []
     seen: set[str] = set()
     for index, raw in enumerate(items):
         where = f"{source}: accounts[{index}]"
-        entry = _entry(raw, index, "accounts", {"address", "mode", "reason"}, errors, source)
+        entry = _entry(raw, index, "accounts", {"address", "enabled", "mode", "reason"}, errors, source)
         if entry is None:
             continue
         address = _text(entry, "address", where, errors)
@@ -278,35 +296,64 @@ def _accounts(items: list[Any], errors: list[str], source: str) -> list[AccountR
         # its first entry has other problems.
         repeated = address in seen
         seen.add(address)
-        mode, reason = entry.get("mode"), entry.get("reason")
-        if mode not in MODES:
-            errors.append(f"{where}: mode {mode!r} is not one of {', '.join(MODES)}")
+        enabled = _flag(entry, where, errors, notices)
+        if enabled is None and ("enabled" in entry or "mode" in entry):
             continue
+        reason = entry.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             errors.append(f"{where}: reason is missing: say why the account is watched")
             continue
         if repeated:
             errors.append(f"{where}: account {address} is listed twice")
             continue
-        rules.append(AccountRule(address, mode, reason.strip()))
+        rules.append(AccountRule(address, reason.strip(), enabled))
     return rules
 
 
-def apply(session: Session, config: TrackingConfig, *, change_modes: bool = False) -> ImportResult:
+def _flag(entry: Mapping[str, Any], where: str, errors: list[str], notices: list[str]) -> bool | None:
+    """Whether the entry is enabled, None when the file says nothing.
+
+    A former ``mode`` is read as the flag it always meant in practice, and
+    that is noted so that an old file is handled in the open.
+    """
+    mode, enabled = entry.get("mode"), entry.get("enabled")
+    if mode is not None and enabled is not None:
+        errors.append(f"{where}: 'mode' and 'enabled' are alternatives: give one of them")
+        return None
+    if mode is not None:
+        if mode not in LEGACY_MODES:
+            errors.append(f"{where}: mode {mode!r} is not one of {', '.join(LEGACY_MODES)}")
+            return None
+        flag = LEGACY_MODES[mode]
+        notices.append(f"{where}: mode {mode} read as enabled {str(flag).lower()}")
+        return flag
+    if enabled is None:
+        return None
+    if not isinstance(enabled, bool):
+        errors.append(f"{where}: enabled must be true or false, got {enabled!r}")
+        return None
+    return enabled
+
+
+def apply(session: Session, config: TrackingConfig, *, apply_changes: bool = False) -> ImportResult:
     """Write the watch list.
 
     Runs in the caller's transaction: a failure anywhere leaves nothing of
-    the file applied. An account's stored mode changes only with
-    ``change_modes``; a file that leaves entries out removes nothing.
+    the file applied. A stored flag changes only with ``apply_changes``; a
+    file that leaves entries out removes nothing.
     """
-    result = ImportResult()
+    result = ImportResult(notices=list(config.notices))
     for rule in config.assets:
-        if session.get(TrackedAsset, rule.asset_id) is None:
+        tracked = session.get(TrackedAsset, rule.asset_id)
+        if tracked is None:
             _register_asset(session, rule.asset_id)
-            upsert_row(session, TrackedAsset.__table__, {"asset_id": rule.asset_id}, {"reason": rule.reason})
+            upsert_row(
+                session, TrackedAsset.__table__, {"asset_id": rule.asset_id},
+                {"reason": rule.reason, "enabled": rule.enabled is not False},
+            )
             result.added["asset"] += 1
         else:
-            result.unchanged["asset"] += 1
+            _switch(session, tracked, "asset", rule.asset_id, rule, apply_changes, result)
 
     for rule in config.markets:
         # A market is an unordered pair: it is stored with the lower asset first.
@@ -314,33 +361,44 @@ def apply(session: Session, config: TrackingConfig, *, change_modes: bool = Fals
         key = {"base_asset_id": base, "counter_asset_id": counter}
         for asset_id in (base, counter):
             _register_asset(session, asset_id)
-        if session.get(TrackedMarket, (base, counter)) is None:
-            upsert_row(session, TrackedMarket.__table__, key, {"reason": rule.reason})
+        tracked = session.get(TrackedMarket, (base, counter))
+        if tracked is None:
+            upsert_row(session, TrackedMarket.__table__, key, {"reason": rule.reason, "enabled": rule.enabled is not False})
             result.added["market"] += 1
         else:
-            result.unchanged["market"] += 1
+            _switch(session, tracked, "market", market_key(base, counter), rule, apply_changes, result)
 
     for rule in config.accounts:
         key = {"account_id": rule.address}
         tracked = session.get(TrackedAccount, rule.address)
         if tracked is None:
             upsert_row(session, HistoryAccount.__table__, key, {})
-            upsert_row(session, TrackedAccount.__table__, key, {"mode": rule.mode, "reason": rule.reason})
-            result.added["account"] += 1
-        elif tracked.mode == rule.mode:
-            result.unchanged["account"] += 1
-        elif change_modes:
-            tracked.mode, tracked.reason = rule.mode, rule.reason
-            session.flush()
-            result.changed["account"] += 1
-        else:
-            result.skipped.append(
-                f"account {rule.address}: the file says {rule.mode}, the database says {tracked.mode}; "
-                "left as it is (import again with --apply-changes to change it)"
+            upsert_row(
+                session, TrackedAccount.__table__, key, {"reason": rule.reason, "enabled": rule.enabled is not False}
             )
-        if rule.mode not in LOADED_BY_BACKFILL:
-            result.not_loaded.append(f"account {rule.address}: history is not loaded for mode {rule.mode}")
+            result.added["account"] += 1
+        else:
+            _switch(session, tracked, "account", rule.address, rule, apply_changes, result)
     return result
+
+
+def _switch(
+    session: Session, tracked: TrackedAsset | TrackedMarket | TrackedAccount, kind: str, name: str,
+    rule: AssetRule | MarketRule | AccountRule, apply_changes: bool, result: ImportResult,
+) -> None:
+    """Compare what the file says with what is stored. Nothing said, nothing changed."""
+    wanted = rule.enabled
+    if wanted is None or tracked.enabled == wanted:
+        result.unchanged[kind] += 1
+    elif apply_changes:
+        tracked.enabled, tracked.reason = wanted, rule.reason
+        session.flush()
+        result.changed[kind] += 1
+    else:
+        result.skipped.append(
+            f"{kind} {name}: the file says enabled={str(wanted).lower()}, the database says "
+            f"{str(tracked.enabled).lower()}; left as it is (import again with --apply-changes to change it)"
+        )
 
 
 def _register_asset(session: Session, asset_id: str) -> None:

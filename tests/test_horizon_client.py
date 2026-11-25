@@ -410,8 +410,9 @@ def test_stats_are_reported_as_plain_data() -> None:
     horizon.get("/")
     assert horizon.stats.as_dict() == {
         "requests": 2, "retries": 1, "responses_by_status": {200: 1, 503: 1}, "waited_seconds": 0.0,
-        "rate_limited": 0, "abandoned": 0,
+        "rate_limited": 0, "abandoned": 0, "by_server": {"https://horizon.test": 1}, "failovers": 0,
     }
+    assert horizon.name == "https://horizon.test"
 
 
 def test_the_same_request_is_refused_only_within_one_reading_sequence() -> None:

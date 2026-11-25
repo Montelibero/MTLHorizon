@@ -18,6 +18,7 @@ the public server where the backfill depends on it:
 from __future__ import annotations
 
 import hashlib
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -389,6 +390,23 @@ class Fault:
     retry_after: str | None = None
 
 
+def serve(monkeypatch: Any, *fakes: "FakeHorizon", rate: float = 1000) -> None:
+    """Make the command lines read these fake servers, as a process would read
+    real ones: the addresses from the environment, the transports from here.
+    A command then builds its pool over them."""
+    from app import cli_common
+    from app.config import shown_url
+
+    monkeypatch.setenv("MTL_HORIZON_URLS", ",".join(fake.origin for fake in fakes))
+    monkeypatch.delenv("MTL_HORIZON_URL", raising=False)  # the single address of the earlier stages, if the environment has it
+    monkeypatch.setenv("MTL_HORIZON_REQUESTS_PER_SECOND", str(rate))
+    monkeypatch.setattr(
+        cli_common,
+        "TRANSPORTS",
+        {shown_url(fake.origin): httpx.MockTransport(fake._handle) for fake in fakes},
+    )
+
+
 def key_of(record: Mapping[str, Any], kind: str) -> tuple[float, ...]:
     """Sort key of a record: its position in the total order."""
     first, _, second = str(record["paging_token"]).partition("-")
@@ -409,15 +427,33 @@ def token_of(record: Mapping[str, Any]) -> str:
 
 
 class FakeHorizon:
-    def __init__(self, *, elder: int = ELDER, latest: int = LATEST, network: str = PUBLIC_NETWORK_PASSPHRASE) -> None:
+    def __init__(
+        self,
+        *,
+        elder: int = ELDER,
+        latest: int = LATEST,
+        network: str = PUBLIC_NETWORK_PASSPHRASE,
+        origin: str = ORIGIN,
+        down: Exception | None = None,
+        stall: float = 0.0,
+    ) -> None:
         self.history: list[Transaction] = history()
         self.ledger = Ledger(self.history)
         self.elder = elder
         self.latest = latest
         self.network = network
+        # Where this server lives: its pages' links name it, as a real one's do.
+        self.origin = origin
+        # Every request fails with this exception: the server is unreachable.
+        self.down = down
+        # Every request takes this long to answer (seconds, really slept).
+        self.stall = stall
+        # Sent with every answer, as a server behind a limiter sends its own.
+        self.headers: dict[str, str] = {}
         self.requests: list[tuple[str, dict[str, str]]] = []
         self.faults: list[Fault] = []
         self.hidden_operations: set[str] = set()  # /operations/{id} answers 404
+        self.hidden_transactions: set[str] = set()  # /transactions/{hash} answers 404
         self.gone: set[str] = set()  # record ids left out of the answers
         self.tamper: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
         self.before_answer: Callable[[str], None] | None = None  # runs before a request is answered
@@ -433,7 +469,7 @@ class FakeHorizon:
 
     def _new_client(self) -> HorizonClient:
         return HorizonClient(
-            HorizonSettings(ORIGIN, requests_per_second=1000, max_attempts=4, backoff_base_seconds=0.0, backoff_cap_seconds=0.0),
+            HorizonSettings(self.origin, requests_per_second=1000, max_attempts=4, backoff_base_seconds=0.0, backoff_cap_seconds=0.0),
             transport=httpx.MockTransport(self._handle),
             sleeper=lambda seconds: None,
         )
@@ -458,6 +494,10 @@ class FakeHorizon:
         url = urlsplit(str(request.url))
         query = dict(parse_qsl(url.query))
         self.requests.append((url.path, query))
+        if self.stall:
+            time.sleep(self.stall)
+        if self.down is not None:
+            raise self.down
         if self.before_answer is not None:
             self.before_answer(url.path)
         for fault in self.faults:
@@ -512,9 +552,10 @@ class FakeHorizon:
         }
 
     def _kept(self, record: Mapping[str, Any]) -> bool:
-        """History below the elder ledger is gone, as on a reaping server."""
+        """History below the elder ledger is gone, as on a reaping server; and
+        a server that has not ingested a ledger yet has nothing of it."""
         ledger = (int(str(record["paging_token"]).partition("-")[0]) >> 32) if "ledger" not in record else record["ledger"]
-        return ledger >= self.elder
+        return self.elder <= ledger <= self.latest
 
     def _trades(self, query: dict[str, str]) -> list[dict[str, Any]]:
         base, counter = self._asset(query, "base_"), self._asset(query, "counter_")
@@ -557,7 +598,7 @@ class FakeHorizon:
         if len(name) != 64 or not all(char in "0123456789abcdef" for char in name):
             raise _Problem(400)
         record = self.ledger.transactions.get(name) or self.ledger.by_inner_hash.get(name)
-        if record is None:
+        if record is None or name in self.hidden_transactions:
             raise _Problem(404)
         if record["ledger"] < self.elder:
             raise _Problem(410)
@@ -632,9 +673,9 @@ class FakeHorizon:
         body = {
             "_embedded": {"records": page_records},
             "_links": {
-                "self": {"href": ORIGIN + path + "?" + urlencode(query)},
-                "next": {"href": ORIGIN + path + "?" + urlencode(following)},
-                "prev": {"href": ORIGIN + path + "?" + urlencode({**query, "order": "asc" if order == "desc" else "desc"})},
+                "self": {"href": self.origin + path + "?" + urlencode(query)},
+                "next": {"href": self.origin + path + "?" + urlencode(following)},
+                "prev": {"href": self.origin + path + "?" + urlencode({**query, "order": "asc" if order == "desc" else "desc"})},
             },
         }
         if self.tamper is not None:
@@ -642,15 +683,16 @@ class FakeHorizon:
         return self._json(body)
 
     def _json(self, body: dict[str, Any]) -> httpx.Response:
-        return httpx.Response(200, headers={"content-type": "application/hal+json; charset=utf-8"}, json=body)
+        return httpx.Response(
+            200, headers={"content-type": "application/hal+json; charset=utf-8", **self.headers}, json=body
+        )
 
-    @staticmethod
-    def _problem(status: int, headers: dict[str, str] | None = None) -> httpx.Response:
+    def _problem(self, status: int, headers: dict[str, str] | None = None) -> httpx.Response:
         titles = {400: "Bad Request", 404: "Resource Missing", 410: "Data Requested Is Before Recorded History", 429: "Too Many Requests", 503: "Service Unavailable"}
         types = {400: "bad_request", 404: "not_found", 410: "before_history", 429: "rate_limit_exceeded", 503: "service_unavailable"}
         return httpx.Response(
             status,
-            headers={"content-type": "application/problem+json; charset=utf-8", **(headers or {})},
+            headers={"content-type": "application/problem+json; charset=utf-8", **self.headers, **(headers or {})},
             json={"type": f"https://stellar.org/horizon-errors/{types[status]}", "title": titles[status], "status": status, "detail": "fake answer"},
         )
 

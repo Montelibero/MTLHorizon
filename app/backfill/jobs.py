@@ -1,4 +1,4 @@
-"""Which streams a backfill reads: every FULL account and every enabled market."""
+"""Which streams a backfill reads: every enabled account and every enabled market."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ from app.storage.models import TrackedAccount, TrackedMarket
 
 # A policy is what gets collected. Its version changes when the meaning of a
 # policy changes; coverage of an older version stays a true record of what
-# was collected under it.
+# was collected under it. "FULL" is the name the account policy was given
+# when accounts still had modes; it means what it did — the four streams of
+# the account — so the coverage collected under it stays valid.
 POLICY_VERSIONS = {"FULL": 1, "MARKET": 1}
 
 ACCOUNT_STREAMS = ("transactions", "operations", "effects", "trades")
@@ -79,8 +81,8 @@ def stream_jobs(session: Session) -> tuple[list[StreamJob], list[str]]:
     jobs: list[StreamJob] = []
     left_out: list[str] = []
     for account in session.scalars(select(TrackedAccount).order_by(TrackedAccount.account_id)):
-        if account.mode != "FULL":
-            left_out.append(f"account {account.account_id}: mode {account.mode}; history is loaded only for FULL")
+        if not account.enabled:
+            left_out.append(f"account {account.account_id}: disabled; its history is not loaded")
             continue
         for stream in ACCOUNT_STREAMS:
             jobs.append(

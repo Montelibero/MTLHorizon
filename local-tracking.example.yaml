@@ -4,9 +4,9 @@
 # list of real users: the market is the public test market of stage 02 and
 # the accounts are placeholders.
 #
-# Importing the file again changes nothing unless the file did. An account's
-# mode is only changed with --apply-changes. Entries left out of a later file
-# are not removed: collected history stays.
+# Importing the file again changes nothing unless the file did. A stored
+# flag is only changed with --apply-changes. Entries left out of a later
+# file are not removed: collected history stays.
 
 assets:
   - code: MTLRECT
@@ -22,10 +22,12 @@ markets:
   - base: MTLRECT:GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
     counter: EURMTL:GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
 
-# History is loaded only for FULL accounts. The other modes are stored as
-# given and skipped: ASSETS_ONLY and CANDIDATE are not read as if they were
-# FULL. `reason` is required: say why the account is watched.
+# The three lists are independent: an enabled account, an enabled asset and
+# an enabled market are three rules, and a record is collected when any of
+# them says so. `enabled` may be left out: a new entry is then enabled, and
+# one that is stored already keeps the flag it has. `reason` is required:
+# say why the entry is watched.
 accounts:
   - address: GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
-    mode: CANDIDATE
+    enabled: false
     reason: issuer of the market's assets; too active to load without a decision

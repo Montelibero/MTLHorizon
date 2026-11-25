@@ -12,13 +12,18 @@ import os
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session
+
+from app import cli_common
+from app.config import Settings, shown_url
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,6 +33,47 @@ def alembic_config(database_url: str) -> Config:
     config.set_main_option("script_location", str(PROJECT_ROOT / "alembic"))
     config.attributes["configure_logger"] = False
     return config
+
+
+@pytest.fixture(autouse=True)
+def no_real_servers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches a real server.
+
+    A pool a command builds reads its servers from the environment. A test
+    that means a command to talk to a fake server provides it
+    (``tests.fake_horizon.serve``); whatever is not provided refuses the
+    connection, so a test that forgot to provide one fails here and does not
+    go out into the world.
+    """
+    from app import cli_common
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"this test provided no fake server for {request.url.host}", request=request)
+
+    monkeypatch.setattr(cli_common, "TRANSPORTS", {shown_url(url): httpx.MockTransport(refuse) for url in Settings.from_env().horizon_urls})
+    monkeypatch.setattr(cli_common, "make_client", _guarded(cli_common.make_client))
+
+
+def _guarded(make_client: Callable[..., Any]) -> Callable[..., Any]:
+    """``make_client`` as it is, but never without a transport for a server:
+    one that is not a fake in this test gets one that refuses."""
+
+    def guarded(settings: Settings, engine: Engine | None = None, **options: Any) -> Any:
+        transports = {**cli_common.TRANSPORTS}
+        for url in settings.horizon_urls:
+            transports.setdefault(shown_url(url), httpx.MockTransport(_refuse))
+        saved = cli_common.TRANSPORTS
+        cli_common.TRANSPORTS = transports
+        try:
+            return make_client(settings, engine, **options)
+        finally:
+            cli_common.TRANSPORTS = saved
+
+    return guarded
+
+
+def _refuse(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError(f"this test provided no fake server for {request.url.host}", request=request)
 
 
 @pytest.fixture(scope="session")

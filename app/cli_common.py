@@ -1,6 +1,7 @@
-"""Pieces the command lines share: logging, the database, the source client,
-small reports. ``python -m app.backfill`` and ``python -m app.collector`` are
-built from these.
+"""Pieces the command lines share: logging, the database, the client of
+the Horizon pool, small reports. ``python -m app.backfill``,
+``python -m app.collector``, ``python -m app.pool`` and ``python -m
+app.worker`` are built from these.
 """
 
 from __future__ import annotations
@@ -13,17 +14,24 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
+import httpx
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.config import ConfigError, Settings
+from app.config import ConfigError, Settings, shown_url
+from app.storage import pace, pool_state
+from app.storage.pace import Pace
 from app.storage.db import create_db_engine
 from app.storage.network import NetworkMismatch, assert_network
 from app.sources.horizon import HorizonClient, HorizonSettings
+from app.sources.pool import HorizonPool, PoolSettings
 
 Command = Callable[[Any, Settings], int]
+
+# Transports by the name a server is shown under. Tests put their fake
+# servers here; nothing else does.
+TRANSPORTS: dict[str, httpx.BaseTransport] = {}
 
 _ADDRESS = re.compile(r"\bG[A-Z0-9]{55}\b")
 
@@ -43,19 +51,35 @@ def engine_for(settings: Settings) -> Engine:
 
 
 def source_name(client: HorizonClient) -> str:
-    return f"horizon:{urlsplit(client.settings.base_url).netloc}"
+    """The pool as its checkpoints and coverage name it: by its first server.
+    Servers added after the first share its checkpoints."""
+    return f"horizon:{shown_url(client.settings.base_url).split('://', 1)[1]}"
 
 
-def source_name_for(args: Any, settings: Settings) -> str:
-    return f"horizon:{urlsplit(getattr(args, 'horizon_url', None) or settings.horizon_url).netloc}"
+def source_name_for(settings: Settings) -> str:
+    return f"horizon:{shown_url(settings.horizon_urls[0]).split('://', 1)[1]}"
 
 
-def make_client(args: Any, settings: Settings) -> HorizonClient:
-    return HorizonClient(
-        HorizonSettings(
-            base_url=args.horizon_url or settings.horizon_url,
-            requests_per_second=args.rate or settings.horizon_requests_per_second,
-        )
+def make_client(settings: Settings, engine: Engine | None = None, *, share: str = pace.BACKGROUND) -> HorizonPool:
+    """The pool of Horizon servers, which every request to Horizon goes
+    through — whoever asks and whichever command.
+
+    With a database the pace is kept there for every process together, and
+    what is seen of a server is kept for a status page. ``share`` says what
+    the process does: the worker that handles events has the right of way,
+    everything else reads in the background.
+    """
+    return HorizonPool(
+        settings.horizon_urls,
+        HorizonSettings(requests_per_second=settings.horizon_requests_per_second),
+        network_passphrase=settings.network_passphrase,
+        limiter=Pace(engine, share=share) if engine is not None else None,
+        remember=None if engine is None else (lambda server: pool_state.note(engine, server.as_dict())),
+        pool_settings=PoolSettings(
+            health_check_interval=settings.horizon_health_check_interval,
+            failover_cooldown=settings.horizon_failover_cooldown,
+        ),
+        transports=TRANSPORTS or None,
     )
 
 

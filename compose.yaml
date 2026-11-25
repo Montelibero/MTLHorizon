@@ -1,25 +1,36 @@
 # Local development environment: PostgreSQL 17 (persistent volume) and the API.
 #
-#   cp .env.example .env        # set POSTGRES_PASSWORD
+#   cp .env.example .env        # set POSTGRES_PASSWORD and MTL_HORIZON_NOTIFIER_KEYS
 #   docker compose build
-#   docker compose up -d
+#   docker compose up -d        # db, api (with the webhook) and worker
 #   docker compose run --rm api alembic upgrade head
 #   docker compose run --rm -v "$PWD/local:/app/local" api \
 #       python -m app.backfill import-config --file local/tracking.yaml
-#   docker compose --profile collector up -d collector   # regular collection
+#   docker compose --profile collector up -d collector   # recovery and control reads only
+#   docker compose --profile test run --rm tests         # the test suite
 #
 # PostgreSQL does not publish a port: only containers on this network reach it.
-# The API is published on localhost only.
+# The API is published on localhost only; put it behind your own HTTPS proxy
+# for the Notifier to reach /webhooks/notifier.
 
 name: mtl-horizon
 
 x-api-environment: &api-environment
   MTL_HORIZON_DATABASE_URL: postgresql+psycopg://mtl_horizon:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/mtl_horizon
   MTL_HORIZON_NETWORK_PASSPHRASE: ${MTL_HORIZON_NETWORK_PASSPHRASE:-Public Global Stellar Network ; September 2015}
-  # Where history is read from, and how fast this installation may ask.
+  # Where history is read from, and how fast this installation may ask —
+  # every process together, whichever server answers. One server is named by
+  # MTL_HORIZON_URL; several by MTL_HORIZON_URLS, the first being the primary
+  # (the two may be set together when they agree on the primary).
   MTL_HORIZON_URL: ${MTL_HORIZON_URL:-https://horizon.stellar.org}
+  MTL_HORIZON_URLS: ${MTL_HORIZON_URLS:-}
   MTL_HORIZON_REQUESTS_PER_SECOND: ${MTL_HORIZON_REQUESTS_PER_SECOND:-1}
+  MTL_HORIZON_HEALTH_CHECK_INTERVAL: ${MTL_HORIZON_HEALTH_CHECK_INTERVAL:-300}
+  MTL_HORIZON_FAILOVER_COOLDOWN: ${MTL_HORIZON_FAILOVER_COOLDOWN:-60}
   MTL_HORIZON_CONCURRENCY: ${MTL_HORIZON_CONCURRENCY:-1}
+  # The keys Operations Notifier signs its webhooks with. With none, the
+  # webhook accepts nothing.
+  MTL_HORIZON_NOTIFIER_KEYS: ${MTL_HORIZON_NOTIFIER_KEYS:-}
   # Live collection: one cycle every so many seconds.
   MTL_HORIZON_COLLECTOR_INTERVAL: ${MTL_HORIZON_COLLECTOR_INTERVAL:-900}
 
@@ -54,9 +65,33 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # Not started by `docker compose up`. Reads what is new in the watch lists
-  # every MTL_HORIZON_COLLECTOR_INTERVAL seconds until stopped. No port: it
-  # serves nothing, and `python -m app.collector status` says where it is.
+  # The regular way history comes in: takes the jobs that notifications from
+  # Operations Notifier make and brings their transactions in, whole. Asks
+  # Horizon for nothing else — no account is polled. Started by
+  # `docker compose up`. No port: `python -m app.worker status` says where
+  # the queue is.
+  worker:
+    build:
+      context: .
+      target: runtime
+    command: ["python", "-m", "app.worker", "run"]
+    environment:
+      <<: *api-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # On SIGTERM the job in progress stops before its next request and goes
+    # back to the queue untouched; the lease (120s) would take it back anyway.
+    stop_grace_period: 150s
+    # The image's health check asks the API, which this service does not run.
+    healthcheck:
+      disable: true
+
+  # Not started by `docker compose up`. Polls every stream of the watch lists
+  # every MTL_HORIZON_COLLECTOR_INTERVAL seconds until stopped: for recovery
+  # and control reads, not as the regular way. No port: it serves nothing,
+  # and `python -m app.collector status` says where it is.
   #   docker compose --profile collector up -d collector
   #   docker compose --profile collector logs -f collector
   collector:

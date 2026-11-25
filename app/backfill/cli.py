@@ -7,8 +7,11 @@ the source cannot verify.
 
 A historical run (``run``, ``reimport``) never chooses its window on its
 own: the ledgers are given, or all the history the source keeps is asked for
-with ``--full-retention`` — and either way the run has a budget. While it
-reads, it holds the source; a collector that is due gets it first.
+with ``--full-retention`` — and either way the run has a budget. It reads
+through the pool of Horizon servers like everything else, at the pace every
+process shares; a run may go on while events are handled, and it never
+starves: while events flow it gets one request in ten, and all of them when
+they do not.
 """
 
 from __future__ import annotations
@@ -48,8 +51,8 @@ from app.cli_common import (
     write_report,
 )
 from app.config import ConfigError, Settings
-from app.sources.horizon import HorizonClient
-from app.storage import coverage, locks
+from app.sources.horizon import HorizonClient, Scope
+from app.storage import coverage
 from app.storage.models import Base
 from app.storage.upsert import checkpoint
 from app.storage.writer import HistoryWriter
@@ -98,7 +101,7 @@ def command_import_config(args: argparse.Namespace, settings: Settings) -> int:
     engine = engine_for(settings)
     with Session(engine) as session:
         session.begin()
-        result = watch_lists.apply(session, config, change_modes=args.apply_changes)
+        result = watch_lists.apply(session, config, apply_changes=args.apply_changes)
         if args.dry_run:
             session.rollback()
         else:
@@ -114,7 +117,7 @@ def command_probe(args: argparse.Namespace, settings: Settings) -> int:
     with Session(engine) as session:
         market, account = _probe_subjects(session, args)
     engine.dispose()
-    with make_client(args, settings) as client:
+    with make_client(settings, engine) as client:
         result = probe(client, network_passphrase=settings.network_passphrase, market=market, account=account)
     result["checked_at"] = datetime.now(UTC).isoformat(timespec="seconds")
     result["requests"] = client.stats.as_dict()
@@ -130,8 +133,9 @@ def command_probe(args: argparse.Namespace, settings: Settings) -> int:
 
 def command_estimate(args: argparse.Namespace, settings: Settings) -> int:
     engine = engine_for(settings)
-    with make_client(args, settings) as client:
+    with make_client(settings, engine) as client:
         window = Window(args.from_ledger, args.to_ledger)
+        client.scope = Scope(window.from_ledger, window.to_ledger)
         jobs = pick_jobs(engine, args)
         estimates = checking.estimate(client, jobs, window, args.page_size)
     rows = [estimate.as_dict() for estimate in estimates]
@@ -156,32 +160,30 @@ def command_run(args: argparse.Namespace, settings: Settings) -> int:
     engine = engine_for(settings)
     stop = threading.Event()
     _stop_on_signal(stop)
-    with make_client(args, settings) as client:
-        # The source is held while it is read; a collector that is due gets it first.
-        with locks.SourceUse(engine, source_name(client), stop=stop) as use:
-            if not use.acquire(wait=args.wait_lock):
-                raise ConfigError(
-                    f"another reader has held the source for {args.wait_lock}s: a collector's cycle "
-                    f"should be over in minutes, a backfill is not. Stop it, or give --wait-lock more seconds."
-                )
-            started = time.monotonic()
-            window, source_at_start = resolve_window(client, args, settings, window)
-            jobs, left_out = pick_jobs(engine, args, with_left_out=True)
-            limits = Limits(
-                requests=lambda: client.stats.requests,
-                max_pages=args.max_pages,
-                max_requests=args.max_requests,
-                max_seconds=args.max_seconds,
-                stop=stop,
-            )
-            with Backfill(
-                client, engine, source=source_name(client), page_size=args.page_size, limits=limits, context=args.context
-            ) as backfill:
-                _let_collectors_in(client, use)
-                if args.command == "reimport":
-                    forget(engine, jobs, window, source_name(client))
-                reports = backfill.run(window, jobs, concurrency=settings.horizon_concurrency)
-                summary = _summary(window, client, backfill, reports, started, left_out)
+    engine = engine_for(settings)
+    with make_client(settings, engine) as client:
+        started = time.monotonic()
+        all_there_is = window is None
+        window, source_at_start = resolve_window(client, args, settings, window)
+        # What this run is about: a server that keeps none of the window, or
+        # has not got as far as its top, is not asked for it. Of all the
+        # history there is, the bottom is wherever the pool's history ends.
+        client.scope = Scope(None if all_there_is else window.from_ledger, window.to_ledger)
+        jobs, left_out = pick_jobs(engine, args, with_left_out=True)
+        limits = Limits(
+            requests=lambda: client.stats.requests,
+            max_pages=args.max_pages,
+            max_requests=args.max_requests,
+            max_seconds=args.max_seconds,
+            stop=stop,
+        )
+        with Backfill(
+            client, engine, source=source_name(client), page_size=args.page_size, limits=limits, context=args.context
+        ) as backfill:
+            if args.command == "reimport":
+                forget(engine, jobs, window, source_name(client))
+            reports = backfill.run(window, jobs, concurrency=settings.horizon_concurrency)
+            summary = _summary(window, client, backfill, reports, started, left_out)
     engine.dispose()
     summary["source_at_start"] = source_at_start
     _print_summary(summary)
@@ -198,7 +200,7 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
         for job in jobs:
             state = checkpoint(
                 session,
-                source=source_name_for(args, settings),
+                source=source_name_for(settings),
                 resource_type=job.resource_type,
                 stream_key=job.stream_key,
                 direction="desc",
@@ -229,8 +231,9 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
 
 def command_verify(args: argparse.Namespace, settings: Settings) -> int:
     engine = engine_for(settings)
-    with make_client(args, settings) as client:
+    with make_client(settings, engine) as client:
         window = Window(args.from_ledger, args.to_ledger)
+        client.scope = Scope(window.from_ledger, window.to_ledger)
         jobs = pick_jobs(engine, args)
         comparisons = checking.verify(client, engine, jobs, window, args.page_size)
         matches = all(comparison.matches for comparison in comparisons)
@@ -337,7 +340,7 @@ def _probe_subjects(session: Session, args: argparse.Namespace) -> tuple[Market 
         tracked = session.scalars(select(TrackedMarket).where(TrackedMarket.enabled.is_(True)).limit(1)).first()
         market = (tracked.base_asset_id, tracked.counter_asset_id) if tracked else None
     account = args.account or session.scalars(
-        select(TrackedAccount.account_id).where(TrackedAccount.mode == "FULL").order_by(TrackedAccount.account_id).limit(1)
+        select(TrackedAccount.account_id).where(TrackedAccount.enabled.is_(True)).order_by(TrackedAccount.account_id).limit(1)
     ).first()
     return market, account
 
@@ -384,18 +387,20 @@ def resolve_window(
     """The window of the run, and what the source says of itself at its start.
 
     A run never writes into a database of another network, so the source is
-    asked first. With ``--full-retention`` the window is the source's oldest
-    and latest ledger as they are right now.
+    asked first. With ``--full-retention`` the window is everything the pool
+    keeps: its oldest ledger on whichever server keeps the most, and the
+    latest ledger of the server that has got furthest, as they are right now.
     """
     root = client.root()
     if root.get("network_passphrase") != settings.network_passphrase:
         raise ConfigError(
-            f"{client.settings.base_url} serves the network {root.get('network_passphrase')!r}, "
+            f"{client.name} serves the network {root.get('network_passphrase')!r}, "
             f"this installation is configured for {settings.network_passphrase!r}"
         )
     if window is None:
-        window = Window(int(root["history_elder_ledger"]), int(root["history_latest_ledger"]))
-        logger.info("full retention: the source keeps ledgers %d..%d", window.from_ledger, window.to_ledger)
+        history = client.history()  # of a pool: asked of every server that could answer
+        window = Window(history.elder, history.latest)
+        logger.info("full retention: the pool keeps ledgers %d..%d", window.from_ledger, window.to_ledger)
     return window, {name: root.get(name) for name in ROOT_FIELDS}
 
 
@@ -413,17 +418,6 @@ def _stop_on_signal(stop: threading.Event) -> None:
 
     for number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(number, stop_now)
-
-
-def _let_collectors_in(client, use: locks.SourceUse) -> None:
-    """Before every request: see whether a collector is due, and let it read first."""
-    inner = client.before_request
-
-    def before_request() -> None:
-        use.before_request()
-        inner()
-
-    client.before_request = before_request
 
 
 def _summary(
@@ -519,8 +513,8 @@ def build_parser() -> argparse.ArgumentParser:
         sub = commands.add_parser(name, help=help_)
         sub.set_defaults(handler=handler)
         if source:
-            sub.add_argument("--horizon-url", help="Horizon to read (default: MTL_HORIZON_URL or the public server)")
-            sub.add_argument("--rate", type=float, help="requests per second (default: MTL_HORIZON_REQUESTS_PER_SECOND or 1)")
+            # Which Horizon servers are read, and how fast, comes from the
+            # environment alone: MTL_HORIZON_URLS and MTL_HORIZON_REQUESTS_PER_SECOND.
             sub.add_argument("--page-size", type=int, default=200, help="records per page, at most 200 (default: 200)")
         if window:
             how = "" if window == "required" else " (or --full-retention)"
@@ -533,12 +527,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = command("import-config", command_import_config, "load a YAML watch list", source=False)
     sub.add_argument("--file", required=True, help="watch list in YAML")
     sub.add_argument("--dry-run", action="store_true", help="validate and report, write nothing")
-    sub.add_argument("--apply-changes", action="store_true", help="change the mode of accounts whose stored mode differs")
+    sub.add_argument("--apply-changes", action="store_true", help="change the flag of entries whose stored flag differs from the file")
 
     sub = command("probe", command_probe, "check the live Horizon once and report")
     sub.add_argument("--base", help="asset id of the market to look at (default: the first tracked market)")
     sub.add_argument("--counter", help="asset id of the market's other side")
-    sub.add_argument("--account", help="account whose streams to look at (default: the first FULL account)")
+    sub.add_argument("--account", help="account whose streams to look at (default: the first enabled account)")
     sub.add_argument("--output", help="write the report to this file instead of stdout")
 
     command("estimate", command_estimate, "count the pages of the window without storing anything", window="required", subjects=True)
@@ -568,12 +562,6 @@ def build_parser() -> argparse.ArgumentParser:
             default=FULL,
             help="what to fetch for a record's transaction: full (default: all its operations, effects and trades) "
             "or parents (only what the record cannot be stored without)",
-        )
-        sub.add_argument(
-            "--wait-lock",
-            type=int,
-            default=600,
-            help="seconds to wait while another reader holds the source (default: 600)",
         )
         sub.add_argument("--report", help="write a JSON report of the run to this file")
 

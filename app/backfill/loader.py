@@ -48,6 +48,10 @@ from app.storage.writer import HistoryWriter
 logger = logging.getLogger(__name__)
 
 CONTEXT_STREAMS = frozenset(records.CONTEXT_STREAMS)
+# The context streams in the order a transaction is brought in when it is
+# brought in in steps: effects and trades name operations, so these come first.
+CONTEXT_ORDER = ("operations", "effects", "trades")
+assert set(CONTEXT_ORDER) == CONTEXT_STREAMS
 # What is fetched for a record before it is stored: the whole context of its
 # transaction, or only the parents it cannot be stored without.
 FULL = "full"
@@ -258,6 +262,67 @@ class ContextFetcher:
             self._operations[operation_id] = operation
         self._parents[operation_id] = known
         return known
+
+    def fetch_in_steps(self, transaction_hash: str, keep: Callable[[ContextBundle, bool], None]) -> None:
+        """Fetch what is missing of a transaction's context, in steps, and
+        hand each to ``keep`` the moment it is fetched.
+
+        The steps are the transaction, its operations, its effects and its
+        trades, each only if it is not stored (``keep`` is to store it). A
+        failure further on loses nothing of what came before, and what was
+        stored is not fetched again next time: the database says so. The
+        last step is handed over with ``True`` — the one to store together
+        with whatever says the transaction is whole.
+
+        Nothing is kept here for a page, and nothing here is thread-safe
+        across calls: this is for one worker on one transaction at a time.
+        """
+        found = self._lookup(transaction_hash)
+        loaded = found[1] if found is not None else frozenset()
+        todo = [stream for stream in CONTEXT_ORDER if stream not in loaded]
+        if found is not None and not todo:
+            return
+        transaction = self._client.get(f"/transactions/{transaction_hash}")
+        key, outer = self._identify(transaction_hash, transaction)
+        transaction_id = key["id"]
+        self.fetched += 1
+        plan: list[str] = ([] if found is not None else ["transaction"]) + todo
+        operations: list[Mapping[str, Any]] | None = None
+        makes_trades = "trades" in plan  # not known until the operations are read
+        place = 0
+        while place < len(plan):
+            step = plan[place]
+            place += 1
+            last = place == len(plan)
+
+            def hand(operations=None, effects=None, trades=None, completes=()) -> None:
+                keep(ContextBundle(transaction, transaction_id, operations, effects, trades, frozenset(completes)), last)
+
+            if step == "transaction":
+                hand()
+            elif step == "operations":
+                operations = self._collection(f"/transactions/{outer}/operations", "operation", transaction_id)
+                self.fetched += 1
+                makes_trades = any(operation.get("type") in TRADE_MAKING_OPERATIONS for operation in operations)
+                if makes_trades:
+                    hand(operations=operations, completes=("operations",))
+                else:
+                    # It can make no trades: there is nothing to ask for, and
+                    # the next try is not to come back to it.
+                    hand(operations=operations, completes=("operations", "trades"))
+                    if "trades" in plan:
+                        plan.remove("trades")
+            elif step == "effects":
+                hand(effects=self._collection(f"/transactions/{outer}/effects", "effect", transaction_id), completes=("effects",))
+                self.fetched += 1
+            else:  # trades
+                if operations is None:
+                    # Read again only to tell whether the transaction can have trades.
+                    operations = self._collection(f"/transactions/{outer}/operations", "operation", transaction_id)
+                    self.fetched += 1
+                    makes_trades = any(operation.get("type") in TRADE_MAKING_OPERATIONS for operation in operations)
+                hand(trades=self._trades_of(transaction_id) if makes_trades else None, completes=("trades",))
+                self.fetched += 1
 
     def bundles(self) -> list[ContextBundle]:
         """The bundles this thread's page has to store."""
@@ -496,7 +561,9 @@ class Backfill:
     def _run_job(self, job: StreamJob, window: Window, report: StreamReport) -> None:
         todo = [row for row in self._ranges(job, window) if row.state == coverage.PENDING]
         for row in sorted(todo, key=lambda item: item.from_ledger, reverse=True):
-            if self.elder is not None and row.to_ledger < self.elder:
+            # Out of reach without asking — but only when no server of the
+            # pool keeps it; one that might is asked.
+            if self.elder is not None and row.to_ledger < self.elder and self.client.lacks(row.to_ledger):
                 self._out_of_reach(job, row, window)
                 continue
             self._read_range(job, row, window, report)
@@ -522,8 +589,8 @@ class Backfill:
         while True:
             try:
                 page = self._next_page(job, page, cursor, upper)
-            except BeforeHistory:
-                self._end_of_history(job, lower, upper, last_ledger)
+            except BeforeHistory as ended:
+                self._end_of_history(job, lower, upper, last_ledger, ended)
                 return
             self.limits.page_taken()
             report.pages += 1
@@ -541,17 +608,29 @@ class Backfill:
             inside = [record for record, ledger in zip(page.records, ledgers) if ledger >= lower]
             inside_ledgers = [ledger for ledger in ledgers if ledger >= lower]
             finished = page.exhausted or (bool(ledgers) and ledgers[-1] < lower)
+            # This page ends what the server that answered it keeps, and that
+            # may end above the bottom of the range. Another server may keep
+            # what lies below: what was read is stored as read down to where
+            # this one's history starts, and the rest is asked for from there.
+            hand_over = (
+                finished
+                and page.history_from is not None
+                and lower < page.history_from <= upper
+                and not self.client.lacks(page.history_from - 1)
+            )
+            floor = page.history_from if hand_over else lower
 
             # First everything the page needs from the network, then one transaction.
             self._prepare(inside, job)
             last_ledger = inside_ledgers[-1] if inside_ledgers else None
             # The source's history may have moved up past ledgers of this range
             # that were never read: an empty page does not tell.
-            elder = self._elder_if_reachable(lower) if finished else None
+            elder = None if hand_over else (self._elder_if_reachable(lower) if finished else None)
             try:
                 with self.writer.transaction() as session:
                     self._store_page(
-                        session, job, inside, inside_ledgers, lower, upper, last_ledger, elder, segment_has_records, finished
+                        session, job, inside, inside_ledgers, floor, upper, last_ledger, elder, segment_has_records,
+                        finished, page.served_by,
                     )
             except Exception:
                 self.contexts.discarded()
@@ -559,9 +638,17 @@ class Backfill:
             self.contexts.committed()
             report.records += len(inside)
 
-            if finished:
+            if finished and not hand_over:
                 logger.info("%s: verified ledgers %d..%d", job.name, lower, upper)
                 return
+            if hand_over:
+                logger.info(
+                    "%s: %s keeps history only from ledger %d; ledgers %d..%d are asked for of the other servers",
+                    job.name, page.served_by, page.history_from, lower, page.history_from - 1,
+                )
+                upper, cursor, page = page.history_from - 1, str(after_ledger(page.history_from - 1)), None
+                segment_has_records = False
+                continue
             assert last_ledger is not None and inside
             # The next segment starts inside the last ledger, which has records.
             segment_has_records = True
@@ -609,9 +696,11 @@ class Backfill:
         elder: int | None,
         segment_has_records: bool,
         finished: bool,
+        served_by: str | None = None,
     ) -> None:
         """Store the page. ``finished``: it ends the range. ``elder``: the
-        oldest ledger the source keeps, when the range could reach it."""
+        oldest ledger the source keeps, when the range could reach it.
+        ``served_by``: the server that answered the page."""
         store.store_prepared(session, self.contexts)
         for record in inside:
             store.store_stream_record(session, job, record, parents_only=self.context == PARENTS)
@@ -619,7 +708,7 @@ class Backfill:
         if finished:
             has_records = segment_has_records or bool(inside)
             kept_from = max(lower, elder) if elder is not None else lower  # the elder is not the start of the window
-            verified = coverage.complete(kept_from, upper) if has_records else coverage.empty(kept_from, upper)
+            verified = coverage.complete(kept_from, upper, served_by) if has_records else coverage.empty(kept_from, upper, served_by)
             pieces = [verified]
             if elder is not None and lower < elder:
                 pieces.insert(0, coverage.unverifiable(lower, elder - 1, self._history_note()))
@@ -629,7 +718,7 @@ class Backfill:
         if last_ledger < upper:
             # Everything above the last record's ledger has now been read.
             has_records = segment_has_records or any(ledger > last_ledger for ledger in inside_ledgers)
-            piece = coverage.complete(last_ledger + 1, upper) if has_records else coverage.empty(last_ledger + 1, upper)
+            piece = coverage.complete(last_ledger + 1, upper, served_by) if has_records else coverage.empty(last_ledger + 1, upper, served_by)
             coverage.replace(session, job.key, self.source, last_ledger + 1, upper, [piece])
         set_checkpoint(
             session,
@@ -666,7 +755,9 @@ class Backfill:
             return None, False
         return stored[0], True
 
-    def _end_of_history(self, job: StreamJob, lower: int, upper: int, last_ledger: int | None) -> None:
+    def _end_of_history(
+        self, job: StreamJob, lower: int, upper: int, last_ledger: int | None, ended: BeforeHistory
+    ) -> None:
         """Horizon answered 410: close the range as far as it was really read.
 
         410 comes when the cursor lies at or below ``toid(elder, 0, 0)``, the
@@ -675,8 +766,15 @@ class Backfill:
         be, and is marked ``unverifiable`` — with one exception. A transaction
         whose cursor gets 410 in the elder ledger is the first one of that
         ledger: nothing precedes it there, so that ledger is read to its end.
+
+        Of a pool, 410 is the last word of every server that could keep the
+        range, and it comes with what they keep as of that moment.
         """
-        elder = self._source_elder()
+        if ended.history is not None:
+            elder, self._latest = ended.history.elder, ended.history.latest
+            self.elder, self._elder_read_at = elder, time.monotonic()
+        else:
+            elder = self._source_elder()
         note = self._history_note()
         if last_ledger is None:
             # Nothing of the range could be read.
@@ -700,12 +798,13 @@ class Backfill:
         logger.info("%s: history ends in [%d, %d]", job.name, lower, upper)
 
     def _source_elder(self) -> int:
-        """The oldest ledger the source still answers for, as of now. A request."""
-        root = self.client.root()
+        """The oldest ledger the source still answers for, as of now: of a
+        pool, of whichever of its servers keeps the most. A request."""
+        history = self.client.history()
         self._elder_read_at = time.monotonic()
-        elder = int(root["history_elder_ledger"])
+        elder = history.elder
         self.elder = elder if self.elder is None else max(self.elder, elder)
-        self._latest = root.get("history_latest_ledger")
+        self._latest = history.latest
         return elder
 
     def _elder_if_reachable(self, lower: int) -> int | None:

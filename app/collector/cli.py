@@ -6,8 +6,11 @@ stopped), ``status`` (frontiers and lag, asking nothing of the source),
 Exit codes of a cycle: 0 every stream is read to the source's latest ledger,
 1 a stream failed, 2 stopped by a limit or a signal.
 
-One collector serves a database. While a cycle reads, it holds the source;
-a backfill that is reading lets go of it.
+One collector serves a database. It is for recovery and for control reads:
+events are what brings history in day by day (``python -m app.worker``), and
+this polls every stream of the watch list, so it is started only when that
+is wanted. It reads through the same pool of Horizon servers as everything
+else, at the pace every process shares.
 """
 
 from __future__ import annotations
@@ -84,7 +87,7 @@ def command_once(args: argparse.Namespace, settings: Settings) -> int:
     jobs, left_out = pick_jobs(engine, args)
     stop = threading.Event()
     _stop_on_signal(stop)
-    with make_client(args, settings) as client, AdvisoryLock(engine, locks.INSTANCE) as instance:
+    with make_client(settings, engine) as client, AdvisoryLock(engine, locks.INSTANCE) as instance:
         if not instance.acquire():
             raise ConfigError("another collector already serves this database: `run` is going, or a `once` is")
         report = _cycle(engine, client, source_name(client), settings, args, jobs, stop)
@@ -100,7 +103,7 @@ def command_run(args: argparse.Namespace, settings: Settings) -> int:
     stop = threading.Event()
     _stop_on_signal(stop)
     interval = args.interval if args.interval is not None else settings.collector_interval_seconds
-    with make_client(args, settings) as client, AdvisoryLock(engine, locks.INSTANCE) as instance:
+    with make_client(settings, engine) as client, AdvisoryLock(engine, locks.INSTANCE) as instance:
         if not instance.acquire():
             raise ConfigError("another collector already serves this database: one is enough")
         source = source_name(client)
@@ -119,7 +122,8 @@ def command_run(args: argparse.Namespace, settings: Settings) -> int:
                     logger.error("%s", error)
                     return FAILED
                 except ConfigError as error:
-                    # A backfill would not let go in time: asked again next cycle.
+                    # Asked for what the source cannot give (a start ledger
+                    # ahead of it): asked again next cycle.
                     logger.warning("%s", error)
                     due = time.monotonic() + interval
                     continue
@@ -131,7 +135,7 @@ def command_run(args: argparse.Namespace, settings: Settings) -> int:
                     logger.warning("next cycle in %.0fs", pause)
                     due = time.monotonic() + pause
                     continue
-                if report is None:  # stopped while a backfill still held the source
+                if report is None:  # stopped before the cycle began
                     break
                 failures = 0
                 _print(report, left_out)
@@ -144,7 +148,7 @@ def command_run(args: argparse.Namespace, settings: Settings) -> int:
 def command_status(args: argparse.Namespace, settings: Settings) -> int:
     """Where every stream has got to, and how far behind it is."""
     engine = engine_for(settings)
-    source = source_name_for(args, settings)
+    source = source_name_for(settings)
     jobs, left_out = pick_jobs(engine, args)
     with Session(engine) as session:
         states = {state.key: state for state in collector_state.streams(session, source)}
@@ -211,15 +215,14 @@ def command_check(args: argparse.Namespace, settings: Settings) -> int:
     engine = engine_for(settings)
     with Session(engine) as session:
         account = args.account or session.scalars(
-            select(TrackedAccount.account_id).where(TrackedAccount.mode == "FULL").order_by(TrackedAccount.account_id).limit(1)
+            select(TrackedAccount.account_id).where(TrackedAccount.enabled.is_(True)).order_by(TrackedAccount.account_id).limit(1)
         ).first()
         market = session.scalars(select(TrackedMarket).where(TrackedMarket.enabled.is_(True)).limit(1)).first()
     engine.dispose()
     if account is None or market is None:
-        raise ConfigError("check needs a FULL account and an enabled market in the watch list")
-    with locks.SourceUse(engine, source_name_for(args, settings)) as use, make_client(args, settings) as client:
-        if not use.acquire(wait=args.wait_lock):
-            raise ConfigError(f"another reader has held the source for {args.wait_lock}s")
+        raise ConfigError("check needs an enabled account and an enabled market in the watch list")
+    engine.dispose()
+    with make_client(settings, engine) as client:
         limits = Limits(requests=lambda: client.stats.requests, max_requests=args.max_requests)
         client.before_request = limits.check
         findings = check.ascending(
@@ -264,26 +267,18 @@ def _cycle(
     *,
     collector: Collector | None = None,
 ) -> CycleReport | None:
-    """One cycle, with the collector's right of way: the demand lock is held
-    from now until the cycle is over, the source lock while it reads.
+    """One cycle. None when stopped before it began.
 
-    None when stopped while a backfill still held the source.
+    The requests of the cycle share the pace of every process; nothing is
+    locked while it reads.
     """
-    with AdvisoryLock(engine, locks.DEMAND + source) as demand, AdvisoryLock(engine, locks.SOURCE + source) as held:
-        if not demand.acquire():
-            raise ConfigError("another collector is waiting for this source: one collector serves a database")
-        if not held.acquire(wait=args.wait_lock, stop=stop):
-            if stop.is_set():
-                return None
-            raise ConfigError(
-                f"a backfill has held the source for {args.wait_lock}s. It should let a collector in; "
-                f"stop it, or give --wait-lock more seconds."
-            )
-        limits = _limits(client, args, settings, stop)
-        if collector is None:
-            with _collector(client, engine, source, settings, args) as once:
-                return once.cycle(jobs, start_from=args.start_ledger, limits=limits)
-        return collector.cycle(jobs, start_from=args.start_ledger, limits=limits)
+    limits = _limits(client, args, settings, stop)
+    if stop.is_set():
+        return None
+    if collector is None:
+        with _collector(client, engine, source, settings, args) as once:
+            return once.cycle(jobs, start_from=args.start_ledger, limits=limits)
+    return collector.cycle(jobs, start_from=args.start_ledger, limits=limits)
 
 
 def _limits(client: HorizonClient, args: argparse.Namespace, settings: Settings, stop: threading.Event) -> Limits:
@@ -396,8 +391,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     def source_options(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--horizon-url", help="Horizon to read (default: MTL_HORIZON_URL or the public server)")
-        sub.add_argument("--rate", type=float, help="requests per second (default: MTL_HORIZON_REQUESTS_PER_SECOND or 1)")
+        # Which Horizon servers are read, and how fast, comes from the
+        # environment alone: MTL_HORIZON_URLS and MTL_HORIZON_REQUESTS_PER_SECOND.
         sub.add_argument("--page-size", type=int, default=200, help="records per page, at most 200 (default: 200)")
 
     def cycle_options(sub: argparse.ArgumentParser) -> None:
@@ -419,9 +414,6 @@ def build_parser() -> argparse.ArgumentParser:
             help="what to fetch for an account record's transaction: full (default) or parents. "
             "A market's trades are always read with their parents only.",
         )
-        sub.add_argument(
-            "--wait-lock", type=int, default=600, help="seconds to wait while a backfill holds the source (default: 600)"
-        )
 
     sub = commands.add_parser("once", help="read every stream to the source's latest ledger, once")
     sub.set_defaults(handler=command_once)
@@ -438,16 +430,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = commands.add_parser("check", help="read forwards from one account and one market on a small window; stores nothing")
     sub.set_defaults(handler=command_check)
     source_options(sub)
-    sub.add_argument("--account", help="whose streams to read (default: the first FULL account)")
+    sub.add_argument("--account", help="whose streams to read (default: the first enabled account)")
     sub.add_argument("--window", type=int, default=86400, help="ledgers to read from, below the latest (default: 86400, a day)")
     sub.add_argument("--max-requests", type=int, default=20, help="stop at this many requests (default: 20)")
-    sub.add_argument("--wait-lock", type=int, default=60, help="seconds to wait while another reader holds the source (default: 60)")
     sub.add_argument("--output", help="write the findings to this file as JSON")
 
     sub = commands.add_parser("status", help="frontiers and lag of every stream; asks nothing of the source")
     sub.set_defaults(handler=command_status)
     sub.add_argument("--subject", action="append", help="only streams whose name contains this; repeatable")
-    sub.add_argument("--horizon-url", help="the source whose frontiers to show (default: MTL_HORIZON_URL)")
     return parser
 
 

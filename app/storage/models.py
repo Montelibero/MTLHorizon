@@ -18,6 +18,7 @@ Identifier rules that the database enforces itself:
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -440,8 +441,11 @@ class HistoryTrade(Base, Timestamped):
 class TrackedAccount(Base, Timestamped):
     """The watch list of accounts. Managed by hand.
 
-    ``mode`` is not part of the identity, so an account can move between FULL
-    and ASSETS_ONLY at any time; history already collected is not deleted.
+    ``enabled`` says whether the account's history is collected. It is not
+    part of the identity, so an account can be switched off and on at any
+    time. History already collected is not deleted, and switching an account
+    off switches off neither the assets nor the markets: the three watch
+    lists are independent.
     """
 
     __tablename__ = "tracked_accounts"
@@ -449,12 +453,8 @@ class TrackedAccount(Base, Timestamped):
     account_id: Mapped[str] = mapped_column(
         Text, ForeignKey("history_accounts.account_id"), primary_key=True
     )
-    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     reason: Mapped[str] = mapped_column(Text, nullable=False)
-
-    __table_args__ = (
-        CheckConstraint("mode IN ('FULL', 'ASSETS_ONLY', 'CANDIDATE', 'DISABLED')", name="mode_known"),
-    )
 
 
 class TrackedAsset(Base, Timestamped):
@@ -516,8 +516,13 @@ class SyncCoverage(Base, Timestamped):
     policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
     from_ledger: Mapped[int] = mapped_column(BigInteger, nullable=False)
     to_ledger: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    # Where the range was collected from, e.g. "horizon:horizon.stellar.org".
+    # Where the range was collected from, e.g. "horizon:horizon.stellar.org":
+    # the pool, named by its first server.
     source: Mapped[str] = mapped_column(Text, nullable=False)
+    # Which server of the pool read the range, as it is shown to people;
+    # several, comma-separated, when more than one did. NULL for ranges read
+    # before it was kept, and for pending ones.
+    served_by: Mapped[str | None] = mapped_column(Text)
     # pending (not verified) | complete (verified, has records) | empty
     # (verified, no records) | unverifiable (the source can no longer answer
     # for this range: it lies below the history the source keeps)
@@ -644,3 +649,195 @@ class CollectorStream(Base, Timestamped):
         CheckConstraint("failures >= 0", name="failures_not_negative"),
     )
 
+
+class HttpPace(Base):
+    """The pace of requests to Horizon, one row, shared by every process
+    (see :mod:`app.storage.pace`). It is not history: it holds no claim."""
+
+    __tablename__ = "http_pace"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    # When the next request of any process may go.
+    next_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # When a request last took a slot, and of what kind.
+    last_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_share: Mapped[str] = mapped_column(Text, nullable=False)
+    # Event slots taken since a background reader last had one.
+    since_background: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (
+        CheckConstraint("last_share IN ('events', 'background')", name="share_known"),
+        CheckConstraint("since_background >= 0", name="since_background_not_negative"),
+    )
+
+
+class HorizonNodeState(Base, Timestamped):
+    """What is known of one server of the pool: its last check, and what the
+    running processes last saw of it. Compact, for a status page; a check
+    writes the first half, a pool the second. It holds no claim about
+    history.
+
+    ``url`` is the address as it is shown to people — scheme, host, port —
+    so that a secret in the configured address never reaches the table.
+    """
+
+    __tablename__ = "horizon_node_state"
+
+    url: Mapped[str] = mapped_column(Text, primary_key=True)
+    # Its place in the list, the primary being 1.
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # -- the last check ------------------------------------------------------
+    available: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    network_passphrase: Mapped[str | None] = mapped_column(Text)
+    horizon_version: Mapped[str | None] = mapped_column(Text)
+    latest_ledger: Mapped[int | None] = mapped_column(BigInteger)
+    elder_ledger: Mapped[int | None] = mapped_column(BigInteger)
+    latest_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Behind the freshest server of the same check.
+    lag_ledgers: Mapped[int | None] = mapped_column(BigInteger)
+    # Median milliseconds of the successful answers, and the last status.
+    root_ms: Mapped[int | None] = mapped_column(Integer)
+    history_ms: Mapped[int | None] = mapped_column(Integer)
+    root_status: Mapped[int | None] = mapped_column(Integer)
+    history_status: Mapped[int | None] = mapped_column(Integer)
+    errors: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    timeouts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # The rate limit headers the server sent, when it sent any.
+    rate_limit_headers: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # The whole result of the check, for a page that wants more than the columns.
+    report: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # -- what the running processes last saw of it ---------------------------
+    last_answer_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cooling_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("position > 0", name="position_positive"),
+        CheckConstraint("errors >= 0", name="errors_not_negative"),
+        CheckConstraint("timeouts >= 0", name="timeouts_not_negative"),
+    )
+
+
+class ProcessingJob(Base, Timestamped):
+    """The work of bringing one transaction in whole: the transaction, its
+    operations, its effects and, when it made any, its trades.
+
+    One job for one transaction, whoever brought word of it: notifications of
+    several operations of one transaction, deliveries repeated, deliveries
+    for several subscriptions — they all lead here. What is stored already is
+    not fetched again (``history_transactions.context_loaded``).
+
+    ``state`` is one of:
+
+    * ``pending`` — to be done, when ``next_attempt_at`` has come;
+    * ``running`` — taken by a worker (the lease: ``leased_by`` until
+      ``lease_expires_at``), and back to ``pending`` by whoever finds the
+      lease expired: a worker that died takes no job along;
+    * ``done`` — everything the transaction has is stored;
+    * ``partial`` — some of it is stored; the rest was not had in
+      ``attempts`` tries, and it waits for a retry;
+    * ``dead`` — nothing of it could be stored, for as many tries.
+
+    ``result`` says what was stored and what was not. ``last_error`` says
+    why the last try went as it did.
+    """
+
+    __tablename__ = "processing_job"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    # The transaction as Horizon names it: of a fee-bump transaction, the hash of the envelope.
+    transaction_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    transaction_toid: Mapped[int | None] = mapped_column(BigInteger)
+    ledger_sequence: Mapped[int | None] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The lease: who has the job, and until when.
+    leased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    leased_by: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # How many times word of the transaction came again after the job had
+    # given up, and took it back into the queue.
+    revivals: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    __table_args__ = (
+        UniqueConstraint("transaction_hash", name="transaction_hash"),
+        CheckConstraint(
+            "state IN ('pending', 'running', 'done', 'partial', 'dead')",
+            name="state_known",
+        ),
+        CheckConstraint("attempts >= 0", name="attempts_not_negative"),
+        CheckConstraint("revivals >= 0", name="revivals_not_negative"),
+        Index("ix_processing_job_queue", "state", "next_attempt_at"),
+    )
+
+
+class NotifierEvent(Base, Timestamped):
+    """One delivery of Operations Notifier, kept as it came, before anything
+    is done about it: the journal of what was heard.
+
+    A delivery is told from another by the notification's ``id`` and the
+    ``subscription`` it was sent for — one notification is delivered once for
+    every subscription that matched it. One that comes again is recognised
+    and nothing changes.
+
+    ``state`` is one of:
+
+    * ``queued`` — a watch rule matched, or whether one does could not be
+      told and the transaction is brought in all the same;
+    * ``unmatched`` — no enabled watch rule names the operation's accounts,
+      assets or markets, and that could be said for sure; kept, not worked;
+    * ``unsupported`` — not a notification of an operation, or without a
+      transaction to bring in; kept, not worked.
+
+    ``matched`` names the rules that matched and ``diagnosis`` says why there
+    is no job when there is none, or what could not be read. ``payload`` is
+    the body as it came. Nothing here is ever deleted.
+    """
+
+    __tablename__ = "notifier_event"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    subscription: Mapped[str] = mapped_column(Text, primary_key=True)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # What the Notifier says of it: when it made the notification and when
+    # it sent this delivery. ``created_at`` of the row is when it got here.
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # What was read of it.
+    operation_id: Mapped[int | None] = mapped_column(BigInteger)
+    operation_type: Mapped[str | None] = mapped_column(Text)
+    account: Mapped[str | None] = mapped_column(Text)
+    transaction_hash: Mapped[str | None] = mapped_column(Text)
+    transaction_toid: Mapped[int | None] = mapped_column(BigInteger)
+    ledger_sequence: Mapped[int | None] = mapped_column(Integer)
+    accounts: Mapped[list[str] | None] = mapped_column(JSONB)
+    assets: Mapped[list[str] | None] = mapped_column(JSONB)
+    markets: Mapped[list[list[str]] | None] = mapped_column(JSONB)
+    # What was made of it.
+    matched: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    diagnosis: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    job_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("processing_job.id"))
+    # The delivery itself, as it came.
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # A few headers, none that could be a secret: the signature is not kept.
+    headers: Mapped[dict[str, str]] = mapped_column(JSONB, nullable=False)
+    # Which configured signing key it was signed with (a public key).
+    signed_by: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("state IN ('queued', 'unmatched', 'unsupported')", name="state_known"),
+        Index("ix_notifier_event_received", "received_at"),
+        Index("ix_notifier_event_transaction", "transaction_hash"),
+        Index("ix_notifier_event_job", "job_id"),
+    )

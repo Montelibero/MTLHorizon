@@ -43,7 +43,7 @@ accounts:
     mode: FULL
     reason: test account
   - address: {C}
-    mode: CANDIDATE
+    enabled: false
     reason: not loaded
 """
     ),
@@ -521,7 +521,7 @@ def test_an_account_that_is_not_full_is_not_read(pilot: Pilot) -> None:
     jobs = pilot.jobs()
 
     assert not any(C in job.name for job in jobs)
-    assert pilot.left_out == [f"account {C}: mode CANDIDATE; history is loaded only for FULL"]
+    assert pilot.left_out == [f"account {C}: disabled; its history is not loaded"]
     pilot.run()
     assert pilot.rows("SELECT count(*) FROM history_transactions WHERE id = :id", id=toid(100, 3)) == [(0,)]
 

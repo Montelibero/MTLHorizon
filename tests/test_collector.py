@@ -25,9 +25,9 @@ from app.sources.horizon import RequestFailed
 from app.collector.loader import Collector, CycleReport, StreamResult, WrongNetwork
 from app.storage import collector_state, coverage, locks
 from app.storage.collector_state import StreamState
-from app.storage.locks import AdvisoryLock, SourceUse
+from app.storage.locks import AdvisoryLock
 from app.storage.writer import HistoryWriter
-from tests.fake_horizon import EUR, ISSUER, RECT, A, B, C, D, S, FakeHorizon, Operation, Transaction, _payment, paid, sale
+from tests.fake_horizon import EUR, ISSUER, RECT, A, B, C, D, S, FakeHorizon, Operation, Transaction, _payment, paid, sale, serve
 
 SOURCE = "horizon:horizon.test"
 START = 118  # the latest ledger when the collector is first started
@@ -50,7 +50,7 @@ accounts:
     mode: FULL
     reason: test account
   - address: {C}
-    mode: CANDIDATE
+    enabled: false
     reason: not loaded
 """
     ),
@@ -477,60 +477,6 @@ def test_one_collector_serves_a_database(make_database: Callable[[], str]) -> No
         second.dispose()
 
 
-def test_a_backfill_holding_the_source_lets_a_due_collector_in(make_database: Callable[[], str]) -> None:
-    engine = create_engine(make_database())
-    backfill = SourceUse(engine, SOURCE, check_every=0.0, poll=0.02)
-    order: list[str] = []
-
-    def collector() -> None:
-        with AdvisoryLock(engine, locks.DEMAND + SOURCE) as demand, AdvisoryLock(engine, locks.SOURCE + SOURCE) as held:
-            assert demand.acquire()
-            assert held.acquire(wait=10.0, poll=0.02)
-            order.append("collector reads")
-        order.append("collector done")
-
-    thread = threading.Thread(target=collector)
-    try:
-        assert backfill.acquire(wait=0.0)
-        backfill.before_request()  # nobody waits: the backfill keeps the source
-        assert backfill.held and order == []
-
-        thread.start()
-        time.sleep(0.3)  # the collector is due and waiting
-        for _ in range(200):  # what a backfill does between its requests
-            backfill.before_request()
-            if order and order[-1] == "collector done":
-                break
-            time.sleep(0.02)
-        thread.join(10)
-
-        assert order == ["collector reads", "collector done"]
-        assert backfill.held and not locks.demanded(engine, SOURCE)
-    finally:
-        backfill.release()
-        thread.join(10)
-        engine.dispose()
-
-
-def test_a_source_nobody_demands_is_never_given_up(make_database: Callable[[], str]) -> None:
-    engine = create_engine(make_database())
-    other = AdvisoryLock(engine, locks.SOURCE + SOURCE)
-    use = SourceUse(engine, SOURCE, check_every=0.0)
-    try:
-        assert use.acquire(wait=0.0)
-        use.before_request()
-        assert use.held
-        use.release()
-        assert other.acquire(wait=0.0)
-    finally:
-        use.release()
-        other.release()
-        engine.dispose()
-
-
-# -- markets -------------------------------------------------------------------
-
-
 def test_the_market_is_read_before_the_accounts(live: Live) -> None:
     live.cycle()
     live.fake.close(sale(120), paid(121, A, B), latest=122)
@@ -621,8 +567,9 @@ def test_status_says_where_every_stream_has_got_to(live: Live, capsys: pytest.Ca
     live.fake.close(paid(120, A, B), latest=121)
     live.cycle()
     monkeypatch.setenv("MTL_HORIZON_DATABASE_URL", live.url)
+    serve(monkeypatch, live.fake)
 
-    assert collector_cli.main(["status", "--horizon-url", "https://horizon.test"]) == 0
+    assert collector_cli.main(["status"]) == 0
 
     out = capsys.readouterr().out
     assert "global frontier 121" in out
@@ -633,8 +580,9 @@ def test_status_says_where_every_stream_has_got_to(live: Live, capsys: pytest.Ca
 
 def test_status_tells_a_stream_that_never_ran(live: Live, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MTL_HORIZON_DATABASE_URL", live.url)
+    serve(monkeypatch, live.fake)
 
-    assert collector_cli.main(["status", "--subject", MARKET, "--horizon-url", "https://horizon.test"]) == 0
+    assert collector_cli.main(["status", "--subject", MARKET]) == 0
 
     out = capsys.readouterr().out
     assert "not started" in out and "the collector has not run since it was tracked" in out
@@ -741,11 +689,11 @@ def test_run_collects_cycle_after_cycle_and_picks_up_the_watch_list(
     live: Live, make_database: Callable[[], str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("MTL_HORIZON_DATABASE_URL", live.url)
-    monkeypatch.setattr(collector_cli, "make_client", lambda args, settings: live.fake.client)
+    serve(monkeypatch, live.fake)
     stops: list[threading.Event] = []
     monkeypatch.setattr(collector_cli, "_stop_on_signal", lambda stop: stops.append(stop))
     outcome: list[int] = []
-    argv = ["run", "--interval", "0.05", "--max-seconds", "30", "--horizon-url", "https://horizon.test"]
+    argv = ["run", "--interval", "0.05", "--max-seconds", "30"]
     runner = threading.Thread(target=lambda: outcome.append(collector_cli.main(argv)))
     runner.start()
     try:
@@ -769,9 +717,8 @@ def test_run_collects_cycle_after_cycle_and_picks_up_the_watch_list(
     assert live.count("history_trades") == 1 and live.count("history_transactions") == 3
 
     # A restart goes on where it stood: the starts are not moved. (`run`
-    # closed the client it was given, as a command does.)
-    monkeypatch.setattr(collector_cli, "make_client", lambda args, settings: live.fake.reopen())
-    assert collector_cli.main(["once", "--horizon-url", "https://horizon.test"]) == collector_cli.OK
+    # closed its pool, as a command does; the next one builds a new one.)
+    assert collector_cli.main(["once"]) == collector_cli.OK
     assert {state.start_ledger for state in live.states().values()} == {START, 121}
     out = capsys.readouterr().out
     assert "global frontier 126" in out
@@ -792,31 +739,15 @@ def test_run_collects_cycle_after_cycle_and_picks_up_the_watch_list(
 
 def test_once_refuses_while_another_collector_serves(live: Live, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MTL_HORIZON_DATABASE_URL", live.url)
-    monkeypatch.setattr(collector_cli, "make_client", lambda args, settings: live.fake.client)
+    serve(monkeypatch, live.fake)
     holder = AdvisoryLock(live.engine, locks.INSTANCE)
     assert holder.acquire()
     try:
-        assert collector_cli.main(["once", "--horizon-url", "https://horizon.test"]) == collector_cli.FAILED
+        assert collector_cli.main(["once"]) == collector_cli.FAILED
         assert live.fake.requests == []  # nothing was asked of the source
         assert live.states() == {}
     finally:
         holder.release()
-
-
-def test_a_backfill_waits_no_longer_than_told_for_a_busy_source(make_database: Callable[[], str]) -> None:
-    engine = create_engine(make_database())
-    holder = AdvisoryLock(engine, locks.SOURCE + SOURCE)
-    use = SourceUse(engine, SOURCE)
-    try:
-        assert holder.acquire()
-        assert not use.acquire(wait=0.2)
-        assert not use.held
-        holder.release()
-        assert use.acquire(wait=1.0) and use.held
-    finally:
-        use.release()
-        holder.release()
-        engine.dispose()
 
 
 def test_a_cycle_that_finds_nothing_new_asks_for_the_root_alone_for_as_long_as_it_runs(live: Live) -> None:
