@@ -22,7 +22,7 @@ from tests import factories as f
 
 SOURCE = "horizon:horizon.stellar.org"
 NOW = datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC)
-STREAM = (SOURCE, "transaction", f.ALICE)
+STREAM = {"source": SOURCE, "resource_type": "transaction", "stream_key": f.ALICE, "direction": "desc"}
 VERIFIED_RANGE = text(
     "SELECT subject_key, state, from_ledger, to_ledger FROM sync_coverage "
     "WHERE state IN ('complete', 'empty') ORDER BY from_ledger"
@@ -176,21 +176,21 @@ def test_market_is_one_row_whichever_side_is_named_first(session: Session) -> No
 
 def test_checkpoint_travels_with_its_data(session: Session) -> None:
     def checkpoint() -> SyncState | None:
-        return session.get(SyncState, STREAM)
+        return session.get(SyncState, (SOURCE, "transaction", "desc", f.ALICE))
 
     def transactions() -> int:
         return session.scalar(select(func.count()).select_from(HistoryTransaction)) or 0
 
     # A page whose transaction is rolled back takes its checkpoint with it.
     f.add_transaction(session, 1, source_account=f.ALICE)
-    set_checkpoint(session, *STREAM, cursor=str(to_total_order_id(1, 1)), cursor_ledger=1)
+    set_checkpoint(session, **STREAM, cursor=str(to_total_order_id(1, 1)), cursor_ledger=1)
     session.rollback()
     assert checkpoint() is None
     assert transactions() == 0
 
     # A committed page keeps both.
     f.add_transaction(session, 2, source_account=f.ALICE)
-    set_checkpoint(session, *STREAM, cursor=str(to_total_order_id(2, 1)), cursor_ledger=2)
+    set_checkpoint(session, **STREAM, cursor=str(to_total_order_id(2, 1)), cursor_ledger=2)
     session.commit()
     assert checkpoint().cursor == str(to_total_order_id(2, 1))  # type: ignore[union-attr]
     assert checkpoint().cursor_ledger == 2  # type: ignore[union-attr]
@@ -198,7 +198,13 @@ def test_checkpoint_travels_with_its_data(session: Session) -> None:
 
     # The next page replaces the checkpoint; a stream has one. The cursor is
     # kept verbatim, whatever its format.
-    set_checkpoint(session, *STREAM, cursor="opaque-token")
+    set_checkpoint(session, **STREAM, cursor="opaque-token")
     assert checkpoint().cursor == "opaque-token"  # type: ignore[union-attr]
     assert checkpoint().cursor_ledger is None  # type: ignore[union-attr]
     assert session.scalar(select(func.count()).select_from(SyncState)) == 1
+
+    # A replaced checkpoint is an updated row: its time of change moves too.
+    session.execute(update(SyncState).values(updated_at=NOW))
+    set_checkpoint(session, **STREAM, cursor=str(to_total_order_id(3, 1)), cursor_ledger=3)
+    session.expire_all()
+    assert checkpoint().updated_at > NOW  # type: ignore[union-attr]

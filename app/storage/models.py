@@ -230,6 +230,13 @@ class HistoryTransaction(Base, Timestamped):
     # Source record as JSON. Content only, never a byte-exact copy of the
     # HTTP response.
     raw: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    # Which parts of the transaction were loaded from the source as a whole:
+    # any of "operations", "effects", "trades". The transaction row alone says
+    # nothing about them: a row found in a stream may still be waiting for
+    # its operations to be fetched.
+    context_loaded: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default=text("'{}'")
+    )
 
     __table_args__ = (
         UniqueConstraint("transaction_hash", name="uq_history_transactions_transaction_hash"),
@@ -511,14 +518,20 @@ class SyncCoverage(Base, Timestamped):
     to_ledger: Mapped[int] = mapped_column(BigInteger, nullable=False)
     # Where the range was collected from, e.g. "horizon:horizon.stellar.org".
     source: Mapped[str] = mapped_column(Text, nullable=False)
-    # pending (not verified) | complete (verified, has records) | empty (verified, no records)
+    # pending (not verified) | complete (verified, has records) | empty
+    # (verified, no records) | unverifiable (the source can no longer answer
+    # for this range: it lies below the history the source keeps)
     state: Mapped[str] = mapped_column(Text, nullable=False)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Why the range is in its state, when that needs words.
+    detail: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         CheckConstraint("from_ledger > 0", name="from_ledger_positive"),
         CheckConstraint("to_ledger >= from_ledger", name="range_not_empty"),
-        CheckConstraint("state IN ('pending', 'complete', 'empty')", name="state_known"),
+        CheckConstraint(
+            "state IN ('pending', 'complete', 'empty', 'unverifiable')", name="state_known"
+        ),
         CheckConstraint(
             "(state = 'pending') = (verified_at IS NULL)", name="verified_at_matches_state"
         ),
@@ -542,7 +555,7 @@ event.listen(
 
 
 class SyncState(Base, Timestamped):
-    """Cursor checkpoint per source and stream.
+    """Cursor checkpoint per source, stream and frontier.
 
     A checkpoint is only valid together with the data collected up to it, so
     it must be written in the same database transaction as that data; the
@@ -553,6 +566,10 @@ class SyncState(Base, Timestamped):
     operations, ``<id>-<order>`` for effects and trades, an address for
     accounts) and is not a number in general. ``cursor_ledger`` is the ledger
     sequence derived from it where the format allows, NULL otherwise.
+
+    ``direction`` tells the two frontiers of one stream apart: ``asc`` moves
+    after new records (live collection), ``desc`` moves back into history
+    (backfill).
     """
 
     __tablename__ = "sync_state"
@@ -560,7 +577,12 @@ class SyncState(Base, Timestamped):
     source: Mapped[str] = mapped_column(Text, primary_key=True)
     # ledger | transaction | operation | effect | trade | account
     resource_type: Mapped[str] = mapped_column(Text, primary_key=True)
+    direction: Mapped[str] = mapped_column(
+        Text, primary_key=True, server_default=text("'asc'")
+    )
     # Account address, market key, '' for an unfiltered stream.
     stream_key: Mapped[str] = mapped_column(Text, primary_key=True)
     cursor: Mapped[str | None] = mapped_column(Text)
     cursor_ledger: Mapped[int | None] = mapped_column(BigInteger)
+
+    __table_args__ = (CheckConstraint("direction IN ('asc', 'desc')", name="direction_known"),)

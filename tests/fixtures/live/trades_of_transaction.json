@@ -1,0 +1,150 @@
+[
+ {
+  "_links": {
+   "self": {
+    "href": ""
+   },
+   "base": {
+    "href": "https://horizon.stellar.org/liquidity_pools/1b492b669959d3f082b5fb7dcc847d43371fd1f586209899603b93ac1a39b7f8"
+   },
+   "counter": {
+    "href": "https://horizon.stellar.org/accounts/GCPOWDQQDVSAQGJXZW3EWPPJ5JCF4KTTHBYNB4U54AKQVDLZXLLYMXY7"
+   },
+   "operation": {
+    "href": "https://horizon.stellar.org/operations/281967128423751681"
+   }
+  },
+  "id": "281967128423751681-0",
+  "paging_token": "281967128423751681-0",
+  "ledger_close_time": "2026-11-24T16:49:53Z",
+  "trade_type": "liquidity_pool",
+  "liquidity_pool_fee_bp": 30,
+  "base_liquidity_pool_id": "1b492b669959d3f082b5fb7dcc847d43371fd1f586209899603b93ac1a39b7f8",
+  "base_amount": "4912.8652874",
+  "base_asset_type": "credit_alphanum12",
+  "base_asset_code": "EURMTL",
+  "base_asset_issuer": "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V",
+  "counter_offer_id": "4893653146851139585",
+  "counter_account": "GCPOWDQQDVSAQGJXZW3EWPPJ5JCF4KTTHBYNB4U54AKQVDLZXLLYMXY7",
+  "counter_amount": "712.6809730",
+  "counter_asset_type": "credit_alphanum4",
+  "counter_asset_code": "MTL",
+  "counter_asset_issuer": "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V",
+  "base_is_seller": true,
+  "price": {
+   "n": "7126809730",
+   "d": "49128652874"
+  }
+ },
+ {
+  "_links": {
+   "self": {
+    "href": ""
+   },
+   "base": {
+    "href": "https://horizon.stellar.org/accounts/GCPOWDQQDVSAQGJXZW3EWPPJ5JCF4KTTHBYNB4U54AKQVDLZXLLYMXY7"
+   },
+   "counter": {
+    "href": "https://horizon.stellar.org/accounts/GA5U6OV2P77IZIXWNKNHGXSFKCRJX3NVQESVZKMYEKV5WNB6IIJKL4GF"
+   },
+   "operation": {
+    "href": "https://horizon.stellar.org/operations/281967128423751681"
+   }
+  },
+  "id": "281967128423751681-1",
+  "paging_token": "281967128423751681-1",
+  "ledger_close_time": "2026-11-24T16:49:53Z",
+  "trade_type": "orderbook",
+  "base_offer_id": "4893653146851139585",
+  "base_account": "GCPOWDQQDVSAQGJXZW3EWPPJ5JCF4KTTHBYNB4U54AKQVDLZXLLYMXY7",
+  "base_amount": "23.1829549",
+  "base_asset_type": "credit_alphanum12",
+  "base_asset_code": "EURMTL",
+  "base_asset_issuer": "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V",
+  "counter_offer_id": "1867248625",
+  "counter_account": "GA5U6OV2P77IZIXWNKNHGXSFKCRJX3NVQESVZKMYEKV5WNB6IIJKL4GF",
+  "counter_amount": "4.9325436",
+  "counter_asset_type": "credit_alphanum12",
+  "counter_asset_code": "MTLRECT",
+  "counter_asset_issuer": "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V",
+  "base_is_seller": false,
+  "price": {
+   "n": "10",
+   "d": "47"
+  }
+ },
+ {
+  "_links": {
+   "self": {
+    "href": ""
+   },
+   "base": {
+    "href": "https://horizon.stellar.org/accounts/GCPOWDQQDVSAQGJXZW3EWPPJ5JCF4KTTHBYNB4U54AKQVDLZXLLYMXY7"
+   },
+   "counter": {
+    "href": "https://horizon.stellar.org/accounts/GDUMK6YJZ6ZC72CAMVHLUHLIFTNSLD7WFWO75Q3T2EOEW75XWH4PNSOZ"
+   },
+   "operation": {
+    "href": "https://horizon.stellar.org/operations/281967128423751681"
+   }
+  },
+  "id": "281967128423751681-2",
+  "paging_token": "281967128423751681-2",
+  "ledger_close_time": "2026-11-24T16:49:53Z",
+  "trade_type": "orderbook",
+  "base_offer_id": "4893653146851139585",
+  "base_account": "GCPOWDQQDVSAQGJXZW3EWPPJ5JCF4KTTHBYNB4U54AKQVDLZXLLYMXY7",
+  "base_amount": "4385.0000000",
+  "base_asset_type": "credit_alphanum12",
+  "base_asset_code": "EURMTL",
+  "base_asset_issuer": "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V",
+  "counter_offer_id": "1804182570",
+  "counter_account": "GDUMK6YJZ6ZC72CAMVHLUHLIFTNSLD7WFWO75Q3T2EOEW75XWH4PNSOZ",
+  "counter_amount": "877.1792495",
+  "counter_asset_type": "credit_alphanum12",
+  "counter_asset_code": "MTLRECT",
+  "counter_asset_issuer": "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V",
+  "base_is_seller": false,
+  "price": {
+   "n": "201285428",
+   "d": "1006221479"
+  }
+ },
+ {
+  "_links": {
+   "self": {
+    "href": ""
+   },
+   "base": {
+    "href": "https://horizon.stellar.org/accounts/GCPOWDQQDVSAQGJXZW3EWPPJ5JCF4KTTHBYNB4U54AKQVDLZXLLYMXY7"
+   },
+   "counter": {
+    "href": "https://horizon.stellar.org/accounts/GC6CMCHNOVQGX4STELR7W2HN5H6EGY7LG2ED27DJAFYVFR3PTCG47CWP"
+   },
+   "operation": {
+    "href": "https://horizon.stellar.org/operations/281967128423751681"
+   }
+  },
+  "id": "281967128423751681-3",
+  "paging_token": "281967128423751681-3",
+  "ledger_close_time": "2026-11-24T16:49:53Z",
+  "trade_type": "orderbook",
+  "base_offer_id": "4893653146851139585",
+  "base_account": "GCPOWDQQDVSAQGJXZW3EWPPJ5JCF4KTTHBYNB4U54AKQVDLZXLLYMXY7",
+  "base_amount": "504.6823325",
+  "base_asset_type": "credit_alphanum12",
+  "base_asset_code": "EURMTL",
+  "base_asset_issuer": "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V",
+  "counter_offer_id": "1831513391",
+  "counter_account": "GC6CMCHNOVQGX4STELR7W2HN5H6EGY7LG2ED27DJAFYVFR3PTCG47CWP",
+  "counter_amount": "100.9364665",
+  "counter_asset_type": "credit_alphanum12",
+  "counter_asset_code": "MTLRECT",
+  "counter_asset_issuer": "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V",
+  "base_is_seller": false,
+  "price": {
+   "n": "1",
+   "d": "5"
+  }
+ }
+]

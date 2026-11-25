@@ -35,13 +35,22 @@ class Settings:
     # publishable, and the host side of the mapping is what stays local.
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    # Source of history. Read-only; the public server unless overridden.
+    horizon_url: str = "https://horizon.stellar.org"
+    # Pace of requests to the source. The public server publishes no limit,
+    # so the client keeps to one request per second by default.
+    horizon_requests_per_second: float = 1.0
+    # Requests in flight at once. Irrelevant below a few requests per second;
+    # kept because latency, not rate, is the limit once the pace is raised.
+    horizon_concurrency: int = 1
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
         env = os.environ if env is None else env
-        port = env.get(f"{ENV_PREFIX}API_PORT", "").strip() or "8000"
+        name = f"{ENV_PREFIX}API_PORT"
+        port = env.get(name, "").strip() or "8000"
         if not port.isdigit() or not 0 < int(port) < 65536:
-            raise ConfigError(f"{ENV_PREFIX}API_PORT must be a TCP port number, got {port!r}")
+            raise ConfigError(f"{name} must be a TCP port number, got {port!r}")
         return cls(
             database_url=env.get(f"{ENV_PREFIX}DATABASE_URL", "").strip(),
             network_passphrase=(
@@ -49,4 +58,20 @@ class Settings:
             ),
             api_host=env.get(f"{ENV_PREFIX}API_HOST", "").strip() or "127.0.0.1",
             api_port=int(port),
+            horizon_url=env.get(f"{ENV_PREFIX}URL", "").strip() or "https://horizon.stellar.org",
+            horizon_requests_per_second=_positive_number(env, "REQUESTS_PER_SECOND", 1.0),
+            horizon_concurrency=int(_positive_number(env, "CONCURRENCY", 1.0)),
         )
+
+
+def _positive_number(env: Mapping[str, str], name: str, default: float) -> float:
+    raw = env.get(f"{ENV_PREFIX}{name}", "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ConfigError(f"{ENV_PREFIX}{name} must be a number, got {raw!r}") from None
+    if value <= 0 or value != value:
+        raise ConfigError(f"{ENV_PREFIX}{name} must be positive, got {raw!r}")
+    return value

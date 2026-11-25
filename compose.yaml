@@ -4,6 +4,8 @@
 #   docker compose build
 #   docker compose up -d
 #   docker compose run --rm api alembic upgrade head
+#   docker compose run --rm -v "$PWD/local:/app/local" api \
+#       python -m app.backfill import-config --file local/tracking.yaml
 #
 # PostgreSQL does not publish a port: only containers on this network reach it.
 # The API is published on localhost only.
@@ -13,6 +15,10 @@ name: mtl-horizon
 x-api-environment: &api-environment
   MTL_HORIZON_DATABASE_URL: postgresql+psycopg://mtl_horizon:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/mtl_horizon
   MTL_HORIZON_NETWORK_PASSPHRASE: ${MTL_HORIZON_NETWORK_PASSPHRASE:-Public Global Stellar Network ; September 2015}
+  # Where history is read from, and how fast this installation may ask.
+  MTL_HORIZON_URL: ${MTL_HORIZON_URL:-https://horizon.stellar.org}
+  MTL_HORIZON_REQUESTS_PER_SECOND: ${MTL_HORIZON_REQUESTS_PER_SECOND:-1}
+  MTL_HORIZON_CONCURRENCY: ${MTL_HORIZON_CONCURRENCY:-1}
 
 services:
   db:

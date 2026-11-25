@@ -18,13 +18,16 @@ from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy import types as sqltypes
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import TableClause
 
-from app.storage.models import HistoryTrade, SyncState
+from app.storage.models import HistoryTrade, HistoryTransaction, SyncState
+
+# The collections that make up the context of a transaction.
+CONTEXT_STREAMS = ("operations", "effects", "trades")
 
 Row = dict[str, Any]
 
@@ -179,22 +182,66 @@ def upsert_trade(session: Session, values: Row) -> UpsertOutcome:
 
 def set_checkpoint(
     session: Session,
+    *,
     source: str,
     resource_type: str,
     stream_key: str,
+    direction: str,
     cursor: str | None,
     cursor_ledger: int | None = None,
 ) -> None:
-    """Save a stream checkpoint.
+    """Save the checkpoint of one frontier of a stream.
 
     Call it in the same transaction as the data collected up to the cursor;
     the caller's commit or rollback then applies to both together. A
-    checkpoint always replaces the previous one for its stream.
+    checkpoint always replaces the previous one of its frontier.
     """
-    key = {"source": source, "resource_type": resource_type, "stream_key": stream_key}
-    values = {"cursor": cursor, "cursor_ledger": cursor_ledger}
+    key = {
+        "source": source,
+        "resource_type": resource_type,
+        "direction": direction,
+        "stream_key": stream_key,
+    }
+    # updated_at is set here: the column's own onupdate only fires for rows
+    # changed through the ORM, not through this statement.
+    values = {"cursor": cursor, "cursor_ledger": cursor_ledger, "updated_at": func.now()}
     session.execute(
         insert(SyncState.__table__)
         .values(**values, **key)
         .on_conflict_do_update(index_elements=list(key), set_=values)
+    )
+
+
+def checkpoint(
+    session: Session, *, source: str, resource_type: str, stream_key: str, direction: str
+) -> tuple[str | None, int | None] | None:
+    """The stored cursor and its ledger of one frontier, or None if it has none."""
+    row = session.get(
+        SyncState, (source, resource_type, direction, stream_key)
+    )
+    return None if row is None else (row.cursor, row.cursor_ledger)
+
+
+def context_loaded(session: Session, transaction_id: int) -> frozenset[str]:
+    """The parts of a transaction's context that are stored; empty for a
+    transaction that is not stored at all."""
+    row = session.execute(
+        select(HistoryTransaction.__table__.c.context_loaded).where(
+            HistoryTransaction.__table__.c.id == transaction_id
+        )
+    ).first()
+    return frozenset(row[0] if row is not None else [])
+
+
+def mark_context(session: Session, transaction_id: int, *streams: str) -> None:
+    """Record that ``streams`` of the transaction's context are stored."""
+    loaded = context_loaded(session, transaction_id)
+    merged = [stream for stream in CONTEXT_STREAMS if stream in loaded or stream in streams]
+    unknown = set(streams) - set(CONTEXT_STREAMS)
+    if unknown:
+        raise ValueError(f"not a context stream: {sorted(unknown)}")
+    session.execute(
+        update(HistoryTransaction.__table__)
+        .where(HistoryTransaction.__table__.c.id == transaction_id)
+        .values(context_loaded=merged)
     )

@@ -1,0 +1,31 @@
+# Watch list for `python -m app.backfill import-config --file <file>`.
+#
+# Copy to local/tracking.yaml (ignored by git) and edit. Nothing here is a
+# list of real users: the market is the public test market of stage 02 and
+# the accounts are placeholders.
+#
+# Importing the file again changes nothing unless the file did. An account's
+# mode is only changed with --apply-changes. Entries left out of a later file
+# are not removed: collected history stays.
+
+assets:
+  - code: MTLRECT
+    issuer: GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
+  - code: EURMTL
+    issuer: GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
+  # XLM is written as `native`; it needs no code or issuer.
+  # - native: true
+
+# A market is an unordered pair. Naming it the other way round is the same
+# market; listing both orders is an error.
+markets:
+  - base: MTLRECT:GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
+    counter: EURMTL:GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
+
+# History is loaded only for FULL accounts. The other modes are stored as
+# given and skipped: ASSETS_ONLY and CANDIDATE are not read as if they were
+# FULL. `reason` is required: say why the account is watched.
+accounts:
+  - address: GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
+    mode: CANDIDATE
+    reason: issuer of the market's assets; too active to load without a decision

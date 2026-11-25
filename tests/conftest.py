@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -77,6 +77,55 @@ def engine(database_url: str) -> Iterator[Engine]:
         yield engine
     finally:
         engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def template_url(server_url: str) -> Iterator[str]:
+    """A migrated empty database that nothing connects to, so that it can be
+    copied."""
+    yield from create_scratch_database(server_url, migrate=True)
+
+
+@pytest.fixture
+def fresh_database_url(server_url: str, template_url: str) -> Iterator[str]:
+    """A private database for one test, empty and at head: a copy of the
+    template, made in milliseconds. For code that commits on its own, which
+    an enclosing rollback could not undo."""
+    template = make_url(template_url).set(database="postgres")
+    name = f"mtl_horizon_test_{uuid.uuid4().hex[:12]}"
+    control = create_engine(template, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE "{name}" TEMPLATE "{make_url(template_url).database}"'))
+    control.dispose()
+    try:
+        yield make_url(template_url).set(database=name).render_as_string(hide_password=False)
+    finally:
+        with control.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+        control.dispose()
+
+
+@pytest.fixture
+def make_database(server_url: str, template_url: str) -> Iterator[Callable[[], str]]:
+    """A factory of private databases, each a copy of the template; all are
+    dropped when the test ends. For tests that compare two databases."""
+    control = create_engine(make_url(template_url).set(database="postgres"), isolation_level="AUTOCOMMIT")
+    created: list[str] = []
+
+    def make() -> str:
+        name = f"mtl_horizon_test_{uuid.uuid4().hex[:12]}"
+        with control.connect() as conn:
+            conn.execute(text(f'CREATE DATABASE "{name}" TEMPLATE "{make_url(template_url).database}"'))
+        created.append(name)
+        return make_url(template_url).set(database=name).render_as_string(hide_password=False)
+
+    try:
+        yield make
+    finally:
+        with control.connect() as conn:
+            for name in created:
+                conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+        control.dispose()
 
 
 @pytest.fixture

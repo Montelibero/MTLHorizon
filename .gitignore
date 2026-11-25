@@ -17,3 +17,6 @@ belief_map.sexp
 .idea/
 .vscode/
 .belief_map_cache.json
+
+# Local files: the pilot watch list, run reports, probe output
+local/

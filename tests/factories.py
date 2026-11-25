@@ -24,7 +24,6 @@ from app.storage.models import (
     HistoryOperationParticipant,
     HistoryTransaction,
     HistoryTransactionParticipant,
-    HistoryTrade,
 )
 from app.storage.upsert import upsert_row, upsert_trade
 
