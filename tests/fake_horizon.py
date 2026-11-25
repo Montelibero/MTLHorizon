@@ -42,6 +42,7 @@ T0 = datetime(2026, 1, 1, tzinfo=UTC)
 INF = float("inf")
 
 DEBIT, CREDIT, TRADE, POOL_TRADE, DATA_CREATED = 3, 2, 33, 92, 40
+TRUSTLINE_CREATED, TRUSTLINE_UPDATED, TRUSTLINE_REMOVED = 12, 13, 14
 MARKET = (EUR, RECT)
 
 # Collection name -> the kind of record in it, which is also how its cursor is read.
@@ -173,6 +174,19 @@ def history() -> list[Transaction]:
             {C, D}, {1: {C}},
         ),
     ]
+
+
+def trust(account: str, asset_id: str, *, limit: int = 1000, kind: str = "created") -> Operation:
+    """``account`` opens a trustline to ``asset_id`` (or changes its limit, or
+    closes it: ``kind`` "updated", "removed" with a zero limit)."""
+    effect = {"created": "trustline_created", "updated": "trustline_updated", "removed": "trustline_removed"}[kind]
+    stroops = 0 if kind == "removed" else limit * 10**7
+    return Operation(
+        "change_trust", 6, None,
+        {"limit": amount(stroops), **asset("", asset_id)},
+        effects=[{"account": account, "type": effect, "type_i": {"created": TRUSTLINE_CREATED, "updated": TRUSTLINE_UPDATED, "removed": TRUSTLINE_REMOVED}[kind],
+                  "limit": amount(stroops), **asset("", asset_id)}],
+    )
 
 
 def paid(ledger: int, source: str, *to: str) -> Transaction:
@@ -450,6 +464,9 @@ class FakeHorizon:
         self.stall = stall
         # Sent with every answer, as a server behind a limiter sends its own.
         self.headers: dict[str, str] = {}
+        # The trustlines the network has now: asset id -> account -> balance
+        # in stroops. A line with no balance is a line all the same.
+        self.trustlines: dict[str, dict[str, int]] = {}
         self.requests: list[tuple[str, dict[str, str]]] = []
         self.faults: list[Fault] = []
         self.hidden_operations: set[str] = set()  # /operations/{id} answers 404
@@ -511,7 +528,10 @@ class FakeHorizon:
             return self._problem(problem.status)
         if isinstance(answer, dict):
             return self._json(answer)
-        return self._page(url.path, query, *answer)
+        kind, records = answer
+        if kind == "account":
+            return self._page(url.path, query, kind, records, by_address=True)
+        return self._page(url.path, query, kind, records)
 
     def _answer(self, path: str, query: dict[str, str]) -> Any:
         """An object (a dict) or a collection (kind, records)."""
@@ -522,6 +542,8 @@ class FakeHorizon:
             return self._root()
         if parts[0] == "ledgers" and len(parts) == 2:
             return self._ledger(int(parts[1]))
+        if parts[0] == "accounts" and len(parts) == 1:
+            return "account", self._accounts(query.get("asset"))
         if parts[0] == "trade_aggregations":
             return self._aggregations(query)
         if parts[0] == "trades" and len(parts) == 1:
@@ -541,6 +563,38 @@ class FakeHorizon:
         if parts[0] == "operations" and len(parts) == 3 and parts[2] == "effects":
             return "effect", [record for record in self.ledger.effects.values() if record["paging_token"].startswith(parts[1] + "-")]
         raise _Problem(404)
+
+    def _accounts(self, asset_param: str | None) -> list[dict[str, Any]]:
+        """The accounts that hold an asset — the line is what counts, not
+        the balance — ordered by address, as `/accounts?asset=` answers."""
+        if asset_param in (None, ""):
+            holders: set[str] = set()
+            for lines in self.trustlines.values():
+                holders.update(lines)
+        else:
+            holders = set(self.trustlines.get("native" if asset_param == "native" else asset_param, {}))
+        return [self._account_record(account) for account in sorted(holders)]
+
+    def _account_record(self, account: str) -> dict[str, Any]:
+        balances: list[dict[str, Any]] = [{"balance": "10.0000000", "asset_type": "native", "min_balance": "0.0000000"}]
+        for asset_id, lines in self.trustlines.items():
+            if asset_id != "native" and account in lines:
+                balances.append(
+                    {
+                        "balance": amount(lines[account]), "limit": "922337203685.4775807", **asset("", asset_id),
+                        "is_authorized": True, "is_authorized_to_maintain_liabilities": True,
+                        "last_modified_ledger": max(ELDER, self.latest - 1), "last_modified_time": iso(close_time(max(ELDER, self.latest - 1))),
+                    }
+                )
+        return {
+            "id": account, "paging_token": account, "account_id": account, "sequence": "1000",
+            "subentry_count": len(balances) - 1, "last_modified_ledger": max(ELDER, self.latest - 1),
+            "last_modified_time": iso(close_time(max(ELDER, self.latest - 1))),
+            "thresholds": {"low_threshold": 0, "med_threshold": 0, "high_threshold": 0},
+            "flags": {"auth_required": False, "auth_revocable": False, "auth_immutable": False, "auth_clawback_enabled": False},
+            "balances": balances, "data": {}, "num_sponsoring": 0, "num_sponsored": 0,
+            "signers": [{"public_key": account, "weight": 1, "type": "ed25519_public_key", "key": account}],
+        }
 
     def _root(self) -> dict[str, Any]:
         return {
@@ -651,20 +705,25 @@ class FakeHorizon:
 
     # -- pages and problems ---------------------------------------------------
 
-    def _page(self, path: str, query: dict[str, str], kind: str, records: list[dict[str, Any]]) -> httpx.Response:
+    def _page(
+        self, path: str, query: dict[str, str], kind: str, records: list[dict[str, Any]], *, by_address: bool = False
+    ) -> httpx.Response:
+        """A page of a collection. ``by_address``: the accounts, which are
+        ordered by address and have no place in time."""
+        key = (lambda record: (record["account_id"],)) if by_address else (lambda record: key_of(record, kind))
         order, limit = query.get("order", "asc"), int(query.get("limit", 10))
         cursor = query.get("cursor", "")
-        view = sorted((record for record in records if record["id"] not in self.gone), key=lambda record: key_of(record, kind))
+        view = sorted((record for record in records if record["id"] not in self.gone), key=key)
         if cursor:
-            position = position_of(cursor, kind)
+            position = (cursor,) if by_address else position_of(cursor, kind)
             # A cursor at or below the elder ledger asks for what is not kept.
             # Reading backwards that is an error; reading forwards the source
             # starts where its history does, without a word.
-            if position[0] <= self.elder << 32:
+            if not by_address and position[0] <= self.elder << 32:
                 if order == "desc":
                     return self._problem(410)
                 position = (self.elder << 32, INF) if kind in ("effect", "trade") else (self.elder << 32,)
-            view = [record for record in view if _after(key_of(record, kind), position, order)]
+            view = [record for record in view if _after(key(record), position, order)]
         if order == "desc":
             view = view[::-1]
         page_records = view[:limit]

@@ -77,6 +77,28 @@ class Settings:
     # webhook is accepted: the endpoint is there, and answers that it is not
     # configured. Nothing is logged of a key's neighbours in the environment.
     notifier_signer_keys: tuple[str, ...] = ()
+    # Stage 05. The API of the Notifier, to register what this installation
+    # wants to be told of; the token it is asked with (an admin token, or a
+    # user token of its "token" mode); and the address its webhooks are
+    # sent to. With no API address, nothing is registered automatically:
+    # subscriptions are made by hand and adopted here by their ids.
+    # The token is a secret: it never reaches a log, a table or a message.
+    notifier_api_url: str = ""
+    notifier_api_token: str = ""
+    notifier_callback_url: str = ""
+    # Discovery of the holders of an asset: how often to run it, in
+    # seconds; 0, the default, is never — only by hand.
+    discovery_interval_seconds: float = 0.0
+    # How often the worker looks whether an account needs a subscription or
+    # a history import, in seconds.
+    provision_interval_seconds: float = 60.0
+    # One slice of a history import: what it may cost before the next
+    # subject gets its turn. And what is fetched for a record before it is
+    # stored: parents (the streams, and only the parents a record cannot be
+    # stored without) or full.
+    history_slice_requests: int = 50
+    history_slice_seconds: float = 60.0
+    history_context: str = "parents"
     # What one cycle may cost at most. What it does not reach is read in the
     # next cycle. The time budget is None for nine tenths of the interval.
     collector_max_requests: int = 2000
@@ -102,9 +124,17 @@ class Settings:
             horizon_health_check_interval=_positive_number(env, "HEALTH_CHECK_INTERVAL", 300.0),
             horizon_failover_cooldown=_positive_number(env, "FAILOVER_COOLDOWN", 60.0),
             collector_interval_seconds=_positive_number(env, "COLLECTOR_INTERVAL", 900.0),
-            collector_max_requests=int(_positive_number(env, "COLLECTOR_MAX_REQUESTS", 2000.0)),
+            collector_max_requests=_positive_whole(env, "COLLECTOR_MAX_REQUESTS", 2000),
             collector_max_seconds=_optional_positive_number(env, "COLLECTOR_MAX_SECONDS"),
             notifier_signer_keys=_signer_keys(env),
+            notifier_api_url=_address(env, "NOTIFIER_API_URL", path_allowed=True),
+            notifier_api_token=env.get(f"{ENV_PREFIX}NOTIFIER_API_TOKEN", "").strip(),
+            notifier_callback_url=_address(env, "NOTIFIER_CALLBACK_URL", path_allowed=True),
+            discovery_interval_seconds=_non_negative_number(env, "DISCOVERY_INTERVAL", 0.0),
+            provision_interval_seconds=_positive_number(env, "PROVISION_INTERVAL", 60.0),
+            history_slice_requests=_positive_whole(env, "HISTORY_SLICE_REQUESTS", 50),
+            history_slice_seconds=_positive_number(env, "HISTORY_SLICE_SECONDS", 60.0),
+            history_context=_history_context(env),
         )
 
 
@@ -178,6 +208,45 @@ def _signer_keys(env: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(keys)
 
 
+def _non_negative_number(env: Mapping[str, str], name: str, default: float) -> float:
+    """Zero or a positive number; zero is "never" where it can be."""
+    raw = env.get(f"{ENV_PREFIX}{name}", "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ConfigError(f"{ENV_PREFIX}{name} must be a number, got {raw!r}") from None
+    if value < 0 or value != value:
+        raise ConfigError(f"{ENV_PREFIX}{name} must be zero or positive, got {raw!r}")
+    return value
+
+
+def _history_context(env: Mapping[str, str]) -> str:
+    raw = env.get(f"{ENV_PREFIX}HISTORY_CONTEXT", "").strip() or "parents"
+    if raw not in ("parents", "full"):
+        raise ConfigError(f"{ENV_PREFIX}HISTORY_CONTEXT must be parents or full, got {raw!r}")
+    return raw
+
+
+def _address(env: Mapping[str, str], name: str, *, path_allowed: bool) -> str:
+    """An optional http or https address. A user name or a password in it
+    is kept out of every message."""
+    value = env.get(f"{ENV_PREFIX}{name}", "").strip()
+    if not value:
+        return ""
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        raise ConfigError(f"{ENV_PREFIX}{name} is not an address") from None
+    if parts.scheme not in ("http", "https") or not parts.hostname or port == 0:
+        raise ConfigError(f"{ENV_PREFIX}{name}: {shown_url(value)} is not an http or https address")
+    if not path_allowed and (parts.path not in ("", "/") or parts.query or parts.fragment):
+        raise ConfigError(f"{ENV_PREFIX}{name}: must name a server and nothing more")
+    return value
+
+
 def _positive_number(env: Mapping[str, str], name: str, default: float) -> float:
     raw = env.get(f"{ENV_PREFIX}{name}", "").strip()
     if not raw:
@@ -189,6 +258,15 @@ def _positive_number(env: Mapping[str, str], name: str, default: float) -> float
     if value <= 0 or value != value:
         raise ConfigError(f"{ENV_PREFIX}{name} must be positive, got {raw!r}")
     return value
+
+
+def _positive_whole(env: Mapping[str, str], name: str, default: int) -> int:
+    """A number of things: one or more. Half a request a slice would be a
+    slice that never reads, over and over."""
+    value = _positive_number(env, name, float(default))
+    if value < 1:
+        raise ConfigError(f"{ENV_PREFIX}{name} must be a whole number of one or more, got {env.get(f'{ENV_PREFIX}{name}', '')!r}")
+    return int(value)
 
 
 def _optional_positive_number(env: Mapping[str, str], name: str) -> float | None:

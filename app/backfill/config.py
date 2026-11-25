@@ -13,6 +13,9 @@ what was collected.
     assets:
       - code: MTLRECT
         issuer: GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
+      - code: EURMTL
+        issuer: GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
+        discover: true
       - native: true
     markets:
       - base: MTLRECT:GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
@@ -26,6 +29,12 @@ what was collected.
 is stored already keeps the flag it has. Accounts used to have ``mode``
 instead; a file that still names one is read with FULL as enabled and every
 other mode as disabled, and the import says so line by line.
+
+``discover`` on an asset is a rule of its own, apart from ``enabled``: the
+accounts that hold the asset are looked for and added to the watch list
+(``python -m app.discovery``). Left out, a new asset is not discovered and a
+stored one keeps what it has; it changes only with ``--apply-changes``, like
+``enabled``. Native cannot be discovered: every account holds it.
 """
 
 from __future__ import annotations
@@ -74,6 +83,9 @@ class AssetRule:
     # None: the file says nothing, so a new asset is enabled and a stored one
     # keeps what it has.
     enabled: bool | None = None
+    # None: the file says nothing; False: not discovered. The rule of
+    # discovery, apart from the rule of history.
+    discover: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -219,11 +231,15 @@ def _assets(items: list[Any], errors: list[str], source: str, notices: list[str]
     seen: set[str] = set()
     for index, raw in enumerate(items):
         where = f"{source}: assets[{index}]"
-        entry = _entry(raw, index, "assets", {"code", "issuer", "native", "reason", "enabled", "mode"}, errors, source)
+        entry = _entry(raw, index, "assets", {"code", "issuer", "native", "reason", "enabled", "mode", "discover"}, errors, source)
         if entry is None:
             continue
         enabled = _flag(entry, where, errors, notices)
         if enabled is None and ("enabled" in entry or "mode" in entry):
+            continue
+        discover = entry.get("discover")
+        if "discover" in entry and not isinstance(discover, bool):
+            errors.append(f"{where}: discover must be true or false, got {discover!r}")
             continue
         asset = None
         if entry.get("native") is True:
@@ -240,11 +256,14 @@ def _assets(items: list[Any], errors: list[str], source: str, notices: list[str]
                 asset = asset_id(code, issuer, where, errors)
         if asset is None:
             continue
+        if discover and asset == "native":
+            errors.append(f"{where}: native cannot be discovered: every account of the network holds it")
+            continue
         if asset in seen:
             errors.append(f"{where}: asset {asset} is listed twice")
             continue
         seen.add(asset)
-        rules.append(AssetRule(asset, _reason(entry, "imported from config"), enabled))
+        rules.append(AssetRule(asset, _reason(entry, "imported from config"), enabled, discover))
     return rules
 
 
@@ -349,7 +368,7 @@ def apply(session: Session, config: TrackingConfig, *, apply_changes: bool = Fal
             _register_asset(session, rule.asset_id)
             upsert_row(
                 session, TrackedAsset.__table__, {"asset_id": rule.asset_id},
-                {"reason": rule.reason, "enabled": rule.enabled is not False},
+                {"reason": rule.reason, "enabled": rule.enabled is not False, "discover": rule.discover is True},
             )
             result.added["asset"] += 1
         else:
@@ -373,8 +392,11 @@ def apply(session: Session, config: TrackingConfig, *, apply_changes: bool = Fal
         tracked = session.get(TrackedAccount, rule.address)
         if tracked is None:
             upsert_row(session, HistoryAccount.__table__, key, {})
+            # Added now: its history is to be imported from the ledger that
+            # is the latest, which the worker captures (boundary_due).
             upsert_row(
-                session, TrackedAccount.__table__, key, {"reason": rule.reason, "enabled": rule.enabled is not False}
+                session, TrackedAccount.__table__, key,
+                {"reason": rule.reason, "enabled": rule.enabled is not False, "origin": "yaml", "boundary_due": True},
             )
             result.added["account"] += 1
         else:
@@ -392,6 +414,10 @@ def _switch(
         result.unchanged[kind] += 1
     elif apply_changes:
         tracked.enabled, tracked.reason = wanted, rule.reason
+        if kind == "account" and wanted:
+            # Switched on again: what was missed while it was off is to be
+            # read, from the ledger that is the latest (the worker captures it).
+            tracked.boundary_due = True  # type: ignore[attr-defined]
         session.flush()
         result.changed[kind] += 1
     else:
@@ -399,6 +425,18 @@ def _switch(
             f"{kind} {name}: the file says enabled={str(wanted).lower()}, the database says "
             f"{str(tracked.enabled).lower()}; left as it is (import again with --apply-changes to change it)"
         )
+    if isinstance(tracked, TrackedAsset) and isinstance(rule, AssetRule) and rule.discover is not None:
+        if tracked.discover == rule.discover:
+            pass
+        elif apply_changes:
+            tracked.discover = rule.discover
+            session.flush()
+            result.changed["asset"] += 1
+        else:
+            result.skipped.append(
+                f"asset {name}: the file says discover={str(rule.discover).lower()}, the database says "
+                f"{str(tracked.discover).lower()}; left as it is (import again with --apply-changes to change it)"
+            )
 
 
 def _register_asset(session: Session, asset_id: str) -> None:

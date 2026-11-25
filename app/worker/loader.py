@@ -30,7 +30,7 @@ from sqlalchemy.engine import Engine
 
 from app.backfill import store
 from app.backfill.loader import CONTEXT_STREAMS, ContextFetcher, ContextIndex
-from app.sources.horizon import HorizonClient, NotFound, Scope
+from app.sources.horizon import HorizonClient, NotFound, RateLimited, Scope, Unavailable
 from app.storage import jobs
 from app.storage.models import ProcessingJob
 from app.storage.writer import HistoryWriter
@@ -45,6 +45,9 @@ DEFAULT_RETRY_CAP = 600.0
 # any one request can take.
 DEFAULT_LEASE = 120.0
 DEFAULT_POLL = 2.0
+# How often the worker looks whether an account needs a boundary, a history
+# import or a subscription, while no event is waiting.
+DEFAULT_PROVISION_EVERY = 60.0
 
 
 class JobLost(Exception):
@@ -111,12 +114,44 @@ class Worker:
 
     # -- running -------------------------------------------------------------
 
-    def run(self, stop: threading.Event, *, poll_seconds: float = DEFAULT_POLL, max_jobs: int | None = None) -> None:
-        """Take and do jobs until ``stop`` is set, or ``max_jobs`` are done."""
+    def run(
+        self,
+        stop: threading.Event,
+        *,
+        poll_seconds: float = DEFAULT_POLL,
+        max_jobs: int | None = None,
+        provision: Callable[[], Any] | None = None,
+        provision_every: float = DEFAULT_PROVISION_EVERY,
+    ) -> None:
+        """Take and do jobs until ``stop`` is set, or ``max_jobs`` are done.
+
+        While the queue is empty, every ``provision_every`` seconds,
+        ``provision`` is called: the pass that keeps accounts, their history
+        imports and their subscriptions in step. It is called only when no
+        job was waiting, so an event never waits for it; and it asks Horizon
+        for nothing when there is nothing to do.
+        """
         self._stop = stop
+        last_provision = time.monotonic() - provision_every  # due as soon as the queue is quiet
         while not stop.is_set() and (max_jobs is None or self.done + self.failed < max_jobs):
             if self.once(stop=stop) is False and max_jobs is None:
+                if provision is not None and time.monotonic() - last_provision >= provision_every:
+                    last_provision = time.monotonic()
+                    self._provision(provision)
                 stop.wait(poll_seconds)
+
+    def _provision(self, provision: Callable[[], Any]) -> None:
+        try:
+            report = provision()
+        except Exception:  # noqa: BLE001 - the next pass tries again; the rows still say what is to be done
+            logger.exception("the pass that keeps accounts in step failed; it is run again")
+            return
+        done = getattr(report, "as_dict", lambda: {})()
+        quiet = not any(
+            done.get(name) for name in ("accounts_added", "start_boundaries", "imports_planned", "upper_boundaries", "imports_paused")
+        ) and not (done.get("subscriptions_wanted") and done.get("subscriptions_not_done"))
+        for line in getattr(report, "lines", lambda: [])():
+            logger.log(logging.DEBUG if quiet else logging.INFO, "provisioning: %s", line)
 
     def once(self, *, stop: threading.Event | None = None) -> bool:
         """Take the next job whose time has come and do it. False when there
@@ -145,8 +180,25 @@ class Worker:
             if not self._finished:  # everything was stored already: there was nothing to hand over
                 self._end(job, jobs.DONE, None)
         except NotFound as error:
+            # A transaction told of seconds after its ledger closed can be
+            # 404 for a moment on a server that has the ledger. That is not
+            # its absence: it is asked again, like any failure, until the
+            # tries are used up.
             self.failed += 1
-            state = self._end(job, jobs.DEAD, f"the transaction is on none of the servers: {error}")
+            if job.attempts >= self.max_attempts:
+                state = self._end(job, jobs.DEAD, f"the transaction is on none of the servers: {error}")
+            else:
+                state = jobs.failed(
+                    self.engine, job, error=f"not on any server yet: {error}", delay=self._delay(job),
+                    max_attempts=self.max_attempts, now=self.clock(),
+                )
+        except (Unavailable, RateLimited) as error:
+            # No server could answer, or the server asks to wait longer than
+            # a request waits: the servers' state, not the job's failure.
+            # The try is not counted, and the job waits for them to return.
+            jobs.defer(self.engine, job, error=f"{type(error).__name__}: {error}", delay=self.retry_cap, now=self.clock())
+            state = jobs.PENDING
+            logger.warning("job %s: no server can answer now, asked again in %.0fs: %s", job.id, self.retry_cap, error)
         except JobLost:
             state, self.failed = jobs.PENDING, self.failed + 1
             logger.warning("job %s is no longer this worker's: left as it is", job.id)

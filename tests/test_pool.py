@@ -295,6 +295,27 @@ def test_history_tells_what_the_whole_pool_keeps() -> None:
     pool.close()
 
 
+def test_the_history_of_the_pool_does_not_shrink_while_a_server_is_silent() -> None:
+    """The server that keeps the oldest history goes down. What it keeps is
+    not given up on while it cannot be asked: the pool goes on saying it
+    keeps from where that server said it did, and names it as silent — so
+    that nothing below the others' history is called out of reach for good."""
+    one, two = FakeHorizon(origin=FIRST), FakeHorizon(origin=SECOND, elder=110)
+    pool, clock = make({FIRST: one, SECOND: two})
+    try:
+        assert pool.history().elder == ELDER and pool.silent() == []
+        one.down = refused()
+        assert pool.get("/ledgers/120")["sequence"] == 120  # the second answered in its place
+        history = pool.history()
+        assert (history.elder, history.name, history.latest) == (ELDER, SECOND, LATEST)
+        assert pool.silent() == [FIRST] and not pool.lacks(ELDER)
+        clock.sleep(11)  # its cooldown is over
+        one.down = None
+        assert pool.history().elder == ELDER and pool.silent() == []
+    finally:
+        pool.close()
+
+
 def test_nothing_is_below_the_history_of_a_pool_while_a_server_has_not_said_what_it_keeps() -> None:
     one, two = FakeHorizon(origin=FIRST, elder=110), FakeHorizon(origin=SECOND)
     pool, _ = make({FIRST: one, SECOND: two})

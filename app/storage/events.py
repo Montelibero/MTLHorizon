@@ -9,9 +9,16 @@ the subscription it was sent for.
 
 Whether a delivery makes a job is decided by the watch lists, which are
 three and independent, joined with OR: an enabled account, an enabled asset,
-an enabled market the operation names. A transaction is brought in whole
-whoever named it: one operation of an account that is switched off here may
-be the other side of a trade in a market that is switched on.
+an enabled market the operation names — and, since stage 05, by discovery:
+an asset marked for discovery is a rule too. A transaction is brought in
+whole whoever named it: one operation of an account that is switched off
+here may be the other side of a trade in a market that is switched on.
+
+A delivery that came for a subscription this installation manages
+(``watch_subscription``) is always brought in: the subscription is the
+owner's decision, made once, and it would take a very complete payload to
+second-guess it. What the local rules would have said is kept with the
+delivery all the same.
 
 What cannot be told is not dropped. When the operation is of a type this
 reader does not know, or names something it cannot read, whether a rule
@@ -38,7 +45,7 @@ from sqlalchemy.orm import Session
 
 from app.notifier.format import OPERATION, Notice
 from app.storage.jobs import DEAD, PARTIAL, PENDING
-from app.storage.models import ProcessingJob, TrackedAccount, TrackedAsset, TrackedMarket
+from app.storage.models import ProcessingJob, TrackedAccount, TrackedAsset, TrackedMarket, WatchSubscription
 from app.storage.models import NotifierEvent as Event
 
 logger = logging.getLogger(__name__)
@@ -96,9 +103,18 @@ def _keep(
     """Keep a delivery that was not kept, and queue its transaction if a
     watch rule wants it. Runs inside the caller's transaction."""
     matched = _matched_rules(session, notice)
+    ours = _managed(session, notice.subscription)
     job = None
     if notice.type != OPERATION or notice.transaction_hash is None:
         state, diagnosis = UNSUPPORTED, _why_unsupported(notice)
+    elif ours is not None:
+        state, diagnosis = QUEUED, None
+        if not matched:
+            diagnosis = (
+                f"queued for this installation's subscription ({ours.kind} {ours.key}) although no watch rule "
+                + ("could be told to match: " + "; ".join(notice.problems) if not notice.told else "matches it")
+            )
+        job = _job(session, notice, received_at)
     elif not notice.told:
         state, diagnosis = QUEUED, (
             "queued although whether a watch rule matches could not be told: " + "; ".join(notice.problems)
@@ -109,7 +125,8 @@ def _keep(
         job = _job(session, notice, received_at)
     else:
         state, diagnosis = UNMATCHED, (
-            "no enabled account, asset or market names this operation: "
+            "no enabled account, asset or market names this operation, nor an asset marked for discovery, "
+            "and the subscription it came for is not one this installation manages: "
             + ", ".join(_short(notice.names()))
         )
     event = Event(
@@ -148,6 +165,20 @@ def _keep(
     return event
 
 
+def _managed(session: Session, subscription: str) -> WatchSubscription | None:
+    """The subscription of this installation a delivery came for: the one
+    whose id at the Notifier is the delivery's subscription, confirmed or
+    adopted. A subscription on its way out is not this installation's any more."""
+    if not subscription:
+        return None
+    return session.scalar(
+        select(WatchSubscription).where(
+            WatchSubscription.remote_id == subscription,
+            WatchSubscription.state.in_(("active", "manual")),
+        )
+    )
+
+
 def _kept_headers(headers: Mapping[str, str]) -> dict[str, str]:
     """The few headers kept with a delivery, by their usual names, whatever
     case they came in."""
@@ -172,6 +203,12 @@ def _matched_rules(session: Session, notice: Notice) -> list[dict[str, str]]:
             select(TrackedAsset.asset_id).where(TrackedAsset.enabled.is_(True), TrackedAsset.asset_id.in_(assets))
         ):
             matched.append({"rule": "asset", "key": asset})
+        # A rule of its own: an asset marked for discovery is matched whether
+        # or not its history is read.
+        for asset in session.scalars(
+            select(TrackedAsset.asset_id).where(TrackedAsset.discover.is_(True), TrackedAsset.asset_id.in_(assets))
+        ):
+            matched.append({"rule": "discovery", "key": asset})
     if notice.markets:
         # A market is an unordered pair; the trade names its two assets.
         pairs = [{sold, bought} for sold, bought in notice.markets]

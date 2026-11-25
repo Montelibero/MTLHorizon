@@ -4,6 +4,7 @@ makes of what it kept."""
 from __future__ import annotations
 
 import base64
+import os
 import threading
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -303,3 +304,91 @@ def test_receive_keeps_a_delivery_once_and_makes_the_job_with_it(site: Any) -> N
     assert first.created and not again.created and again.event.id == first.event.id
     assert HEADER not in first.event.headers and first.event.headers == {"User-Agent": "StellarNotifier/0.12.0"}
     assert jobs.counts(site.engine) == {"pending": 1, "running": 0, "done": 0, "partial": 0, "dead": 0}
+
+
+# -- stage 05: what this installation asked for itself, and discovery ------------------
+
+
+def _payment_in(asset: str, account: str, *, subscription: str, notification_id: str | None = None) -> dict[str, Any]:
+    """A notification of a payment in ``asset`` by ``account``, for a
+    subscription of the Notifier: the fields the Notifier gives a payment."""
+    from tests.factories import address
+
+    from app.notifier.format import G_ADDRESS
+
+    code, issuer = asset.split(":", 1)
+    return {
+        "id": notification_id or base64.b16encode(os.urandom(12)).decode().lower(),
+        "subscription": subscription,
+        "type": "operation",
+        "created": "2026-11-25T12:00:00.000Z",
+        "sent": "2026-11-25T12:00:01.000Z",
+        "operation": {
+            "type_i": 1, "type": "payment", "account": account, "destination": address(400),
+            "amount": "1.0000000", "asset": {"asset_type": 1 if len(code) <= 4 else 2, "asset_code": code, "asset_issuer": issuer},
+            "id": str((140 << 32) | (1 << 12) | 1),
+        },
+        "transaction": {"hash": "ab" * 32, "paging_token": str((140 << 32) | (1 << 12))},
+    }
+
+
+def _mark_asset(site: Any, asset: str, **flags: bool) -> None:
+    from app.storage.models import TrackedAsset
+
+    with Session(site.engine) as session, session.begin():
+        tracked = session.get(TrackedAsset, asset)
+        assert tracked is not None
+        for name, value in flags.items():
+            setattr(tracked, name, value)
+
+
+def test_a_delivery_for_a_subscription_this_installation_manages_is_brought_in_whatever_the_local_rules_say(
+    site: Any,
+) -> None:
+    """The owner registered an asset subscription (this installation did).
+    A payment in it by an account nobody watches here is brought in: the
+    subscription is the decision. Before, it was kept without a job."""
+    from app.storage.models import WatchSubscription
+
+    _mark_asset(site, RECT, enabled=False, discover=False)
+    with Session(site.engine) as session, session.begin():
+        session.add(WatchSubscription(kind="asset", key=RECT, remote_id="sub-of-ours", state="active", managed=True))
+    payload = _payment_in(RECT, D, subscription="sub-of-ours")
+    with TestClient(create_app(site.settings)) as client:
+        answer = post(client, site.notifier, payload)
+    assert answer.status_code == 200 and answer.json()["state"] == "queued" and answer.json()["job_id"] is not None
+    [event] = kept(site)
+    assert event.matched == [] and "queued for this installation's subscription (asset" in (event.diagnosis or "")
+    assert len(queue(site)) == 1
+
+
+def test_a_subscription_on_its_way_out_no_longer_decides(site: Any) -> None:
+    from app.storage.models import WatchSubscription
+
+    _mark_asset(site, RECT, enabled=False, discover=False)
+    with Session(site.engine) as session, session.begin():
+        session.add(WatchSubscription(kind="asset", key=RECT, remote_id="sub-going", state="retiring", managed=True))
+    with TestClient(create_app(site.settings)) as client:
+        answer = post(client, site.notifier, _payment_in(RECT, D, subscription="sub-going"))
+    assert answer.json()["state"] == "unmatched" and queue(site) == []
+
+
+def test_an_asset_marked_for_discovery_is_a_rule_of_its_own(site: Any) -> None:
+    """The asset's history is not read (``enabled`` false), its holders are
+    looked for (``discover`` true): an operation in it is brought in, so
+    that a trustline opened on it is seen."""
+    _mark_asset(site, RECT, enabled=False, discover=True)
+    with TestClient(create_app(site.settings)) as client:
+        answer = post(client, site.notifier, _payment_in(RECT, D, subscription="sub-of-ours"))
+    assert answer.json()["state"] == "queued"
+    [event] = kept(site)
+    assert event.matched == [{"rule": "discovery", "key": RECT}] and len(queue(site)) == 1
+
+
+def test_an_asset_nobody_reads_nor_discovers_makes_no_job(site: Any) -> None:
+    _mark_asset(site, RECT, enabled=False, discover=False)
+    with TestClient(create_app(site.settings)) as client:
+        answer = post(client, site.notifier, _payment_in(RECT, D, subscription="somebody-elses"))
+    assert answer.json()["state"] == "unmatched"
+    assert "the subscription it came for is not one this installation manages" in kept(site)[0].diagnosis
+    assert queue(site) == []

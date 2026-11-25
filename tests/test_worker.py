@@ -323,12 +323,17 @@ def test_a_job_that_keeps_failing_gives_up_as_partial_and_only_a_person_takes_it
 
 
 def test_a_transaction_on_none_of_the_servers_is_dead_and_nothing_is_stored(shop: Shop) -> None:
+    """Not there, time after time: asked for as many times as it has tries,
+    then dead, with the reason."""
     digest = transaction_hash(shop.fake, T1)
     shop.fake.hidden_transactions.add(digest)
     shop.deliver(T1)
-    shop.worker.once()
+    for _ in range(shop.worker.max_attempts):
+        shop.worker.once()
+        shop.wall.wait(11)
     job = shop.job()
-    assert (job.state, job.attempts) == (jobs.DEAD, 1) and "on none of the servers" in (job.last_error or "")
+    assert (job.state, job.attempts) == (jobs.DEAD, shop.worker.max_attempts)
+    assert "on none of the servers" in (job.last_error or "")
     assert shop.count("history_transactions") == 0
 
 
@@ -341,11 +346,11 @@ def test_a_transaction_ahead_of_every_server_is_waited_for_not_declared_missing(
         ahead.deliver(operation, fake=source)
         ahead.worker.once()
         job = ahead.job()
-        assert (job.state, job.attempts) == (jobs.PENDING, 1)
+        assert (job.state, job.attempts) == (jobs.PENDING, 0)  # the servers' doing: the try is not counted
         assert "has got only to ledger 130" in (job.last_error or "")
         assert ahead.pool.stats.by_server == {}
         ahead.fake.close(paid(131, A, B), latest=132)  # the first server catches up
-        ahead.wall.wait(6)
+        ahead.wall.wait(601)  # a job that waits for the servers is asked again in ten minutes
         assert ahead.worker.once() is True and ahead.job().state == jobs.DONE
     finally:
         ahead.close()
@@ -408,8 +413,14 @@ def test_status_retry_and_events_as_commands(shop: Shop, monkeypatch: pytest.Mon
     assert worker_cli.main(["events", "--limit", "3"]) == worker_cli.OK
     assert "s2" in capsys.readouterr().out
 
-    assert worker_cli.main(["once"]) == worker_cli.OK  # one of the two; which is not said
-    assert worker_cli.main(["once"]) == worker_cli.FAILED  # the one on no server is dead
+    once = ["once", "--retry-base", "0", "--max-attempts", "3"]  # a repeated try is due at once; three tries
+    assert worker_cli.main(once) == worker_cli.OK  # one of the two; which is not said
+    assert worker_cli.main(once) == worker_cli.FAILED  # the other is on no server: not done yet
+    assert worker_cli.main(["status"]) == worker_cli.OK
+    out = capsys.readouterr().out
+    assert "1 done" in out and "1 pending" in out and "not on any server yet" in out
+    for _ in range(2):  # three tries in all, then it is dead
+        assert worker_cli.main(once) == worker_cli.FAILED
     assert worker_cli.main(["status"]) == worker_cli.OK
     out = capsys.readouterr().out
     assert "1 done" in out and "1 dead" in out and "on none of the servers" in out

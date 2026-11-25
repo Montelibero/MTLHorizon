@@ -160,6 +160,22 @@ def put_back(engine: Engine, job: ProcessingJob, worker: str, *, why: str, now: 
         return changed.rowcount == 1  # type: ignore[attr-defined]
 
 
+def defer(
+    engine: Engine, job: ProcessingJob, *, error: str, delay: float, now: datetime | None = None
+) -> None:
+    """Put a job back because no server could answer: that is the servers'
+    doing, not the job's, so the try is not counted. It is asked again in
+    ``delay`` seconds."""
+    now = now or datetime.now(UTC)
+    with Session(engine) as session, session.begin():
+        current = session.scalar(select(ProcessingJob).where(ProcessingJob.id == job.id).with_for_update())
+        assert current is not None
+        current.state, current.next_attempt_at = PENDING, now + timedelta(seconds=delay)
+        current.attempts = max(0, current.attempts - 1)
+        current.last_error = error
+        current.leased_at, current.lease_expires_at, current.leased_by = None, None, None
+
+
 def failed(
     engine: Engine, job: ProcessingJob, *, error: str, delay: float | None, max_attempts: int, now: datetime | None = None
 ) -> str:

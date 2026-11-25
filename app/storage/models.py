@@ -439,13 +439,24 @@ class HistoryTrade(Base, Timestamped):
 
 
 class TrackedAccount(Base, Timestamped):
-    """The watch list of accounts. Managed by hand.
+    """One watched account.
 
-    ``enabled`` says whether the account's history is collected. It is not
-    part of the identity, so an account can be switched off and on at any
-    time. History already collected is not deleted, and switching an account
-    off switches off neither the assets nor the markets: the three watch
-    lists are independent.
+    ``enabled`` says whether the account's history is collected and its
+    events are wanted. It is not part of the identity, so an account can be
+    switched off and on at any time. History already collected is not
+    deleted, and switching an account off switches off neither the assets
+    nor the markets: the three watch lists are independent.
+
+    How it got here is kept apart from that: ``origin`` (the watch list
+    file, by hand, discovery, or ``legacy`` for an account that was here
+    before stage 05), ``discovered_by`` (the assets whose discovery found
+    it, comma-separated), and ``watch_since_ledger`` — the ledger that was
+    the latest when it was added or switched on again, or NULL when that
+    was not captured. ``boundary_due`` says it has to be captured: the
+    account was just added or switched on, and with it its history import
+    is planned. An account that was already here before stage 05 gets no
+    history import on its own: what to import of it is said with
+    ``python -m app.history enqueue``.
     """
 
     __tablename__ = "tracked_accounts"
@@ -455,6 +466,11 @@ class TrackedAccount(Base, Timestamped):
     )
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     reason: Mapped[str] = mapped_column(Text, nullable=False)
+    # legacy | yaml | manual | discovery
+    origin: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'yaml'"))
+    discovered_by: Mapped[str | None] = mapped_column(Text)
+    watch_since_ledger: Mapped[int | None] = mapped_column(BigInteger)
+    boundary_due: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
 
 class TrackedAsset(Base, Timestamped):
@@ -464,6 +480,9 @@ class TrackedAsset(Base, Timestamped):
 
     asset_id: Mapped[str] = mapped_column(Text, ForeignKey("history_assets.asset_id"), primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    # A rule of its own: find the accounts that hold this asset and add them
+    # to the watch list. Neither depends on the other.
+    discover: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     reason: Mapped[str] = mapped_column(Text, nullable=False)
 
 
@@ -516,8 +535,8 @@ class SyncCoverage(Base, Timestamped):
     policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
     from_ledger: Mapped[int] = mapped_column(BigInteger, nullable=False)
     to_ledger: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    # Where the range was collected from, e.g. "horizon:horizon.stellar.org":
-    # the pool, named by its first server.
+    # Where the range was collected from: the logical source, "horizon:pool"
+    # (until stage 05 the pool was named by its first server).
     source: Mapped[str] = mapped_column(Text, nullable=False)
     # Which server of the pool read the range, as it is shown to people;
     # several, comma-separated, when more than one did. NULL for ranges read
@@ -602,7 +621,7 @@ class CollectorSource(Base, Timestamped):
 
     __tablename__ = "collector_source"
 
-    # Where the history comes from, e.g. "horizon:horizon.stellar.org".
+    # Where the history comes from: the logical source, "horizon:pool".
     source: Mapped[str] = mapped_column(Text, primary_key=True)
     # history_latest_ledger and history_elder_ledger of the last cycle.
     latest_ledger: Mapped[int | None] = mapped_column(BigInteger)
@@ -720,6 +739,17 @@ class HorizonNodeState(Base, Timestamped):
         CheckConstraint("errors >= 0", name="errors_not_negative"),
         CheckConstraint("timeouts >= 0", name="timeouts_not_negative"),
     )
+
+
+class SourceIdentity(Base):
+    """Which names the logical source had before it was called
+    ``horizon:pool``, for a downgrade to give back (migration ``0007``).
+    Not history: a name that was merged with others stays merged."""
+
+    __tablename__ = "source_identity"
+
+    old_source: Mapped[str] = mapped_column(Text, primary_key=True)
+    renamed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class ProcessingJob(Base, Timestamped):
@@ -840,4 +870,193 @@ class NotifierEvent(Base, Timestamped):
         Index("ix_notifier_event_received", "received_at"),
         Index("ix_notifier_event_transaction", "transaction_hash"),
         Index("ix_notifier_event_job", "job_id"),
+    )
+
+
+class HistoryJob(Base, Timestamped):
+    """The import of a subject's history that there is: one account's four
+    streams, or one market's trades, from as far back as the pool keeps up to
+    a fixed ledger.
+
+    Separate from the queue of events (``processing_job``): that one is
+    about one transaction and is done in seconds; this one may run for a
+    week, in slices, and is the backfill run slice by slice over the same
+    coverage and checkpoints.
+
+    ``state`` is one of:
+
+    * ``waiting`` — to be worked on when ``next_attempt_at`` has come;
+    * ``running`` — taken by a worker under a lease (``leased_by`` until
+      ``lease_expires_at``), and back to ``waiting`` for whoever finds the
+      lease expired;
+    * ``done`` — every stream of the subject is verified up to
+      ``to_ledger`` (some of it may be ``unverifiable``: below what the pool
+      keeps, which is reported in ``result``, never counted as read);
+    * ``partial`` — some streams are verified and others failed too many
+      times in a row (a 503 on a busy account's trades, for one);
+    * ``error`` — nothing of it could be read, for as many tries;
+    * ``paused`` — stopped on purpose (the account was switched off, or by
+      hand); it is not worked on until it is resumed.
+
+    ``to_ledger`` is the upper boundary. It is fixed once events are
+    guaranteed for the subject, which is what ``boundary_final`` says; until
+    then it may be raised. ``from_ledger`` NULL means as far back as the
+    pool keeps. Re-planning a subject raises its boundary and never resets
+    its progress: that is in the coverage and the checkpoints.
+    """
+
+    __tablename__ = "history_job"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    # account | market
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    # The account's address, or the market's key.
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    from_ledger: Mapped[int | None] = mapped_column(BigInteger)
+    to_ledger: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    boundary_final: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # parents | full: what is fetched for a record before it is stored.
+    context: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'parents'"))
+    # Slices that ended in failure, one after the other.
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    slices: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    requests: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    pages: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    records: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # When it last had a slice: the one that waited longest is served first.
+    last_slice_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    leased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    leased_by: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    paused_because: Mapped[str | None] = mapped_column(Text)
+    # What became of every stream, and what lies out of the pool's reach.
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    __table_args__ = (
+        UniqueConstraint("kind", "subject", name="subject"),
+        CheckConstraint("kind IN ('account', 'market')", name="kind_known"),
+        CheckConstraint(
+            "state IN ('waiting', 'running', 'done', 'partial', 'error', 'paused')",
+            name="state_known",
+        ),
+        CheckConstraint("context IN ('parents', 'full')", name="context_known"),
+        CheckConstraint("to_ledger > 0", name="to_ledger_positive"),
+        CheckConstraint("from_ledger IS NULL OR from_ledger <= to_ledger", name="from_ledger_below_to"),
+        CheckConstraint("attempts >= 0", name="attempts_not_negative"),
+        Index("ix_history_job_queue", "state", "next_attempt_at"),
+    )
+
+
+class WatchSubscription(Base, Timestamped):
+    """A subscription of Operations Notifier that this installation wants:
+    one for an enabled account, one for an asset that is enabled, marked
+    for discovery or belongs to an enabled market.
+
+    Only subscriptions of this installation are kept here, by their id at
+    the Notifier; subscriptions made by others are never touched. A
+    subscription is one for a kind and a key, whatever rules want it: an
+    asset is subscribed once for its history, its discovery and every market
+    it is in, and it stays as long as any of them wants it.
+
+    ``state`` is one of:
+
+    * ``wanted`` — to be registered, when ``next_attempt_at`` has come;
+    * ``active`` — registered and confirmed: read back from the Notifier;
+    * ``error`` — the last attempt failed; it is tried again with a pause;
+    * ``ambiguous`` — more than one subscription fits, or one that is not
+      clearly this installation's: a person decides;
+    * ``retiring`` — no longer wanted and to be deleted at the Notifier;
+    * ``manual`` — made by hand at the Notifier and adopted here by its id;
+    * ``retired`` — gone from the Notifier; kept for the record.
+
+    ``managed`` says whether this installation made it: only what it made
+    it deletes.
+    """
+
+    __tablename__ = "watch_subscription"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    # account | asset
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    # The account's address, or the asset's id.
+    key: Mapped[str] = mapped_column(Text, nullable=False)
+    remote_id: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'wanted'"))
+    managed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    filter_version: Mapped[int | None] = mapped_column(Integer)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("kind", "key", name="subscription"),
+        CheckConstraint("kind IN ('account', 'asset')", name="kind_known"),
+        CheckConstraint(
+            "state IN ('wanted', 'active', 'error', 'ambiguous', 'retiring', 'manual', 'retired')",
+            name="state_known",
+        ),
+        CheckConstraint("attempts >= 0", name="attempts_not_negative"),
+        Index("ix_watch_subscription_queue", "state", "next_attempt_at"),
+    )
+
+
+class DiscoveryRun(Base, Timestamped):
+    """One pass of discovery over one asset: what was read, from which
+    servers, and how far it got.
+
+    The accounts of the network are read page by page, and a server may be
+    exchanged for another on the way: a pass is not one snapshot of the
+    network. What is kept says which servers answered and when, and a pass
+    that did not reach the end says so (``incomplete``) instead of looking
+    whole. A pass run again is safe: an account it finds is added once.
+    """
+
+    __tablename__ = "discovery_run"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    # Nothing was written: the pass only says what it would do.
+    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The pass began after this address and reached that one.
+    after_address: Mapped[str | None] = mapped_column(Text)
+    last_address: Mapped[str | None] = mapped_column(Text)
+    # The newest ledger the servers had when the pass began.
+    latest_ledger: Mapped[int | None] = mapped_column(BigInteger)
+    # What each page came from: the server, when, and the newest ledger
+    # that server had.
+    servers: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    pages: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    found: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    with_line: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    added: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    already: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    disabled: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    issuer_skipped: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("state IN ('running', 'complete', 'incomplete', 'failed')", name="state_known"),
+        Index("ix_discovery_run_asset", "asset_id", "started_at"),
+    )
+
+
+class ServiceState(Base):
+    """Small things a service must remember between passes — where a scan
+    got to, when something last ran — by name. Not history."""
+
+    __tablename__ = "service_state"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )

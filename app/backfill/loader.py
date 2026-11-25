@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from app.backfill import store
 from app.backfill.jobs import TRADE_MAKING_OPERATIONS, StreamJob
 from app.sources import horizon_records as records
-from app.sources.horizon import BeforeHistory, HorizonClient, OrderKey, Page
+from app.sources.horizon import BeforeHistory, HorizonClient, OrderKey, Page, RateLimited, Unavailable
 from app.sources.horizon_cursors import InvalidCursor, after_ledger, order_key, parse_cursor
 from app.storage import coverage
 from app.storage.upsert import checkpoint, set_checkpoint
@@ -551,6 +551,12 @@ class Backfill:
                 except RunStopped as stop:
                     report.status, report.error = "stopped", str(stop)
                     self.limits.stop.set()
+                except (Unavailable, RateLimited) as failure:
+                    # No server could answer, or they ask to wait: the state
+                    # of the servers, to be read again — not a failure to
+                    # look into, and said without a traceback.
+                    logger.warning("%s: %s", report.name, failure)
+                    report.status, report.error = "failed", f"{type(failure).__name__}: {failure}"
                 except Exception as failure:  # noqa: BLE001 - one stream must not sink the others
                     logger.exception("%s failed", report.name)
                     report.status, report.error = "failed", f"{type(failure).__name__}: {failure}"

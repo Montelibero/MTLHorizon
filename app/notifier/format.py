@@ -3,11 +3,13 @@ here. This is the only place that knows that shape; the rest of the
 application works with :class:`Notice`.
 
 Studied in the code of ``Montelibero/operations-notifier`` at revision
-``cea7e51`` (v0.12.0). The webhook and its signature are the same there as
-in ``a474e9c`` (v0.11.0), which was studied first; v0.12.0 only added fields
-that may be absent. An example is no proof of what an installed version
-does, so nothing here needs a field to be there, and whatever cannot be read
-is named in ``Notice.problems`` instead of being invented.
+``cea7e51`` (v0.12.0), which was amended into ``e4039fb`` (v0.12.0) while
+stage 05 ran, and at ``0fb6050`` (v0.13.0), which came next. The webhook and
+its signature are the same there as in ``a474e9c`` (v0.11.0), which was
+studied first; since then only fields that may be absent were added. An
+example is no proof of what an installed version does, so nothing here needs
+a field to be there, and whatever cannot be read is named in
+``Notice.problems`` instead of being invented.
 
 What is posted, as a JSON object::
 
@@ -23,7 +25,16 @@ What is posted, as a JSON object::
   ``operation.account`` is the base ``G…`` address of the operation's source
   (of the transaction's source when the operation has none).
 * Assets are written with a number for their type — 0 native, 1 alphanum4,
-  2 alphanum12 — not with Horizon's words.
+  2 alphanum12 — not with Horizon's words. 3 is a share of a liquidity pool
+  (since v0.13.0; before, it was written as XLM): it has no name here, and
+  that is said in ``problems``. What is read instead is the pair of the
+  pool's own assets, ``assets``, on an operation made with the pool. A trade
+  of a pool names the pool's assets itself, in ``asset_sold`` and
+  ``asset_bought``.
+* Next to the base ``G…`` address of an account the Notifier may write its
+  muxed form, ``<field>_muxed`` and ``<field>_muxed_id`` (``account``,
+  ``from``, ``trustor``, the transaction's ``source``). The base address is
+  what is read.
 * ``transaction`` carries ``hash``, ``paging_token``, ``source``,
   ``created_at``, ``result_xdr`` and ``envelope_xdr``. Of a fee-bump
   transaction ``hash`` is the envelope's hash, as in Horizon, and ``source``
@@ -60,6 +71,8 @@ NUMBERED = dict(enumerate(TYPES))
 
 # Fields that name an account other than by being the operation's source.
 ACCOUNT_FIELDS = ("destination", "trustor", "from", "sponsoredId")
+# The type number of a share of a liquidity pool.
+POOL_SHARE = 3
 ASSET_FIELDS = ("asset", "source_asset")
 
 
@@ -242,7 +255,14 @@ def _names(operation: Mapping[str, Any], problems: list[str]) -> tuple[frozenset
             continue
         found = asset_id(value)
         if found is None:
-            problems.append(f"{name} is not an asset as the Notifier writes them: {value!r}")
+            problems.append(_not_an_asset(name, value))
+        else:
+            assets.add(found)
+    # Since v0.13.0: the pair of assets of the pool an operation is made with.
+    for value in _list(operation.get("assets"), "assets", problems):
+        found = asset_id(value)
+        if found is None:
+            problems.append(_not_an_asset("assets", value))
         else:
             assets.add(found)
     for value in _list(operation.get("path"), "path", problems):
@@ -282,6 +302,15 @@ def _names(operation: Mapping[str, Any], problems: list[str]) -> tuple[frozenset
     return frozenset(accounts), frozenset(assets), frozenset(markets)
 
 
+def _not_an_asset(name: str, value: Any) -> str:
+    """What is wrong with ``value`` in the field ``name``: a pool share is an
+    asset this reader knows and has no name for; anything else is not written
+    as the Notifier writes assets."""
+    if is_pool_share(value):
+        return f"{name} is a pool share, which has no name here"
+    return f"{name} is not an asset as the Notifier writes them: {value!r}"
+
+
 def _list(value: Any, name: str, problems: list[str]) -> list[Any]:
     if value is None:
         return []
@@ -289,6 +318,12 @@ def _list(value: Any, name: str, problems: list[str]) -> list[Any]:
         problems.append(f"{name} is not a list")
         return []
     return value
+
+
+def is_pool_share(asset: Any) -> bool:
+    """Whether ``asset`` is a share of a liquidity pool as the Notifier has
+    written it since v0.13.0."""
+    return isinstance(asset, Mapping) and asset.get("asset_type") == POOL_SHARE
 
 
 def asset_id(asset: Any) -> str | None:

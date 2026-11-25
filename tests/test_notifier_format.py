@@ -43,7 +43,7 @@ def test_an_assets_number_becomes_its_name() -> None:
     assert notifier.asset_id({"asset_type": 1, "asset_code": "MTL", "asset_issuer": ISSUER}) == MTL
     assert notifier.asset_id({"asset_type": 2, "asset_code": "EURMTL", "asset_issuer": ISSUER}) == EUR
     assert notifier.asset_id({"asset_type": 2, "asset_code": "EURMTL", "asset_issuer": "not an issuer"}) is None
-    assert notifier.asset_id({"asset_type": 3, "asset_code": "X", "asset_issuer": ISSUER}) is None  # a kind this reader does not know
+    assert notifier.asset_id({"asset_type": 3, "asset_code": "X", "asset_issuer": ISSUER}) is None  # a pool share: known, and it has no name here
     assert notifier.asset_id("native") is None
 
 
@@ -73,6 +73,102 @@ def test_a_muxed_payment_is_read_by_its_base_accounts() -> None:
         destination_muxed_id="123456789",
     )
     assert notice.told and notice.accounts == {A, B}
+
+
+def test_the_muxed_forms_the_notifier_adds_next_to_a_base_account_are_read_by_the_base_one() -> None:
+    """Since v0.12.0 was amended (`e4039fb`), the Notifier writes the muxed
+    form of an account next to its base address wherever it names one —
+    ``from``, ``trustor``, the ``account`` of a sponsorship, the
+    transaction's ``source`` — and the base address stays where it was. The
+    reader goes by the base addresses and is not thrown by the rest."""
+    muxed = "MBEPZKYCZBZV2AM4C4A6NFAC2RJKVHUZ6HRQ3JFMZGLK442LHBMK2SAAAAAAAAAAAHF5Y"
+    fake = FakeHorizon()
+    payload = notification(fake, T1)
+    payload["operation"].update(
+        account_muxed=muxed,
+        account_muxed_id="1",
+        trustor=C,
+        trustor_muxed=muxed,
+        trustor_muxed_id="2",
+        sponsoredId=D,
+        sponsoredId_muxed=muxed,
+        sponsoredId_muxed_id="3",
+    )
+    payload["transaction"].update(source_muxed=muxed, source_muxed_id="4")
+    notice = notifier.read(payload)
+    assert notice.told and notice.problems == ()
+    assert notice.accounts == {A, B, C, D} and muxed not in notice.accounts
+
+
+def test_a_pool_share_is_known_and_said_to_have_no_name_here() -> None:
+    """Since v0.13.0 a share of a liquidity pool is a type of its own; before,
+    the Notifier wrote it as XLM. It is not taken for native, and the
+    delivery says what it could not read — so that it is brought in all the
+    same."""
+    notice = read(asset={"asset_type": 3, "liquidity_pool_id": "ab" * 32})
+    assert not notice.told and notice.assets == frozenset()
+    assert notice.problems == ("asset is a pool share, which has no name here",)
+
+
+def test_the_pair_of_a_liquidity_pool_is_read() -> None:
+    """Since v0.13.0 an operation made with a pool carries the pair of its
+    assets."""
+    notice = read(assets=[{"asset_type": 2, "asset_code": "EURMTL", "asset_issuer": ISSUER}, {"asset_type": 0}])
+    assert notice.told and notice.problems == ()
+    assert notice.assets == {EUR, "native"} and notice.markets == frozenset()
+
+
+def test_a_trustline_to_a_pool_share_says_what_it_is_and_names_the_pair_of_the_pool() -> None:
+    """Since v0.13.0 (``RESPONSE_EXAMPLES.md``, section 6): the line is to a
+    share of a liquidity pool, which has no name here, and the pair of the
+    pool is written beside it. Before v0.13.0 the share was written as XLM,
+    and was taken for it."""
+    usdc = {"asset_type": 1, "asset_code": "USDC", "asset_issuer": ISSUER}
+    notice = read(
+        type_i=6,
+        type="change_trust",
+        asset={"asset_type": 3, "liquidity_pool_id": "3fdb" + "ab" * 30},
+        assets=[usdc, {"asset_type": 2, "asset_code": "EURMTL", "asset_issuer": ISSUER}],
+        fee=30,
+        limit="1000.0000000",
+    )
+    assert not notice.told and notice.problems == ("asset is a pool share, which has no name here",)
+    assert notice.assets == {EUR, "USDC:" + ISSUER} and "native" not in notice.assets
+
+
+def test_a_trade_of_a_liquidity_pool_names_the_assets_of_the_pool() -> None:
+    """As the Notifier writes it since v0.13.0: the pool's own assets are the
+    trade's, and the pair is written beside them."""
+    notice = read(
+        trades=[
+            {
+                "type": "liquidity_pool",
+                "pool_id": "ab" * 32,
+                "asset_sold": {"asset_type": 2, "asset_code": "EURMTL", "asset_issuer": ISSUER},
+                "amount_sold": "0.1716083",
+                "asset_bought": {"asset_type": 0},
+                "amount_bought": "18.3626770",
+                "pool_assets": [{"asset_type": 2, "asset_code": "EURMTL", "asset_issuer": ISSUER}, {"asset_type": 0}],
+            }
+        ]
+    )
+    assert notice.told and notice.problems == ()
+    assert notice.assets == {EUR, "native"} and notice.markets == frozenset({(EUR, "native")})
+
+
+def test_a_trade_that_names_a_pool_share_on_a_side_cannot_be_told_and_is_kept_all_the_same() -> None:
+    """The Notifier does not write a pool share there; were it to, the trade
+    is said not to be readable — and such a delivery is brought in anyway."""
+    notice = read(
+        trades=[
+            {
+                "type": "liquidity_pool",
+                "asset_sold": {"asset_type": 2, "asset_code": "EURMTL", "asset_issuer": ISSUER},
+                "asset_bought": {"asset_type": 3, "liquidity_pool_id": "ab" * 32},
+            }
+        ]
+    )
+    assert not notice.told and notice.problems == ("a trade names assets that cannot be read",)
 
 
 def test_the_ledger_is_taken_from_the_transaction_and_checked_against_the_operation() -> None:

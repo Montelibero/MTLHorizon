@@ -18,6 +18,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -26,15 +27,18 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app import __version__
-from app.cli_common import configure_logging, engine_for, make_client, print_table
+from app.cli_common import configure_logging, engine_for, make_client, print_table, require_schema
 from app.config import ConfigError, Settings
 from app.storage import events as journal
 from app.storage import jobs
 from app.storage.models import NotifierEvent, ProcessingJob
+from app.discovery import scan
 from app.storage.pace import EVENTS
+from app.watch import provision
 from app.worker.loader import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_POLL,
+    DEFAULT_PROVISION_EVERY,
     DEFAULT_RETRY_BASE,
     DEFAULT_RETRY_CAP,
     DEFAULT_LEASE,
@@ -82,21 +86,64 @@ def _worker(settings: Settings, engine: Any, args: argparse.Namespace) -> Worker
 
 
 def command_run(args: argparse.Namespace, settings: Settings) -> int:
-    """The service: take jobs until SIGTERM or SIGINT."""
+    """The service: take jobs until SIGTERM or SIGINT. While no event is
+    waiting, keep accounts, their history imports and their subscriptions in
+    step; and, if the schedule is on, run discovery."""
     engine = engine_for(settings)
+    if not require_schema(engine, settings, logger):
+        engine.dispose()
+        return FAILED
     stop = threading.Event()
     for number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(number, lambda signum, frame: stop.set())
     with _worker(settings, engine, args) as worker:
+        api = provision.make_api(settings)
+        discovery = _discovery_thread(settings, worker.client, engine, stop)
+        if discovery is not None:
+            discovery.start()
         logger.info("worker %s started: %d job(s) waiting", worker.name, jobs.counts(engine)["pending"])
+
+        def pass_() -> provision.PassReport:
+            return provision.run(engine, settings, client=worker.client, api=api)
+
         try:
-            worker.run(stop, poll_seconds=args.poll_seconds)
+            worker.run(
+                stop,
+                poll_seconds=args.poll_seconds,
+                provision=pass_,
+                provision_every=args.provision_interval,
+            )
         except Exception:  # noqa: BLE001 - the queue or the database is unreachable
             logger.exception("the worker could not go on")
             return FAILED
+        finally:
+            if api is not None:
+                api.close()
     engine.dispose()
     logger.info("stopped on request: %d done, %d failed", worker.done, worker.failed)
     return OK
+
+
+def _discovery_thread(settings: Settings, client: Any, engine: Any, stop: threading.Event) -> threading.Thread | None:
+    """Discovery on its schedule, in a thread of its own: a pass over the
+    network may take long, and an event must not wait for it. None when the
+    schedule is off, which it is by default."""
+    interval = settings.discovery_interval_seconds
+    if not interval or interval <= 0:
+        return None
+
+    def loop() -> None:
+        while not stop.is_set():
+            started = time.monotonic()
+            try:
+                for report in scan.run_all(client, engine):
+                    logger.info("discovery %s: %s", report.asset_id, "; ".join(report.lines()[1:]))
+            except Exception:  # noqa: BLE001 - the next pass tries again
+                logger.exception("a scheduled pass of discovery failed")
+            if stop.wait(max(interval - (time.monotonic() - started), 1.0)):
+                return
+
+    return threading.Thread(target=loop, name="discovery", daemon=True)
 
 
 def command_once(args: argparse.Namespace, settings: Settings) -> int:
@@ -135,6 +182,14 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
                 .limit(args.examples)
             )
         )
+        waiting = list(
+            session.scalars(
+                select(ProcessingJob)
+                .where(ProcessingJob.state == jobs.PENDING, ProcessingJob.last_error.is_not(None))
+                .order_by(ProcessingJob.next_attempt_at)
+                .limit(args.examples)
+            )
+        )
         kept = dict.fromkeys(journal.STATES, 0)
         for state, number in session.execute(select(NotifierEvent.state, func.count()).group_by(NotifierEvent.state)):
             kept[state] = number
@@ -164,6 +219,21 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
     ]
     if rows:
         print_table("running", rows, ("job", "transaction", "ledger", "worker", "lease until", "try"))
+    if waiting:
+        print_table(
+            "waiting for another try",
+            [
+                {
+                    "job": job.id,
+                    "transaction": job.transaction_hash[:8],
+                    "try": job.attempts,
+                    "next try": _when(job.next_attempt_at),
+                    "why": job.last_error or "-",
+                }
+                for job in waiting
+            ],
+            ("job", "transaction", "try", "next try", "why"),
+        )
     if gave_up:
         print_table(
             "jobs that gave up (`python -m app.worker retry` takes them back)",
@@ -267,6 +337,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.set_defaults(handler=command_run)
     working(sub)
     sub.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL, help="how long to wait when no job is waiting (default: 2)")
+    sub.add_argument(
+        "--provision-interval",
+        type=float,
+        default=DEFAULT_PROVISION_EVERY,
+        help="how often, while no event is waiting, to keep accounts, their history imports and their subscriptions in step (default: 60)",
+    )
 
     sub = commands.add_parser("once", help="take the next job whose time has come, do it, exit")
     sub.set_defaults(handler=command_once)

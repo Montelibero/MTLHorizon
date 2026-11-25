@@ -8,7 +8,9 @@ that holds anything else.
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -33,6 +35,68 @@ def alembic_config(database_url: str) -> Config:
     config.set_main_option("script_location", str(PROJECT_ROOT / "alembic"))
     config.attributes["configure_logger"] = False
     return config
+
+
+# Addresses a test may connect to: the database server (wherever the Compose
+# network or the host puts it) and this machine. Everything else is outside.
+_PRIVATE_NETWORKS = (
+    "127.0.0.0/8",
+    "::1",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
+
+
+def _is_inside(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False  # not an address: nothing a test connects to directly
+    return any(address in ipaddress.ip_network(network) for network in _PRIVATE_NETWORKS)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_outer_network() -> Iterator[None]:
+    """No test leaves the machine, whatever client it uses.
+
+    Every connection any code in the test process opens goes through
+    ``socket.socket.connect``: it is refused unless its address is private
+    or local. The database is; a public Horizon, a Notifier or anything
+    else on the internet is not. Fakes answer inside the process and open
+    nothing. This holds for code that does not go through this project's
+    clients, and for code yet to be written.
+    """
+    connect, connect_ex = socket.socket.connect, socket.socket.connect_ex
+
+    def refused(address: Any) -> ConnectionRefusedError:
+        host = address if isinstance(address, str) else f"{address[0]}:{address[1]}"
+        return ConnectionRefusedError(f"a test tried to reach {host}: tests do not leave the machine")
+
+    def checked_connect(self: socket.socket, address: Any) -> None:
+        if isinstance(address, str):  # a Unix domain socket
+            return connect(self, address)
+        if not _is_inside(address[0]):
+            raise refused(address)
+        return connect(self, address)
+
+    def checked_connect_ex(self: socket.socket, address: Any) -> int:
+        if isinstance(address, str):
+            return connect_ex(self, address)
+        if not _is_inside(address[0]):
+            raise refused(address)
+        return connect_ex(self, address)
+
+    socket.socket.connect = checked_connect  # type: ignore[method-assign]
+    socket.socket.connect_ex = checked_connect_ex  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        socket.socket.connect = connect  # type: ignore[method-assign]
+        socket.socket.connect_ex = connect_ex  # type: ignore[method-assign]
 
 
 @pytest.fixture(autouse=True)

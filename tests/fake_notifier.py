@@ -89,6 +89,8 @@ def notification(
         )
     elif operation["type"] == "manage_data":
         body.update(name=operation["name"], value=operation["value"])
+    elif operation["type"] == "change_trust":
+        body.update(asset=notifier_asset(operation), limit=operation["limit"])
     return {
         "id": notification_id or uuid.uuid4().hex,
         "subscription": subscription,

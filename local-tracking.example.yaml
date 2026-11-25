@@ -15,6 +15,14 @@ assets:
     issuer: GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
   # XLM is written as `native`; it needs no code or issuer.
   # - native: true
+  # `discover: true` is a rule of its own, apart from `enabled`: the accounts
+  # that hold a trustline to the asset are looked for
+  # (`python -m app.discovery run`) and added to the accounts below. It
+  # changes only with --apply-changes, as `enabled` does. Native cannot be
+  # discovered: every account holds it.
+  # - code: EURMTL
+  #   issuer: GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V
+  #   discover: true
 
 # A market is an unordered pair. Naming it the other way round is the same
 # market; listing both orders is an error.

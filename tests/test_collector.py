@@ -29,7 +29,7 @@ from app.storage.locks import AdvisoryLock
 from app.storage.writer import HistoryWriter
 from tests.fake_horizon import EUR, ISSUER, RECT, A, B, C, D, S, FakeHorizon, Operation, Transaction, _payment, paid, sale, serve
 
-SOURCE = "horizon:horizon.test"
+SOURCE = "horizon:pool"  # the logical source, as the commands name it
 START = 118  # the latest ledger when the collector is first started
 WATCH_LIST = watch_lists.parse(
     yaml.safe_load(

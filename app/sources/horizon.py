@@ -84,6 +84,14 @@ class RequestFailed(HorizonError):
     """A status that will not change on retry, or no answer after every attempt."""
 
 
+class Unavailable(RequestFailed):
+    """No server could answer this request just now: every one is out of
+    service, or the ones that could have said something could not be asked.
+
+    This is the state of the servers, not of the request: it says nothing
+    about the resource, and a job that meets it has not failed."""
+
+
 class WrongNetwork(HorizonError):
     """Every server that could answer belongs to another Stellar network."""
 
@@ -400,6 +408,53 @@ class HorizonClient:
             if not following.records:
                 return
             page = following
+
+    def address_pages(
+        self, path: str, *, cursor: str | None = None, limit: int = 200, **filters: Any
+    ) -> Iterator[Page]:
+        """The pages of a collection ordered by address — the accounts — in
+        order.
+
+        An address has no place in time, so there is no order key to check a
+        record by: what is checked is that the addresses strictly ascend,
+        that the first lies strictly beyond the cursor and that a page's
+        link names the last address of the page as where to go on. A page
+        that repeats, jumps back or skips is a broken answer and stops the
+        reading. The filters asked for are kept on every page.
+        """
+        query = _clean({"order": "asc", "cursor": cursor, "limit": limit, **filters})
+        page = self._to_page(self._request(path, query), path, query, "account")
+        boundary = cursor
+        seen: set[str] = set()
+        while True:
+            addresses = self._addresses(path, page)
+            for address in addresses:
+                if boundary is not None and address <= boundary:
+                    raise MalformedResponse(f"{path}: account {address[:6]}… is not beyond the one before it")
+                boundary = address
+            yield page
+            if page.exhausted:
+                return
+            next_cursor = page.next_cursor
+            assert next_cursor is not None
+            if next_cursor in seen or next_cursor == cursor or (addresses and next_cursor != addresses[-1]):
+                raise MalformedResponse(f"{path}: cursor {next_cursor[:6]}… does not lead on from the page")
+            seen.add(next_cursor)
+            following = self.next_page(page)
+            if following is None or not following.records:
+                return
+            cursor, page = next_cursor, following
+
+    @staticmethod
+    def _addresses(path: str, page: Page) -> list[str]:
+        """The accounts of the page, which must strictly ascend."""
+        addresses: list[str] = []
+        for record in page.records:
+            address = record.get("account_id")
+            if not isinstance(address, str) or not address:
+                raise MalformedResponse(f"{path}: a record names no account")
+            addresses.append(address)
+        return addresses
 
     def _request(self, path: str, query: Mapping[str, Any]) -> dict[str, Any]:
         asked = "&".join(f"{key}={value}" for key, value in sorted(query.items()) if value is not None)

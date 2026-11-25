@@ -53,8 +53,8 @@ from app.sources.horizon import (
     HorizonSettings,
     MalformedResponse,
     NotFound,
-    RequestFailed,
     ResponseError,
+    Unavailable,
     WrongNetwork,
     ledger_of,
     retry_after_in,
@@ -299,12 +299,19 @@ class HorizonPool(HorizonClient):
         self._thrived(self._local.server)
 
     def history(self) -> History:
-        """What the pool keeps, as of now: the oldest ledger some available
-        server still answers for, and the newest ledger any of them has.
+        """What the pool keeps, as of now: the oldest ledger the pool keeps,
+        and the newest ledger any of its servers has got to.
 
         A request to every server that is not left alone: a reading sequence
         starts from what the servers have got to right now, and what they
         said of themselves a while ago does not tell.
+
+        The oldest ledger is said by every server that has said what it
+        keeps, one that is silent at the moment included, by its last word:
+        what a server keeps only moves up, so that word is never below the
+        truth. To go by the servers that answer alone would give up on
+        ledgers that are only waiting for one of them to come back — and
+        call them out of reach for good.
         """
         now = self._clock()
         for server in self.nodes:
@@ -319,10 +326,11 @@ class HorizonPool(HorizonClient):
             if strangers:
                 raise WrongNetwork(f"every server of the pool that answers serves another network: {', '.join(strangers)}")
             down = "; ".join(f"{server.name} {self._say(server, self._unfit(server, None), None)}" for server in self.nodes)
-            raise RequestFailed(f"no server of the pool answers: {down}")
+            raise Unavailable(f"no server of the pool answers: {down}")
         freshest = max(usable, key=lambda server: server.latest or 0)
+        said = [server.elder for server in self.nodes if not server.wrong_network and server.elder is not None]
         return History(
-            elder=min(server.elder for server in usable if server.elder is not None),
+            elder=min(said),
             latest=freshest.latest,
             name=freshest.name,
             network_passphrase=freshest.root.get("network_passphrase"),
@@ -334,6 +342,13 @@ class HorizonPool(HorizonClient):
         it: what lies there can no longer be read from any of them. A server
         that has not said what it keeps is given the benefit of the doubt."""
         return all(server.wrong_network or (server.elder is not None and server.elder > ledger) for server in self.nodes)
+
+    def silent(self) -> list[str]:
+        """The servers that have not said of themselves just now — down, or
+        left alone after a failure — and so may keep history nobody has
+        heard of. A server of another network is not one of the pool's."""
+        now = self._clock()
+        return [server.name for server in self.nodes if not server.wrong_network and not self._usable(server, now)]
 
     def _pace(self) -> None:
         if self._limiter is None:
@@ -407,7 +422,7 @@ class HorizonPool(HorizonClient):
                     self._forget(server)
                 continue
             break
-        raise RequestFailed(f"no server of the pool can answer GET {path}: " + "; ".join(reasons))
+        raise Unavailable(f"no server of the pool can answer GET {path}: " + "; ".join(reasons))
 
     def _unfit(self, server: Server, ledger: int | None) -> str | None:
         """Why ``server`` is not to answer a request about ``ledger``; None
@@ -591,7 +606,7 @@ class HorizonPool(HorizonClient):
             elif status in (408, 425, 500, 502, 503, 504):
                 self._suspect(path, server, f"answered {status} to GET {path}")
         if silent:
-            raise RequestFailed(
+            raise Unavailable(
                 f"GET {error.path}: {first.name} answered {error.status}, and {', '.join(silent)} could not be asked, "
                 f"so that proves nothing yet"
             ) from error
@@ -604,7 +619,7 @@ class HorizonPool(HorizonClient):
             if status == 410 and not self._check(server):
                 silent.append(f"{server.name} (its bounds could not be asked again)")
         if silent:
-            raise RequestFailed(f"GET {error.path}: where the history ends could not be established: {', '.join(silent)}") from error
+            raise Unavailable(f"GET {error.path}: where the history ends could not be established: {', '.join(silent)}") from error
         if any(status == 404 and _keeps(server, ledger) for server, status in gone):
             # A server that keeps the ledger has no such resource.
             who = next(server.name for server, status in gone if status == 404 and _keeps(server, ledger))

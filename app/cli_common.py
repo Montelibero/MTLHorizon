@@ -19,7 +19,7 @@ import httpx
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.config import ConfigError, Settings, shown_url
+from app.config import ConfigError, Settings
 from app.storage import pace, pool_state
 from app.storage.pace import Pace
 from app.storage.db import create_db_engine
@@ -50,14 +50,61 @@ def engine_for(settings: Settings) -> Engine:
     return engine
 
 
+# How the database names the place history is read from. One name for the
+# whole pool, whatever servers it is made of and whatever order they are
+# listed in: a checkpoint is about a ledger, not about a server, and every
+# server of the network answers for the same ledgers. Which server read
+# what is kept apart, in ``sync_coverage.served_by``.
+LOGICAL_SOURCE = "horizon:pool"
+
+
+def schema_checks(engine: Engine, settings: Settings) -> dict[str, str]:
+    """Whether the database is ready for a service to work on it: it
+    answers, its schema is at the head of the migrations, it is of the
+    configured network. A map of check name to ``"ok"`` or the reason."""
+    from app.api.app import readiness_checks
+
+    return readiness_checks(engine, settings.network_passphrase)
+
+
+def require_schema(engine: Engine, settings: Settings, logger: logging.Logger) -> bool:
+    """For a service about to start: say what is not ready, and False if
+    anything is — the service is to exit and let the owner migrate first,
+    not to fail query by query."""
+    checks = _quietly(schema_checks, engine, settings)
+    not_ok = {name: reason for name, reason in checks.items() if reason != "ok"}
+    if not_ok:
+        logger.error(
+            "not starting: the database is not ready (%s); apply the migrations first: "
+            "`docker compose run --rm api alembic upgrade head`",
+            "; ".join(f"{name}: {reason}" for name, reason in not_ok.items()),
+        )
+        return False
+    return True
+
+
+def _quietly(check: Callable[..., dict[str, str]], engine: Engine, settings: Settings) -> dict[str, str]:
+    """The check with what Alembic says of itself while it compares the
+    schema left out of the log: a service that starts is not the place for
+    ten lines about the plugins of a migration."""
+    talkers = [logging.getLogger(name) for name in ("alembic.runtime.plugins", "alembic.runtime.migration")]
+    levels = [talker.level for talker in talkers]
+    for talker in talkers:
+        talker.setLevel(logging.WARNING)
+    try:
+        return check(engine, settings)
+    finally:
+        for talker, level in zip(talkers, levels):
+            talker.setLevel(level)
+
+
 def source_name(client: HorizonClient) -> str:
-    """The pool as its checkpoints and coverage name it: by its first server.
-    Servers added after the first share its checkpoints."""
-    return f"horizon:{shown_url(client.settings.base_url).split('://', 1)[1]}"
+    """The pool as its checkpoints and coverage name it."""
+    return LOGICAL_SOURCE
 
 
 def source_name_for(settings: Settings) -> str:
-    return f"horizon:{shown_url(settings.horizon_urls[0]).split('://', 1)[1]}"
+    return LOGICAL_SOURCE
 
 
 def make_client(settings: Settings, engine: Engine | None = None, *, share: str = pace.BACKGROUND) -> HorizonPool:
