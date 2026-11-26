@@ -44,8 +44,9 @@ jobs:
       run:
         shell: bash
     env:
-      # Compose refuses to read its file without a password for the database.
-      # Nothing is started here, so any value will do.
+      # The Compose file of a developer's machine reads the password of the
+      # database from the environment. Nothing is started here, so any value
+      # will do.
       POSTGRES_PASSWORD: ci-only
       # Written in lower case: the registry takes no other.
       IMAGE: ghcr.io/montelibero/mtlhorizon
@@ -55,7 +56,17 @@ jobs:
       - name: The Compose files are valid
         run: |
           docker compose config --quiet
-          docker compose --profile test --profile collector config --quiet
+          docker compose -f compose.dev.yaml --profile test --profile collector config --quiet
+
+      - name: compose.yaml keeps its three rules
+        # For a server: no variable, no image made from the sources, no file of settings.
+        run: |
+          for forbidden in '$' build .env; do
+            if grep -n -i -F -- "$forbidden" compose.yaml; then
+              echo "compose.yaml must not contain: $forbidden"
+              exit 1
+            fi
+          done
 
       - uses: docker/setup-buildx-action@v4
 

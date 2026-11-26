@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from app import __version__
 from app.cli_common import configure_logging, engine_for, make_client, print_table, write_report
-from app.config import ConfigError, Settings, shown_url
+from app.config import ConfigError, Settings, server_name
 from app.pool import check
 from app.storage import pool_state
 
@@ -80,10 +80,10 @@ def command_status(args: argparse.Namespace, settings: Settings) -> int:
     engine.dispose()
     rows = []
     for url in settings.horizon_urls:
-        row = kept.get(shown_url(url))
+        row = kept.get(server_name(url))
         rows.append(
             {
-                "server": shown_url(url),
+                "server": server_name(url),
                 "check": "-" if row is None or row.checked_at is None else ("available" if row.available else "unavailable"),
                 "latest": "-" if row is None or row.latest_ledger is None else row.latest_ledger,
                 "elder": "-" if row is None or row.elder_ledger is None else row.elder_ledger,

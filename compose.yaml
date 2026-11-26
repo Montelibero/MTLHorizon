@@ -1,66 +1,113 @@
-# Local development environment: PostgreSQL 17 (persistent volume) and the API.
+# MTL Horizon on a server: the image from GitHub Packages, PostgreSQL 17, and
+# nothing else to install. Every setting is written here, in plain text.
 #
-#   cp .env.example .env        # set POSTGRES_PASSWORD and MTL_HORIZON_NOTIFIER_KEYS
-#   docker compose build
-#   docker compose up -d db     # the database first
-#   docker compose run --rm api alembic upgrade head     # before anything that uses the schema
-#   docker compose up -d        # db, api (with the webhook), worker and history
-#   docker compose run --rm -v "$PWD/local:/app/local" api \
-#       python -m app.backfill import-config --file local/tracking.yaml
-#   docker compose --profile collector up -d collector   # recovery and control reads only
-#   docker compose --profile test run --rm tests         # the test suite
+#   1. The password of the database: the same in POSTGRES_PASSWORD of the db
+#      service and in MTL_HORIZON_DATABASE_URL.
+#   2. Not commented is what an installation sets for itself: the keys of the
+#      Notifier, its API with the token, the secret of the admin UI, the
+#      address the installation is reached from. Left empty, the admin UI
+#      stays closed, the webhook accepts nothing, nothing is registered at the
+#      Notifier. The history API is a public archive: it is read by everyone
+#      who reaches it.
+#   3. Commented are the settings the application has a default for: remove
+#      the # of what you change. README.md says what each of them means
+#      ("Переменные окружения").
+#
+# The copy on the server holds real secrets: keep it out of any repository.
+#
+#   docker compose pull
+#   docker compose up -d db                            # the database first
+#   docker compose run --rm api alembic upgrade head   # before anything that uses the schema
+#   docker compose up -d                              # db, api (with the webhook), worker and history
 #
 # PostgreSQL does not publish a port: only containers on this network reach it.
 # The API is published on localhost only; put it behind your own HTTPS proxy
 # for the Notifier to reach /webhooks/notifier.
+#
+# The file of a developer's machine, where the images are made from the
+# sources and the tests are run: compose.dev.yaml.
 
 name: mtl-horizon
 
 x-api-environment: &api-environment
-  MTL_HORIZON_DATABASE_URL: postgresql+psycopg://mtl_horizon:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/mtl_horizon
-  MTL_HORIZON_NETWORK_PASSPHRASE: ${MTL_HORIZON_NETWORK_PASSPHRASE:-Public Global Stellar Network ; September 2015}
+  # The database of this installation, on the network of Compose. The password
+  # is the one the db service is given below: the same in both places.
+  MTL_HORIZON_DATABASE_URL: postgresql+psycopg://mtl_horizon:change-me-before-first-start@db:5432/mtl_horizon
+
+  # --- What an installation sets for itself -----------------------------------
+  # The keys Operations Notifier signs its webhooks with, as Stellar public
+  # keys, separated by commas — what GET /api/status of the Notifier shows as
+  # publicKey. With none, the webhook accepts nothing.
+  #   MTL_HORIZON_NOTIFIER_KEYS: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+  MTL_HORIZON_NOTIFIER_KEYS: ""
+  # The address of the Notifier's API as it is reached from these containers,
+  # and the token it is asked with (a secret). With no address, nothing is
+  # registered automatically: subscriptions are made by hand and adopted.
+  #   in one Docker network with the Notifier:   http://operations_notifier:4021
+  #   behind an HTTPS proxy:                     https://notifier.example.org
+  #   MTL_HORIZON_NOTIFIER_API_TOKEN: "the token of its API"
+  MTL_HORIZON_NOTIFIER_API_URL: ""
+  MTL_HORIZON_NOTIFIER_API_TOKEN: ""
+  # Where the Notifier sends its webhooks: this installation's
+  # /webhooks/notifier as it is reached from the Notifier's container.
+  #   in one Docker network with it:             http://mtl-horizon-api-1:8000/webhooks/notifier
+  #   behind an HTTPS proxy:                     https://horizon.example.org/webhooks/notifier
+  MTL_HORIZON_NOTIFIER_CALLBACK_URL: ""
+  # The admin UI under /admin is opened by this secret (a secret too): a long
+  # random line, for example what `openssl rand -hex 32` prints. With none,
+  # the admin UI is closed to everyone.
+  #   MTL_HORIZON_ADMIN_SECRET: "64 hexadecimal characters made for this installation"
+  MTL_HORIZON_ADMIN_SECRET: ""
+  # The address people open this installation by, in the browser: scheme, host
+  # and port only, no path and no trailing slash. With it, the admin cookie is
+  # Secure and a request that changes something has to come from there.
+  # Opened on the server itself only, it stays empty.
+  #   MTL_HORIZON_PUBLIC_ORIGIN: https://horizon.example.org
+  MTL_HORIZON_PUBLIC_ORIGIN: ""
+  # The history API is a public archive: anyone who reaches it reads it.
+  # `token` instead — only with one of the tokens named at the end of this block.
+  MTL_HORIZON_API_ACCESS: open
+
+  # --- Settings the application has a default for: remove the # of what you change
+  # Stellar network the database belongs to. The database is created for the
+  # public network; the API refuses to work with it when this differs.
+  # MTL_HORIZON_NETWORK_PASSPHRASE: Public Global Stellar Network ; September 2015
   # Where history is read from, and how fast this installation may ask —
   # every process together, whichever server answers. One server is named by
   # MTL_HORIZON_URL; several by MTL_HORIZON_URLS, the first being the primary
   # (the two may be set together when they agree on the primary).
-  MTL_HORIZON_URL: ${MTL_HORIZON_URL:-https://horizon.stellar.org}
-  MTL_HORIZON_URLS: ${MTL_HORIZON_URLS:-}
-  MTL_HORIZON_REQUESTS_PER_SECOND: ${MTL_HORIZON_REQUESTS_PER_SECOND:-1}
-  MTL_HORIZON_HEALTH_CHECK_INTERVAL: ${MTL_HORIZON_HEALTH_CHECK_INTERVAL:-300}
-  MTL_HORIZON_FAILOVER_COOLDOWN: ${MTL_HORIZON_FAILOVER_COOLDOWN:-60}
-  MTL_HORIZON_CONCURRENCY: ${MTL_HORIZON_CONCURRENCY:-1}
-  # The keys Operations Notifier signs its webhooks with. With none, the
-  # webhook accepts nothing.
-  MTL_HORIZON_NOTIFIER_KEYS: ${MTL_HORIZON_NOTIFIER_KEYS:-}
-  # The Notifier's API, to register what this installation wants to be told
-  # of; and where its webhooks are sent. With no API address nothing is
-  # registered automatically (subscriptions are made by hand and adopted).
-  MTL_HORIZON_NOTIFIER_API_URL: ${MTL_HORIZON_NOTIFIER_API_URL:-}
-  MTL_HORIZON_NOTIFIER_CALLBACK_URL: ${MTL_HORIZON_NOTIFIER_CALLBACK_URL:-}
-  # Discovery of the holders of an asset: how often to run it. 0, the
-  # default, is never — only by hand.
-  MTL_HORIZON_DISCOVERY_INTERVAL: ${MTL_HORIZON_DISCOVERY_INTERVAL:-0}
+  # MTL_HORIZON_URL: https://horizon.stellar.org
+  # MTL_HORIZON_URLS: https://horizon.stellar.org,https://your-horizon.example.org
+  # MTL_HORIZON_REQUESTS_PER_SECOND: "1"
+  # MTL_HORIZON_HEALTH_CHECK_INTERVAL: "300"
+  # MTL_HORIZON_FAILOVER_COOLDOWN: "60"
+  # MTL_HORIZON_CONCURRENCY: "1"
+  # Discovery of the holders of an asset: how often to run it, in seconds.
+  # 0 is never — only by hand.
+  # MTL_HORIZON_DISCOVERY_INTERVAL: "0"
   # How often the worker keeps accounts, their history imports and their
-  # subscriptions in step while no event is waiting.
-  MTL_HORIZON_PROVISION_INTERVAL: ${MTL_HORIZON_PROVISION_INTERVAL:-60}
+  # subscriptions in step while no event is waiting, in seconds.
+  # MTL_HORIZON_PROVISION_INTERVAL: "60"
   # One slice of a history import: what it may cost before the next subject
   # gets its turn.
-  MTL_HORIZON_HISTORY_SLICE_REQUESTS: ${MTL_HORIZON_HISTORY_SLICE_REQUESTS:-50}
-  MTL_HORIZON_HISTORY_SLICE_SECONDS: ${MTL_HORIZON_HISTORY_SLICE_SECONDS:-60}
+  # MTL_HORIZON_HISTORY_SLICE_REQUESTS: "50"
+  # MTL_HORIZON_HISTORY_SLICE_SECONDS: "60"
   # What a history import fetches for a record before storing it: parents
   # or full. Live events always bring the whole transaction.
-  MTL_HORIZON_HISTORY_CONTEXT: ${MTL_HORIZON_HISTORY_CONTEXT:-parents}
-  # Stage 06: the admin UI (closed without a secret), where the installation
-  # is reached from, who reads the history API, and — only for a check of the
-  # real servers its owner allowed — the most attempts of the whole run.
-  MTL_HORIZON_ADMIN_SECRET: ${MTL_HORIZON_ADMIN_SECRET:-}
-  MTL_HORIZON_ADMIN_SESSION_SECONDS: ${MTL_HORIZON_ADMIN_SESSION_SECONDS:-43200}
-  MTL_HORIZON_PUBLIC_ORIGIN: ${MTL_HORIZON_PUBLIC_ORIGIN:-}
-  MTL_HORIZON_API_ACCESS: ${MTL_HORIZON_API_ACCESS:-token}
-  MTL_HORIZON_API_TOKENS: ${MTL_HORIZON_API_TOKENS:-}
-  MTL_HORIZON_LIVE_BUDGET: ${MTL_HORIZON_LIVE_BUDGET:-0}
-  # Live collection: one cycle every so many seconds.
-  MTL_HORIZON_COLLECTOR_INTERVAL: ${MTL_HORIZON_COLLECTOR_INTERVAL:-900}
+  # MTL_HORIZON_HISTORY_CONTEXT: parents
+  # How long a session of the admin UI lasts, in seconds (12 hours).
+  # MTL_HORIZON_ADMIN_SESSION_SECONDS: "43200"
+  # To close the history API instead: only with one of the tokens below.
+  #   MTL_HORIZON_API_ACCESS: token
+  #   MTL_HORIZON_API_TOKENS: "one-long-random-token, another-long-random-token"
+  # Only for a check of the real servers you allowed: the most HTTP attempts
+  # of a whole run, every client together. 0 is no cap.
+  # MTL_HORIZON_LIVE_BUDGET: "0"
+  # Live collection: one cycle every so many seconds, and what one cycle may
+  # cost at most (the time budget is nine tenths of the interval when not set).
+  # MTL_HORIZON_COLLECTOR_INTERVAL: "900"
+  # MTL_HORIZON_COLLECTOR_MAX_REQUESTS: "2000"
+  # MTL_HORIZON_COLLECTOR_MAX_SECONDS: "810"
 
 services:
   db:
@@ -68,7 +115,8 @@ services:
     environment:
       POSTGRES_DB: mtl_horizon
       POSTGRES_USER: mtl_horizon
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # Change it here and in MTL_HORIZON_DATABASE_URL above: the same in both.
+      POSTGRES_PASSWORD: change-me-before-first-start
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -79,15 +127,13 @@ services:
     restart: unless-stopped
 
   api:
-    build:
-      context: .
-      target: runtime
+    image: ghcr.io/montelibero/mtlhorizon:main
     environment:
       <<: *api-environment
       MTL_HORIZON_API_HOST: 0.0.0.0
       MTL_HORIZON_API_PORT: "8000"
     ports:
-      - "127.0.0.1:${MTL_HORIZON_API_PORT:-8000}:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -99,9 +145,7 @@ services:
   # `docker compose up`. No port: `python -m app.worker status` says where
   # the queue is.
   worker:
-    build:
-      context: .
-      target: runtime
+    image: ghcr.io/montelibero/mtlhorizon:main
     command: ["python", "-m", "app.worker", "run"]
     environment:
       <<: *api-environment
@@ -120,15 +164,16 @@ services:
   # events have the right of way. Started by `docker compose up`. No port:
   # `python -m app.history status` says where the queue is.
   history:
-    build:
-      context: .
-      target: runtime
+    image: ghcr.io/montelibero/mtlhorizon:main
     command: ["python", "-m", "app.history", "run"]
     environment:
       <<: *api-environment
-      # The Notifier's API is the worker's to talk to; the history service
-      # only reads Horizon.
+      # Leave these two empty — they are not for filling in. The block at the
+      # top gives every service the address and the token of the Notifier's
+      # API; the history service never talks to that API, so these two lines
+      # take them away from it.
       MTL_HORIZON_NOTIFIER_API_URL: ""
+      MTL_HORIZON_NOTIFIER_API_TOKEN: ""
     depends_on:
       db:
         condition: service_healthy
@@ -139,45 +184,14 @@ services:
     healthcheck:
       disable: true
 
-  # Not started by `docker compose up`. Polls every stream of the watch lists
-  # every MTL_HORIZON_COLLECTOR_INTERVAL seconds until stopped: for recovery
-  # and control reads, not as the regular way. No port: it serves nothing,
-  # and `python -m app.collector status` says where it is.
-  #   docker compose --profile collector up -d collector
-  #   docker compose --profile collector logs -f collector
-  collector:
-    build:
-      context: .
-      target: runtime
-    profiles: ["collector"]
-    command: ["python", "-m", "app.collector", "run"]
-    environment:
-      <<: *api-environment
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-    # On SIGTERM the cycle in progress ends where it stands, after at most
-    # one request; what was stored stays consistent.
-    stop_grace_period: 90s
-    # The image's health check asks the API, which this service does not run.
-    healthcheck:
-      disable: true
-
-  # Not started by `docker compose up`. Runs the test suite against a fresh
-  # scratch database on the same PostgreSQL server:
-  #   docker compose --profile test run --rm tests
-  tests:
-    build:
-      context: .
-      target: test
-    profiles: ["test"]
-    environment:
-      <<: *api-environment
-      MTL_HORIZON_TEST_DATABASE_URL: postgresql+psycopg://mtl_horizon:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/ignored
-    depends_on:
-      db:
-        condition: service_healthy
+  # The collector (`python -m app.collector`: recovery and control reads
+  # only) is not a service of this file — the means to keep a service out of
+  # `docker compose up`, a profile, is not understood by every tool that
+  # reads a Compose file. It runs from the image of the api service, by hand,
+  # for as long as it is needed:
+  #   docker compose run -d --rm --name mtl-horizon-collector api python -m app.collector run
+  #   docker logs -f mtl-horizon-collector
+  #   docker stop mtl-horizon-collector
 
 volumes:
   pgdata:

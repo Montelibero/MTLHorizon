@@ -13,8 +13,8 @@
 
 ## 1. Что понадобится
 
-- Сервер с Docker и Docker Compose v2, немного места под PostgreSQL и
-  исходящий HTTPS к Horizon.
+- Сервер с Docker и Docker Compose v2, немного места под PostgreSQL,
+  исходящий HTTPS к Horizon и к `ghcr.io`.
 - Решение об источнике: **публичный** `https://horizon.stellar.org` (1 запрос
   в секунду на адрес; сделки самых активных аккаунтов — 503) или **свой**
   Horizon, или **несколько** — тогда первый в списке основной, остальные
@@ -32,18 +32,39 @@
   ещё `MTL_HORIZON_PUBLIC_ORIGIN` (адрес, по которому к нему приходят):
   cookie станет `Secure`, и менять состояние можно будет только со страниц
   установки.
-- Для исторического API — один или несколько токенов
-  (`MTL_HORIZON_API_TOKENS`, через запятую). Без токенов API не читает никто.
+- Исторический API — публичный архив: читает любой, кто достаёт до него.
+  Закрыть его токенами — раздел 15.
 
 ## 2. Поднять
+
+На сервере нужен только `compose.yaml`: образ приложения приходит из GitHub
+Packages (`ghcr.io/montelibero/mtlhorizon:main`), и каждое значение вписано
+в сам файл — без сборки и без файла переменных.
+
+```bash
+mkdir mtl-horizon && cd mtl-horizon
+curl -fsSLO https://raw.githubusercontent.com/Montelibero/MTLHorizon/main/compose.yaml
+docker login ghcr.io                               # если пакет приватный: токен с read:packages
+docker compose pull
+```
+
+Откройте `compose.yaml` и впишите своё. Не закомментировано только то, что
+каждая установка задаёт под себя:
+
+- пароль базы — в двух местах, одинаковый: `POSTGRES_PASSWORD` у `db` и
+  `MTL_HORIZON_DATABASE_URL`;
+- `MTL_HORIZON_NOTIFIER_KEYS`, `MTL_HORIZON_NOTIFIER_API_URL`,
+  `MTL_HORIZON_NOTIFIER_API_TOKEN` и `MTL_HORIZON_NOTIFIER_CALLBACK_URL` —
+  раздел 5;
+- `MTL_HORIZON_ADMIN_SECRET` и `MTL_HORIZON_PUBLIC_ORIGIN` — раздел 14.
+
+Закомментированы настройки со значением по умолчанию — источник Horizon и
+темп, интервалы, срезы: снимите `#` с тех, что меняете. Копия на сервере
+хранит настоящие секреты — не возвращайте её в репозиторий.
 
 Порядок обязателен: база, миграции, всё остальное.
 
 ```bash
-git clone <репозиторий> mtl-horizon && cd mtl-horizon
-git checkout <commit этапа 06>
-cp .env.example .env            # задать POSTGRES_PASSWORD, MTL_HORIZON_NOTIFIER_KEYS, MTL_HORIZON_ADMIN_SECRET
-docker compose build
 docker compose up -d db
 docker compose run --rm api alembic upgrade head     # довести схему до 0012
 docker compose run --rm api alembic check            # No new upgrade operations detected.
@@ -56,12 +77,14 @@ curl -s http://127.0.0.1:8000/ready                   # 200
 
 На базе без миграций API жив, но не готов (`/ready` — 503), а `worker` и
 `history` выходят с кодом 1, не начав работать, — в логе написано, чего не
-хватает и какая команда нужна. Обновление с этапа 03, 04 или 05: замените образы
-(`docker compose build`), **остановите службы** (`docker compose stop`),
-примените миграции — `0004`–`0012` не трогают историю — и поднимите снова.
-`0007` переименовывает источник у чекпоинтов и покрытия в `horizon:pool`: до
-этого не переставляйте серверы в `MTL_HORIZON_URLS` со старым кодом. Старый
-`.env` с одним `MTL_HORIZON_URL` продолжает работать.
+хватает и какая команда нужна. Обновление (в том числе с установки этапов
+03–05, где образы собирались на сервере): возьмите свежий `compose.yaml`,
+перенесите в него свои значения, затем `docker compose pull`, **остановите
+службы** (`docker compose stop`), примените миграции — `0004`–`0012` не
+трогают историю — и поднимите снова. `0007` переименовывает источник у
+чекпоинтов и покрытия в `horizon:pool`: до этого не переставляйте серверы в
+`MTL_HORIZON_URLS` со старым кодом. Один `MTL_HORIZON_URL` без
+`MTL_HORIZON_URLS` продолжает работать.
 
 PostgreSQL не публикуется вовсе, API публикуется только на `127.0.0.1:8000`,
 worker и history портов не имеют. `docker compose up` поднимает базу, API,
@@ -155,7 +178,7 @@ worker занят событиями, проверка может подожда
 
 ## 5. Подписки Notifier и ключ
 
-В `.env`:
+В `compose.yaml`:
 
 ```dotenv
 MTL_HORIZON_NOTIFIER_KEYS=G...     # publicKey из GET /api/status вашего Notifier; несколько — через запятую
@@ -382,8 +405,9 @@ alias lc='docker compose run --rm --user "$(id -u):$(id -g)" -v "$PWD/local:/app
 
 lc once --report local/reports/recover.json     # один цикл: дочитать потоки до последнего леджера
 lc status                                       # где стоят потоки; сервера не спрашивает
-docker compose --profile collector up -d collector   # только если нужна регулярная сверка
-docker compose --profile collector stop collector
+docker compose run -d --rm --name mtl-horizon-collector api python -m app.collector run   # только если нужна регулярная сверка
+docker logs -f mtl-horizon-collector
+docker stop mtl-horizon-collector
 ```
 
 Граница потока фиксируется один раз (первый цикл) и при рестарте не
@@ -502,8 +526,9 @@ docker compose exec -T db psql -U mtl_horizon -d postgres -c 'DROP DATABASE mtl_
 - Не открывать админку в интернет без HTTPS-прокси: секрет уходит в cookie
   и в форме входа по открытой сети. За прокси задайте
   `MTL_HORIZON_PUBLIC_ORIGIN`.
-- Не ставить `MTL_HORIZON_API_ACCESS=open`, если API доступен не только
-  вам: читать историю сможет любой.
+- Помнить, что исторический API по умолчанию открыт: читать историю сможет
+  любой, кто достаёт до него. Если архив надо закрыть —
+  `MTL_HORIZON_API_ACCESS: token` с токенами (раздел 15).
 - Не запускать смоук-тест Notifier (раздел 16) без транспортного предела
   (`MTL_HORIZON_LIVE_BUDGET`) и не оставлять тестовую подписку: прогон
   кончается `unsubscribe`.
@@ -552,22 +577,22 @@ discovery → на странице актива «Предпросмотр» с
 было». Полный перечень маршрутов, форматы и отличия от upstream — в
 [`history-api.md`](history-api.md).
 
-- По умолчанию читают только с токеном: `Authorization: Bearer <токен>` из
-  `MTL_HORIZON_API_TOKENS`. Без заданных токенов не читает никто (403).
-- `MTL_HORIZON_API_ACCESS=open` открывает чтение всем, кто достаёт до API.
-  Ставьте только за прокси с собственной авторизацией.
+- По умолчанию (`MTL_HORIZON_API_ACCESS: open` в `compose.yaml`) читает
+  любой, кто достаёт до API: архив публичный.
+- Чтобы закрыть: `MTL_HORIZON_API_ACCESS: token` и токены
+  `MTL_HORIZON_API_TOKENS` через запятую; читают с заголовком
+  `Authorization: Bearer <токен>`. Без заданных токенов не читает никто (403).
 - Ссылки в ответах указывают на `MTL_HORIZON_PUBLIC_ORIGIN`, если он задан.
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  'http://127.0.0.1:8000/accounts/G…/transactions?limit=5' | head -c 600
+curl -s 'http://127.0.0.1:8000/accounts/G…/transactions?limit=5' | head -c 600
 ```
 
 ## 16. Живой Notifier: смоук-тест (выходной барьер)
 
 Это единственная проверка этапа 06, которую здесь не запускали: она трогает
 настоящий сервис. Запускайте, только когда готовы, с тестовой конфигурацией:
-адрес API Notifier и токен в `.env`, ключ подписи Notifier в
+адрес API Notifier и токен в `compose.yaml`, ключ подписи Notifier в
 `MTL_HORIZON_NOTIFIER_KEYS`, `api` и `worker` запущены, а вебхук доступен
 Notifier по `MTL_HORIZON_NOTIFIER_CALLBACK_URL`.
 
@@ -610,7 +635,7 @@ N — ни из worker, ни из history, ни из команд, ни из а�
 up`. Сброс — той же командой, что в разделе 16.
 
 ```bash
-docker compose up -d worker history api          # пересоздать службы с новым .env
+docker compose up -d worker history api          # пересоздать службы с новым значением в compose.yaml
 docker compose exec -T db psql -U mtl_horizon -d mtl_horizon -Atc \
   "SELECT value FROM service_state WHERE name = 'live_budget'"   # сколько израсходовано
 ```

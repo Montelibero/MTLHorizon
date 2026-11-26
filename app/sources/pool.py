@@ -45,7 +45,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from app.config import shown_url
+from app.config import server_name
 from app.sources import live
 from app.sources.horizon import (
     BeforeHistory,
@@ -114,8 +114,10 @@ class Server:
         self.position = position
         self.http = http
         self.transport = transport
-        self.name = shown_url(url)
+        self.name = server_name(url)
         self.origin = urlsplit(url)
+        # Every request to this server goes under the path of its address,
+        # which may hold a key: it is the path of its HTTP client's base.
         self.lock = threading.Lock()
         # Its last root, and when it was read (the client's clock).
         self.root: dict[str, Any] | None = None
@@ -193,7 +195,7 @@ class HorizonPool(HorizonClient):
         self._lock = threading.RLock()
         transports = dict(transports or {})
         self.nodes = tuple(
-            Server(url, position, self._new_client(url, transports.get(shown_url(url))), transports.get(shown_url(url)))
+            Server(url, position, self._new_client(url, transports.get(server_name(url))), transports.get(server_name(url)))
             for position, url in enumerate(urls, start=1)
         )
 

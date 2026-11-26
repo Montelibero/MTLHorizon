@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.admin import support
 from app.admin.door import Door, Refused
-from app.config import shown_url
+from app.config import server_name
 from app.pool import check as checking
 from app.storage import pool_state, service_jobs
 from app.storage.models import HorizonNodeState, ServiceJob
@@ -98,7 +98,7 @@ def _aware(moment: datetime) -> datetime:
 def _server(url: str, position: int, kept: HorizonNodeState | None, active: str | None, now: datetime) -> dict[str, Any]:
     """One server of the settings with what is kept of it. The kept row is
     found by the address as it is shown, which is the address it is kept by."""
-    address = shown_url(url)
+    address = server_name(url)
     report: dict[str, Any] = dict((kept.report if kept is not None else None) or {})
     check = None
     if kept is not None and kept.checked_at is not None:
@@ -177,7 +177,7 @@ def build(door: Door) -> APIRouter:
         engine: Engine = door.engine
         with Session(engine) as session:
             kept = {row.url: _plain(row) for row in pool_state.rows(session)}
-        addresses = [shown_url(url) for url in door.settings.horizon_urls]
+        addresses = [server_name(url) for url in door.settings.horizon_urls]
         now = datetime.now(UTC)
         tasks = _tasks(engine, request.query_params.get("job", ""))
         active = _active(tasks["result"], kept, addresses)

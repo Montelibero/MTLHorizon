@@ -453,6 +453,7 @@ class FakeHorizon:
         latest: int = LATEST,
         network: str = PUBLIC_NETWORK_PASSPHRASE,
         origin: str = ORIGIN,
+        prefix: str = "",
         down: Exception | None = None,
         stall: float = 0.0,
     ) -> None:
@@ -463,6 +464,9 @@ class FakeHorizon:
         self.network = network
         # Where this server lives: its pages' links name it, as a real one's do.
         self.origin = origin
+        # The path its address carries (a gateway is named with its key in
+        # the path): requests come in under it, and its links name it too.
+        self.prefix = prefix.rstrip("/")
         # Every request fails with this exception: the server is unreachable.
         self.down = down
         # Every request takes this long to answer (seconds, really slept).
@@ -518,28 +522,31 @@ class FakeHorizon:
     def _handle(self, request: httpx.Request) -> httpx.Response:
         url = urlsplit(str(request.url))
         query = dict(parse_qsl(url.query))
-        self.requests.append((url.path, query))
+        path = url.path
+        if self.prefix and (path == self.prefix or path.startswith(self.prefix + "/")):
+            path = path[len(self.prefix):] or "/"
+        self.requests.append((path, query))
         if self.stall:
             time.sleep(self.stall)
         if self.down is not None:
             raise self.down
         if self.before_answer is not None:
-            self.before_answer(url.path)
+            self.before_answer(path)
         for fault in self.faults:
-            if fault.times > 0 and fault.path_part in url.path:
+            if fault.times > 0 and fault.path_part in path:
                 fault.times -= 1
                 headers = {"Retry-After": fault.retry_after} if fault.retry_after else {}
                 return self._problem(fault.status, headers)
         try:
-            answer = self._answer(url.path, query)
+            answer = self._answer(path, query)
         except _Problem as problem:
             return self._problem(problem.status)
         if isinstance(answer, dict):
             return self._json(answer)
         kind, records = answer
         if kind == "account":
-            return self._page(url.path, query, kind, records, by_address=True)
-        return self._page(url.path, query, kind, records)
+            return self._page(path, query, kind, records, by_address=True)
+        return self._page(path, query, kind, records)
 
     def _answer(self, path: str, query: dict[str, str]) -> Any:
         """An object (a dict) or a collection (kind, records)."""
@@ -763,9 +770,9 @@ class FakeHorizon:
         body = {
             "_embedded": {"records": page_records},
             "_links": {
-                "self": {"href": self.origin + path + "?" + urlencode(query)},
-                "next": {"href": self.origin + path + "?" + urlencode(following)},
-                "prev": {"href": self.origin + path + "?" + urlencode({**query, "order": "asc" if order == "desc" else "desc"})},
+                "self": {"href": self.origin + self.prefix + path + "?" + urlencode(query)},
+                "next": {"href": self.origin + self.prefix + path + "?" + urlencode(following)},
+                "prev": {"href": self.origin + self.prefix + path + "?" + urlencode({**query, "order": "asc" if order == "desc" else "desc"})},
             },
         }
         if self.tamper is not None:

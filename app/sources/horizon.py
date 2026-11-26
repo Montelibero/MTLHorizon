@@ -29,7 +29,7 @@ from urllib.parse import SplitResult, parse_qsl, urlsplit
 import httpx
 
 from app import __version__
-from app.config import shown_url
+from app.config import server_name, shown_url
 from app.sources import live
 from app.sources.horizon_cursors import InvalidCursor, order_key
 
@@ -103,6 +103,12 @@ class MalformedResponse(HorizonError):
 
 class UntrustedNextLink(HorizonError):
     """`_links.next` does not lead back to the same server and request."""
+
+
+def _shown_href(href: object) -> str:
+    """`_links.next` as it may be written in a message: the address without
+    its path, which may hold the key of a gateway."""
+    return shown_url(href) if isinstance(href, str) else repr(href)
 
 
 @dataclass
@@ -227,6 +233,9 @@ class HorizonClient:
         self.settings = settings or HorizonSettings()
         self.stats = RequestStats()
         self._origin = urlsplit(self.settings.base_url)
+        # The path of the address, which may hold the key of a gateway, goes
+        # with every request by itself: it is the path of the HTTP client's
+        # base address. It is never shown.
         # A real client with a cap on (app.sources.live) sends through the
         # capped transport; a fake, or a process without a cap, as before.
         self._transport = transport if transport is not None else live.transport()
@@ -253,7 +262,7 @@ class HorizonClient:
     @property
     def name(self) -> str:
         """The server as it is shown to people: no user name, no password."""
-        return shown_url(self.settings.base_url)
+        return server_name(self.settings.base_url)
 
     def _new_client(self, base_url: str | None = None, transport: httpx.BaseTransport | None = None) -> httpx.Client:
         return httpx.Client(
@@ -709,28 +718,28 @@ class HorizonClient:
             or target.fragment
         ):
             raise UntrustedNextLink(
-                f"{path}: _links.next does not stay on {origin.scheme}://{origin.netloc}: {href!r}"
+                f"{path}: _links.next does not stay on {origin.scheme}://{origin.netloc}: {_shown_href(href)}"
             )
         if (
             "\\" in target.path
             or ".." in target.path.split("/")
             or not target.path.rstrip("/").endswith(path.rstrip("/"))
         ):
-            raise UntrustedNextLink(f"{path}: _links.next leaves the collection: {href!r}")
+            raise UntrustedNextLink(f"{path}: _links.next leaves the collection: {_shown_href(href)}")
 
         given = [(key, str(value)) for key, value in query.items() if value is not None and key != "cursor"]
         found = parse_qsl(target.query, keep_blank_values=True)
         names = [key for key, _ in found]
         if names.count("cursor") != 1 or not all(item in found for item in given):
             raise UntrustedNextLink(
-                f"{path}: _links.next does not keep the request {dict(given)}: {href!r}"
+                f"{path}: _links.next does not keep the request {dict(given)}: {_shown_href(href)}"
             )
         unknown = set(names) - {key for key, _ in given} - {"cursor"}
         if unknown:
             raise UntrustedNextLink(f"{path}: _links.next adds parameters {sorted(unknown)}")
         cursor = found[names.index("cursor")][1]
         if not cursor:
-            raise MalformedResponse(f"{path}: _links.next has an empty cursor: {href!r}")
+            raise MalformedResponse(f"{path}: _links.next has an empty cursor: {_shown_href(href)}")
         return {**query, "cursor": cursor}
 
 

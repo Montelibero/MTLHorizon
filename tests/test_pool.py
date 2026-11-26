@@ -19,7 +19,7 @@ from app.backfill import config as watch_lists
 from app.backfill import verify as checking
 from app.backfill.jobs import stream_jobs
 from app.backfill.loader import Backfill, Limits, Window
-from app.config import PUBLIC_NETWORK_PASSPHRASE, shown_url
+from app.config import PUBLIC_NETWORK_PASSPHRASE, server_name, shown_url
 from app.pool import cli as pool_cli
 from app.pool.check import NodeCheck, Sample, check_pool
 from app.sources.horizon import (
@@ -28,6 +28,7 @@ from app.sources.horizon import (
     NotFound,
     RequestFailed,
     Scope,
+    UntrustedNextLink,
     WrongNetwork,
 )
 from app.sources.horizon_cursors import after_ledger
@@ -778,3 +779,59 @@ def test_a_command_refuses_to_run_on_a_database_without_the_pace_table(
     monkeypatch.setenv("MTL_HORIZON_DATABASE_URL", unmigrated_database_url)
     assert pool_cli.main(["check"]) == pool_cli.FAILED
     assert "error:" in capsys.readouterr().err
+
+
+GATEWAY_HOST = "https://mainnet.stellar.validationcloud.io"
+GATEWAY = GATEWAY_HOST + "/v1/S3CRET-KEY"  # a gateway is named with its key in the path
+GATEWAY_PREFIX = "/v1/S3CRET-KEY"
+
+
+def gateway_pool(fake: FakeHorizon, seen: list[str]) -> tuple[HorizonPool, Clock]:
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return fake._handle(request)
+
+    clock = Clock()
+    horizon = HorizonPool(
+        (GATEWAY,),
+        pool_settings=PoolSettings(health_check_interval=60, failover_cooldown=10),
+        settings=HorizonSettings(**SETTINGS),
+        transports={server_name(GATEWAY): httpx.MockTransport(handle)},
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+    return horizon, clock
+
+
+def test_a_gateway_is_asked_under_the_path_of_its_address_and_its_key_is_not_its_name() -> None:
+    fake = FakeHorizon(origin=GATEWAY_HOST, prefix=GATEWAY_PREFIX)
+    seen: list[str] = []
+    pool, _ = gateway_pool(fake, seen)
+    try:
+        assert pool.get(LEDGER)["sequence"] == 105
+        page = pool.page(f"/accounts/{A}/operations", resource_type="operation", order="desc", cursor=str(after_ledger(113)), limit=2)
+        assert pool.next_page(page) is not None or page.exhausted
+    finally:
+        pool.close()
+    # The root and every request carry the path; the links of the pages name it too.
+    assert seen[:2] == [GATEWAY_PREFIX + "/", GATEWAY_PREFIX + LEDGER]
+    assert seen[2:] and all(path.startswith(GATEWAY_PREFIX + "/accounts/") for path in seen[2:])
+    assert paths_of(fake)[:2] == ["/", LEDGER]  # and the server sees the request it always did
+    # Its name is the address without the path, with a mark that tells it from another key of the same host.
+    assert pool.name == server_name(GATEWAY)
+    assert pool.name.startswith(GATEWAY_HOST + "~")
+    assert "S3CRET" not in pool.name + "".join(pool.stats.by_server)
+    assert list(pool.stats.by_server) == [server_name(GATEWAY)]
+
+
+def test_the_key_is_in_no_message_about_a_link() -> None:
+    pool, _ = gateway_pool(FakeHorizon(origin=GATEWAY_HOST, prefix=GATEWAY_PREFIX), [])
+    try:
+        pool._local.server = pool.nodes[0]  # the server that answered, as after a request
+        with pytest.raises(UntrustedNextLink) as leaves:
+            pool._next_query(GATEWAY_HOST + GATEWAY_PREFIX + "/elsewhere?cursor=1", f"/accounts/{A}/operations", {"limit": "2"})
+        with pytest.raises(UntrustedNextLink) as elsewhere:
+            pool._next_query("https://other.example.org/x?cursor=1", f"/accounts/{A}/operations", {"limit": "2"})
+    finally:
+        pool.close()
+    assert "S3CRET" not in str(leaves.value) + str(elsewhere.value)

@@ -6,6 +6,7 @@ Everything configurable comes from environment variables with the
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -169,7 +170,8 @@ def _horizon_urls(env: Mapping[str, str]) -> tuple[str, ...]:
     ``MTL_HORIZON_URLS`` is a comma-separated list. ``MTL_HORIZON_URL`` is
     the one server of the earlier stages; when both are set they have to
     agree on the primary, or it is not said which one that is. An address
-    names a server and nothing more: no path, no query.
+    names a server and nothing more: no query. It may carry a path — the key
+    of a gateway such as Validation Cloud — which is kept and never shown.
     """
     listed, single = env.get(f"{ENV_PREFIX}URLS", "").strip(), env.get(f"{ENV_PREFIX}URL", "").strip()
     if not listed:
@@ -203,14 +205,38 @@ def _server_address(value: str, name: str) -> str:
         raise ConfigError(f"{name}: {shown} is not an address") from None
     if parts.scheme not in ("http", "https") or not parts.hostname or port == 0:
         raise ConfigError(f"{name}: {shown} is not an http or https address")
-    if (parts.path and parts.path != "/") or parts.query or parts.fragment:
-        raise ConfigError(f"{name}: {shown} must name a server and nothing more: no path, no query")
+    if parts.query or parts.fragment:
+        raise ConfigError(f"{name}: {shown} must name a server and nothing more: no query")
+    # The path stays: a server behind a gateway (Validation Cloud) is named
+    # with the key in it, and every request to it goes under that path. The
+    # key is a secret, which is why an address is never shown with its path.
     return value.rstrip("/")
 
 
-def _identity(url: str) -> tuple[str, str, int]:
+def _identity(url: str) -> tuple[str, str, int, str]:
+    """What makes two addresses one server: where it is, and under what path."""
     parts = urlsplit(url)
-    return parts.scheme.lower(), (parts.hostname or "").lower(), parts.port or (443 if parts.scheme == "https" else 80)
+    return (
+        parts.scheme.lower(),
+        (parts.hostname or "").lower(),
+        parts.port or (443 if parts.scheme == "https" else 80),
+        parts.path.rstrip("/"),
+    )
+
+
+def server_name(url: str) -> str:
+    """The name a server is known by: its address as it is shown, and — when
+    the address carries a path, which may hold a key — a short mark of that
+    path, so two addresses of one host stay two servers. The path itself is
+    not in the name."""
+    shown = shown_url(url)
+    try:
+        path = urlsplit(url).path.rstrip("/")
+    except ValueError:
+        return shown
+    if not path:
+        return shown
+    return f"{shown}~{hashlib.sha256(path.encode()).hexdigest()[:6]}"
 
 
 def _signer_keys(env: Mapping[str, str]) -> tuple[str, ...]:

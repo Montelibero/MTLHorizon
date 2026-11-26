@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.config import ConfigError, Settings, shown_url
+from app.config import ConfigError, Settings, server_name, shown_url
 
 BASE = {"MTL_HORIZON_DATABASE_URL": "postgresql://x"}
 
@@ -43,7 +43,6 @@ def test_two_primaries_are_refused() -> None:
         "https://a.example.org,,https://b.example.org",
         "https://a.example.org,",
         "https://a.example.org,https://A.example.org:443/",
-        "https://a.example.org/history",
         "https://a.example.org/?key=1",
         "ftp://a.example.org",
         "a.example.org",
@@ -130,3 +129,30 @@ def test_the_stage_05_numbers_and_the_context_have_their_defaults_and_refuse_wha
         with pytest.raises(ConfigError, match=name):
             Settings.from_env({**BASE, name: bad})
 
+
+
+def test_an_address_may_carry_the_path_of_a_gateway() -> None:
+    """Validation Cloud is named with its key in the path: the path stays, and
+    every request goes under it."""
+    gateway = "https://mainnet.stellar.validationcloud.io/v1/KEY"
+    assert urls({"MTL_HORIZON_URL": gateway + "/"}) == (gateway,)
+    assert urls({"MTL_HORIZON_URLS": gateway + ",https://horizon.stellar.org"}) == (gateway, "https://horizon.stellar.org")
+    both = {"MTL_HORIZON_URLS": gateway + ",https://horizon.stellar.org", "MTL_HORIZON_URL": gateway}
+    assert urls(both) == (gateway, "https://horizon.stellar.org")
+
+
+def test_two_keys_of_one_gateway_are_two_servers() -> None:
+    first = "https://mainnet.stellar.validationcloud.io/v1/FIRST-KEY"
+    second = "https://mainnet.stellar.validationcloud.io/v1/SECOND-KEY"
+    assert server_name(first) != server_name(second)
+    assert server_name(first).startswith("https://mainnet.stellar.validationcloud.io")
+    assert "KEY" not in server_name(first) + server_name(second)
+    assert server_name("https://horizon.stellar.org") == "https://horizon.stellar.org"
+    with pytest.raises(ConfigError, match="twice"):
+        urls({"MTL_HORIZON_URLS": first + "," + first + "/"})
+
+
+def test_a_query_in_an_address_is_still_refused_and_its_path_is_not_shown() -> None:
+    with pytest.raises(ConfigError, match="no query") as refused:
+        urls({"MTL_HORIZON_URL": "https://mainnet.stellar.validationcloud.io/v1/S3CRET-KEY?x=1"})
+    assert "S3CRET" not in str(refused.value)

@@ -8,8 +8,9 @@ Core и не форк Horizon.
 леджеров, **событийный сбор**, **наблюдение за списком** и **админка**:
 владелец управляет установкой из браузера (`/admin`) — списки аккаунтов,
 активов и рынков, discovery, подписки Operations Notifier, импорт истории,
-активность; Historical API отдаёт собранную историю по путям Horizon, по
-токену; что занимает время, идёт долговечными задачами с видимым состоянием.
+активность; Historical API — публичный архив, отдаёт собранную историю по
+путям Horizon всем, кто до него достаётся; что занимает время, идёт
+долговечными задачами с видимым состоянием.
 Все обращения к Horizon идут через отказоустойчивый пул серверов с общим
 темпом; живые запросы можно жёстко ограничить на транспортном уровне.
 Регулярный опрос (`python -m app.collector`) остался для восстановления и
@@ -49,10 +50,52 @@ production.
 Python 3.14, FastAPI, SQLAlchemy 2, Alembic, psycopg 3, HTTPX,
 stellar-sdk 17, PostgreSQL 17. Версии зафиксированы в `uv.lock`.
 
+## Развёртывание на сервере
+
+На сервере нужен только Docker с Docker Compose v2 и один файл —
+`compose.yaml`: образ приложения приходит из GitHub Packages
+(`ghcr.io/montelibero/mtlhorizon:main`), всё остальное вписано в него же.
+Ни сборки на сервере, ни файла переменных: каждое значение стоит в файле
+как есть.
+
+```bash
+mkdir mtl-horizon && cd mtl-horizon
+curl -fsSLO https://raw.githubusercontent.com/Montelibero/MTLHorizon/main/compose.yaml
+docker login ghcr.io            # только если пакет приватный: токен с read:packages
+docker compose pull
+```
+
+Откройте `compose.yaml` и впишите своё. Не закомментировано то, что каждая
+установка задаёт под себя: пароль базы (в двух местах, одинаковый —
+`POSTGRES_PASSWORD` у `db` и `MTL_HORIZON_DATABASE_URL`), ключи Notifier,
+адрес и токен его API, адрес вебхука, секрет админки, адрес установки.
+Исторический API в файле уже открыт — это публичный архив. Закомментированы
+настройки со значением по
+умолчанию — снимите `#` с тех, что меняете. В репозитории лежит копия с
+заглушками; копия на сервере хранит настоящие секреты и в репозиторий не
+возвращается.
+
+```bash
+docker compose up -d db                            # 1. база
+docker compose run --rm api alembic upgrade head   # 2. миграции — до всего остального
+docker compose up -d                               # 3. db, api (с webhook), worker и history
+
+curl -s http://127.0.0.1:8000/ready                # 200
+```
+
+Обновление: возьмите свежий `compose.yaml`, перенесите в него свои значения,
+затем `docker compose pull`, `docker compose stop`, миграции, `docker compose
+up -d`. Подробности и всё, что дальше, — в
+[`docs/owner-runbook.md`](docs/owner-runbook.md), раздел 2.
+
 ## Локальное окружение
 
-Нужны Docker и Docker Compose v2. Секреты задаются только через файл `.env`
-(он не попадает в git).
+Нужны Docker и Docker Compose v2. На машине разработки Compose читает
+`compose.dev.yaml`: образы собираются из исходников, набор включает сервис
+тестов, настройки читаются из `.env` (он не попадает в git). Файл выбирает
+строка `COMPOSE_FILE=compose.dev.yaml` в `.env` — она есть в `.env.example`.
+Все команды `docker compose` ниже рассчитаны на это; на сервере те же
+команды работают с `compose.yaml`.
 
 ```bash
 cp .env.example .env          # задайте POSTGRES_PASSWORD, MTL_HORIZON_NOTIFIER_KEYS и MTL_HORIZON_ADMIN_SECRET
@@ -213,7 +256,8 @@ bf run --from-ledger L1 --to-ledger L0 --context parents --max-requests 2000 # �
 процессы (worker, backfill, collector, проверки) и на все серверы пула.
 Публичный Horizon ограничивает запросы по IP; ответ 429 несёт заголовки
 `X-RateLimit-*`, и ждать столько, сколько сервер просит, будут все процессы.
-Адреса серверов и темп задаются только через `.env` (`MTL_HORIZON_URLS`,
+Адреса серверов и темп задаются только через окружение — в `.env` на машине
+разработки, в `compose.yaml` на сервере (`MTL_HORIZON_URLS`,
 `MTL_HORIZON_REQUESTS_PER_SECOND`); флагов командной строки для них нет.
 Журнал команды можно дублировать в файл — общие опции ставятся до
 подкоманды:
@@ -289,10 +333,12 @@ docker rm -f mtl-horizon-db-tunnel
 
 `.github/workflows/ci.yml` (GitHub Actions) на каждый пуш в любую ветку, на
 каждый pull request и по кнопке Run workflow собирает из чистого чек-аута
-оба образа — приложения и тестов, — проверяет файлы Compose, поднимает API
-в собранном образе и ждёт, пока его `HEALTHCHECK` скажет `healthy`, и
-собирает (не запускает) набор тестов в тестовом образе. Тесты CI не гоняет:
-им нужна настоящая PostgreSQL, команда выше.
+оба образа — приложения и тестов, — проверяет файлы Compose (`compose.yaml` и
+`compose.dev.yaml`; в `compose.yaml` не должно быть ни `$`, ни слова
+`build`, ни упоминания `.env`), поднимает API в собранном образе и ждёт,
+пока его `HEALTHCHECK` скажет `healthy`, и собирает (не запускает) набор
+тестов в тестовом образе. Тесты CI не гоняет: им нужна настоящая
+PostgreSQL, команда выше.
 
 Для `main` образ приложения после всех проверок выкладывается в GitHub
 Packages — токеном самого воркфлоу, отдельных секретов заводить не нужно:
@@ -482,8 +528,9 @@ Notifier. Подробности — в [инструкции владельцу
 
 **Исторический API** — пути Horizon (`/accounts/{id}/transactions`,
 `/operations/{id}`, `/trades`, `/trade_aggregations`, `/v1/coverage`…),
-читаемые только из локального архива, по умолчанию с токеном
-(`MTL_HORIZON_API_TOKENS`). Пустой список означает «в этом архиве ничего
+читаемые только из локального архива, по умолчанию открытые всем
+(`MTL_HORIZON_API_ACCESS: open`; режим `token` с токенами
+`MTL_HORIZON_API_TOKENS` закрывает чтение). Пустой список означает «в этом архиве ничего
 нет», а не «в сети ничего не было». Перечень маршрутов и отличия от
 upstream — в [`docs/history-api.md`](docs/history-api.md).
 
@@ -510,10 +557,13 @@ lc check                       # что делает сервер при чте�
 lc once --report local/reports/collector.json   # один цикл
 lc status                      # где стоит каждый поток и насколько отстал; сервера не спрашивает
 
-docker compose --profile collector up -d collector      # по необходимости, раз в MTL_HORIZON_COLLECTOR_INTERVAL секунд; не как службу
-docker compose --profile collector logs -f collector
-docker compose --profile collector stop collector      # SIGTERM: цикл заканчивает страницу и выходит
+docker compose run -d --rm --name mtl-horizon-collector api python -m app.collector run   # по необходимости, раз в MTL_HORIZON_COLLECTOR_INTERVAL секунд; не как службу
+docker logs -f mtl-horizon-collector
+docker stop mtl-horizon-collector      # SIGTERM: цикл заканчивает страницу и выходит
 ```
+
+В `compose.dev.yaml` коллектор остаётся отдельной службой профиля `collector`
+(`docker compose --profile collector up -d collector`).
 
 - **Первый старт.** Один цикл атомарно фиксирует для каждого потока стартовый
   леджер L0 — последний леджер сервера в этот момент; новая история начинается
@@ -553,8 +603,8 @@ docker compose --profile collector stop collector      # SIGTERM: цикл за�
 | `MTL_HORIZON_API_HOST` | нет | `127.0.0.1` | адрес прослушивания; в контейнере `0.0.0.0` |
 | `MTL_HORIZON_API_PORT` | нет | `8000` | порт API |
 | `MTL_HORIZON_TEST_DATABASE_URL` | для тестов | — | сервер PostgreSQL для тестов; имя базы игнорируется |
-| `MTL_HORIZON_URL` | нет | `https://horizon.stellar.org` | один сервер Horizon — источник истории (форма этапов 02–03); только чтение |
-| `MTL_HORIZON_URLS` | нет | — | несколько серверов через запятую, первый основной; главнее `MTL_HORIZON_URL`, с которым обязаны сойтись на первом |
+| `MTL_HORIZON_URL` | нет | `https://horizon.stellar.org` | один сервер Horizon — источник истории (форма этапов 02–03); только чтение; адрес может нести путь — шлюз вроде Validation Cloud называется с ключом в пути: `https://mainnet.stellar.validationcloud.io/v1/<ключ>` |
+| `MTL_HORIZON_URLS` | нет | — | несколько серверов через запятую, первый основной; главнее `MTL_HORIZON_URL`, с которым обязаны сойтись на первом; два ключа одного шлюза — два сервера |
 | `MTL_HORIZON_REQUESTS_PER_SECOND` | нет | `1` | темп запросов к источнику — один на все процессы и все серверы пула |
 | `MTL_HORIZON_HEALTH_CHECK_INTERVAL` | нет | `300` | сколько секунд доверять тому, что сервер сказал о себе (сеть, границы истории), прежде чем спросить снова |
 | `MTL_HORIZON_FAILOVER_COOLDOWN` | нет | `60` | сколько секунд не спрашивать сервер, который не ответил; удваивается за каждую неудачу подряд |
@@ -573,7 +623,7 @@ docker compose --profile collector stop collector      # SIGTERM: цикл за�
 | `MTL_HORIZON_ADMIN_SECRET` | для админки | — | секрет, которым открывается `/admin`; без него админка закрыта для всех |
 | `MTL_HORIZON_ADMIN_SESSION_SECONDS` | нет | `43200` | сколько живёт сессия админки |
 | `MTL_HORIZON_PUBLIC_ORIGIN` | нет | — | адрес, по которому установка доступна снаружи (`https://host`): cookie `Secure`, проверка `Origin` изменяющих запросов, ссылки исторического API |
-| `MTL_HORIZON_API_ACCESS` | нет | `token` | кто читает исторический API: `token` — только с токеном, `open` — все |
+| `MTL_HORIZON_API_ACCESS` | нет | `token`; в `compose.yaml` — `open` | кто читает исторический API: `open` — все (публичный архив), `token` — только с токеном |
 | `MTL_HORIZON_API_TOKENS` | нет | — | токены исторического API через запятую; в режиме `token` без них API не читает никто |
 | `MTL_HORIZON_LIVE_BUDGET` | нет | `0` | потолок HTTP-попыток к внешним серверам за прогон, общий для всех процессов; `0` — без предела |
 | `MTL_HORIZON_HISTORY_CONTEXT` | нет | `parents` | что подгружается для записи при импорте истории: `parents` или `full`; живые события всегда приносятся целиком |
