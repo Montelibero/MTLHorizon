@@ -1,0 +1,110 @@
+# Continuous integration on GitHub: the images build.
+#
+# What `docker compose build` and `docker compose --profile test build tests`
+# build on a developer's machine — the image of the application and the image
+# of the tests — are built here from a clean checkout on every push, on every
+# pull request and by hand. Nothing is pushed to a registry: the point is
+# that both images build, and that each one starts.
+#
+# The test suite itself is not run here. It needs a real PostgreSQL and runs
+# with `docker compose --profile test run --rm tests`.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch or pull request stops the build it replaces.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    name: Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # bash with -e and pipefail: a command that a pipe hides the failure of fails too.
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Compose refuses to read its file without a password for the database.
+      # Nothing is started here, so any value will do.
+      POSTGRES_PASSWORD: ci-only
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The Compose files are valid
+        run: |
+          docker compose config --quiet
+          docker compose --profile test --profile collector config --quiet
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: The image of the application
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          tags: mtl-horizon:ci
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image of the tests
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: test
+          tags: mtl-horizon:ci-test
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Every command of the application answers --help in its image
+        run: |
+          mains=$(docker run --rm mtl-horizon:ci sh -c 'ls app/*/__main__.py')
+          test -n "$mains"
+          for main in $mains; do
+            module=${main%/__main__.py}
+            docker run --rm mtl-horizon:ci python -m "${module//\//.}" --help > /dev/null
+          done
+          echo "$(echo "$mains" | wc -l) commands answered"
+
+      - name: The API starts in its image and passes its health check
+        run: |
+          docker run -d --name ci-api -p 8000:8000 mtl-horizon:ci
+          healthy=no
+          for wait in $(seq 1 60); do
+            if [ "$(docker inspect --format '{{.State.Running}}' ci-api)" != true ]; then break; fi
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' ci-api)" = healthy ]; then healthy=yes; break; fi
+            sleep 1
+          done
+          if [ "$healthy" != yes ]; then
+            docker logs ci-api
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:8000/health
+          echo
+          # No database is configured in this run: alive, and honestly not ready.
+          status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/ready)
+          echo "ready without a database: $status"
+          test "$status" = 503
+          docker rm -f ci-api > /dev/null
+
+      - name: The test suite is collected in its image
+        run: |
+          # Arguments to `docker run` replace CMD, so pytest is named. One line
+          # per file with its number of tests is what pytest prints with -qq.
+          docker run --rm mtl-horizon:ci-test pytest --collect-only -qq \
+            | grep -E '^tests/.*: [0-9]+$' \
+            | awk -F': ' '{ tests += $2 } END { print tests " tests collected"; exit(tests > 0 ? 0 : 1) }'

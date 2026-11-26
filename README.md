@@ -285,6 +285,16 @@ uv run --frozen pytest
 docker rm -f mtl-horizon-db-tunnel
 ```
 
+### Сборка в CI
+
+`.github/workflows/ci.yml` (GitHub Actions) на каждый пуш в любую ветку, на
+каждый pull request и по кнопке Run workflow собирает из чистого чек-аута
+оба образа — приложения и тестов, — проверяет файлы Compose, поднимает API
+в собранном образе и ждёт, пока его `HEALTHCHECK` скажет `healthy`, и
+собирает (не запускает) набор тестов в тестовом образе. Тесты CI не гоняет:
+им нужна настоящая PostgreSQL, команда выше. В регистр ничего не
+выкладывается.
+
 ### Проверка Python SDK
 
 ```bash
