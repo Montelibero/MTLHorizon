@@ -12,11 +12,14 @@
 <body{% if refresh %} data-refresh="{{ refresh }}"{% endif %}>
 <header class="top">
   <a class="brand" href="/admin">MTL Horizon</a>
+  {# The sections are named to those who are in: the page of the door and a refusal show the brand only. #}
+  {% if login %}
   <nav class="nav" aria-label="Разделы">
     {% for label, href, key in navigation %}
       <a href="{{ href }}"{% if active == key %} class="is-active" aria-current="page"{% endif %}>{{ label }}</a>
     {% endfor %}
   </nav>
+  {% endif %}
   {% if login %}
     <form class="logout" method="post" action="/admin/logout">
       <input type="hidden" name="csrf" value="{{ csrf }}">

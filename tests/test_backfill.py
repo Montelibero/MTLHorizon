@@ -735,3 +735,53 @@ def test_the_source_is_asked_about_itself_only_where_its_history_could_be_reache
     finally:
         near.close()
         far.close()
+
+
+# -- one record from two servers ------------------------------------------------
+
+
+def test_the_links_of_a_record_never_reach_what_is_stored() -> None:
+    """A record's links name the server that answered — for a gateway, with
+    its key. They are dropped on the way in, and taken out of what was stored
+    before that; a record from another server is the same record."""
+    from app.sources.horizon_records import _without_links
+    from app.storage.upsert import ContentConflict, _merge_json
+
+    key = {"id": "279694536673230848"}
+    read_first = {"id": key["id"], "fee": "100", "_links": {"self": {"href": "https://horizon.stellar.org/transactions/b9d4"}}}
+    read_after_a_failover = {
+        "id": key["id"],
+        "fee": "100",
+        "_links": {"self": {"href": "https://mainnet.stellar.validationcloud.io/v1/S3CRET-KEY/transactions/b9d4"}},
+    }
+    stored_before_the_fix = {**read_first, "_links": read_after_a_failover["_links"]}
+    assert _without_links(read_after_a_failover) == {"id": key["id"], "fee": "100"}
+
+    same = _merge_json("history_transactions", key, stored_before_the_fix, read_after_a_failover)
+    assert same == {"id": key["id"], "fee": "100"}, "the links stored with the key are taken out"
+    kept = _merge_json("history_transactions", key, None, read_after_a_failover)
+    assert kept == {"id": key["id"], "fee": "100"}
+    with pytest.raises(ContentConflict) as differ:
+        _merge_json("history_transactions", key, stored_before_the_fix, {"id": key["id"], "fee": "101"})
+    assert "fee" in str(differ.value) and "S3CRET" not in str(differ.value)
+
+
+def test_a_record_is_stored_without_the_links_that_name_its_server(pilot: Pilot) -> None:
+    """Every record of a page comes, as from a real Horizon, with its links —
+    here naming a gateway and its key. None of it reaches the database."""
+
+    def with_links(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        for record in body.get("_embedded", {}).get("records", []):
+            record["_links"] = {"self": {"href": "https://mainnet.stellar.validationcloud.io/v1/S3CRET-KEY" + path}}
+        return body
+
+    pilot.fake.tamper = with_links
+    pilot.run()
+    tables = ("history_transactions", "history_operations", "history_effects", "history_trades")
+    with_raw = 0
+    for table in tables:
+        for (raw,) in pilot.rows(f"SELECT raw FROM {table}"):
+            if raw is not None:  # a row brought in only as context has none
+                with_raw += 1
+                assert "_links" not in raw and "S3CRET" not in str(raw), table
+    assert with_raw >= len(tables), "every table kept records with their raw, and none of them has links"

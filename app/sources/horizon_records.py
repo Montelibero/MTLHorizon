@@ -128,6 +128,13 @@ def _total_order_id(record: Record, field: str) -> TotalOrderId:
 
 # -- one record -> (key, values) ---------------------------------------------
 
+def _without_links(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The record as Horizon sent it, without its ``_links``: they name the
+    server that answered (for a gateway, with its key), and a record is the
+    same record whoever sent it."""
+    return {name: value for name, value in record.items() if name != "_links"}
+
+
 
 def ledger_values(record: Record) -> tuple[Row, Row]:
     sequence = _int(record["sequence"], "sequence")
@@ -152,7 +159,7 @@ def ledger_values(record: Record) -> tuple[Row, Row]:
         "base_reserve": _optional_int(record, "base_reserve_in_stroops"),
         "max_tx_set_size": _optional_int(record, "max_tx_set_size"),
         "header_xdr": _optional_xdr(record, "header_xdr"),
-        "raw": dict(record),
+        "raw": _without_links(record),
     }
 
 
@@ -197,7 +204,7 @@ def transaction_values(record: Record) -> tuple[Row, Row]:
         "fee_source_account_muxed": None,
         "new_max_fee": None,
         "inner_signatures": None,
-        "raw": dict(record),
+        "raw": _without_links(record),
     }
     if "fee_bump_transaction" in record:
         outer, inner = record["fee_bump_transaction"], record.get("inner_transaction")
@@ -241,7 +248,7 @@ def operation_values(record: Record) -> tuple[Row, Row]:
         "type": _text(record, "type"),
         "type_i": _int(record["type_i"], "type_i"),
         "ledger_close_time": _time(record),
-        "raw": dict(record),
+        "raw": _without_links(record),
     }
 
 
@@ -261,7 +268,7 @@ def effect_values(record: Record) -> tuple[Row, Row]:
         "type": _text(record, "type"),
         "type_i": _int(record["type_i"], "type_i"),
         "ledger_close_time": _time(record),
-        "raw": dict(record),
+        "raw": _without_links(record),
     }
 
 
@@ -312,7 +319,7 @@ def trade_values(record: Record) -> tuple[Row, Row]:
         "price_d": price[1],
         "trade_type": _text(record, "trade_type"),
         "liquidity_pool_fee_bp": _optional_int(record, "liquidity_pool_fee_bp"),
-        "raw": dict(record),
+        "raw": _without_links(record),
     }
 
 

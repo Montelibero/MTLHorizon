@@ -169,8 +169,13 @@ def _merge_json(
     must carry the same value; values are compared as JSON (object key order
     does not matter, array order does).
     """
-    merged = dict(existing) if existing else {}
+    # A record's links name the server that answered — for a gateway, with
+    # its key. They are not stored: dropped from what comes in and taken out
+    # of what was stored before they were left out.
+    merged = {name: value for name, value in (existing or {}).items() if name != "_links"}
     for name, value in (incoming or {}).items():
+        if name == "_links":
+            continue
         if name in merged and merged[name] != value:
             raise ContentConflict(table, key, f"raw.{name}", merged[name], value)
         merged[name] = value
