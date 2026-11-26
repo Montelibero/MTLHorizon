@@ -435,3 +435,22 @@ def test_the_same_request_is_refused_only_within_one_reading_sequence() -> None:
     with pytest.raises(MalformedResponse, match="asked for over and over"):
         horizon.get("/")
     assert len(calls) == 10
+
+
+def test_a_404_on_the_stream_of_an_account_with_no_history_is_an_empty_page() -> None:
+    """Horizon answers 404 for an account it has no history of at all, where an
+    account with nothing after the cursor gets an empty page. Either way
+    there is nothing to read. Other resources are still reported missing."""
+    account = "G" * 55 + "A"
+    asked: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.path)
+        return problem(404)
+
+    horizon, _ = client(handle)
+    page_ = horizon.page(f"/accounts/{account}/operations", resource_type="operation", order="desc", cursor="now", limit=200)
+    assert page_.records == ()
+    with pytest.raises(NotFound):
+        horizon.get(f"/accounts/{account}/transactions/" + "f" * 64)
+    assert asked == [f"/accounts/{account}/operations", f"/accounts/{account}/transactions/" + "f" * 64]

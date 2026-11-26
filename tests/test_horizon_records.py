@@ -261,3 +261,24 @@ def test_assets_in_a_record_are_found_at_every_depth() -> None:
 def test_an_account_in_a_record_must_be_a_real_address() -> None:
     with pytest.raises(records.RecordError, match="not an account address"):
         records.operation_values(changed(live("operation_path_payment_in_fee_bump.json"), source_account="G" + "A" * 55))
+
+
+def test_a_pool_share_and_an_asset_without_its_parts_are_left_out__not_refused() -> None:
+    """Operations and effects of accounts that work with liquidity pools carry
+    pool shares, and sometimes an asset Horizon wrote without its issuer.
+    The record is kept; it is only not tracked by that asset."""
+    change_trust = {
+        "id": "1",
+        "type": "change_trust",
+        "asset_type": "liquidity_pool_shares",
+        "liquidity_pool_id": "a" * 64,
+        "trustee": "G" * 55 + "A",
+        "source_account": "G" * 55 + "B",
+    }
+    assert records.assets_in(change_trust) == set()
+    partial = {"id": "2", "type": "account_credited", "asset_type": "credit_alphanum4", "asset_code": "MTL"}
+    assert records.assets_in(partial) == set()
+    whole = {"id": "3", "asset_type": "credit_alphanum12", "asset_code": "LONGCODE", "asset_issuer": "G" * 55 + "D"}
+    assert records.assets_in(whole) == {"LONGCODE:" + "G" * 55 + "D"}
+    mixed = {"id": "4", "type": "path_payment_strict_receive", "source_asset_type": "native", "asset_type": "liquidity_pool_shares", "liquidity_pool_id": "a" * 64}
+    assert records.assets_in(mixed) == {"native"}

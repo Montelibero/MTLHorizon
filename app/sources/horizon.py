@@ -18,6 +18,7 @@ from __future__ import annotations
 import email.utils
 import logging
 import random
+import re
 import threading
 import time
 from collections import Counter
@@ -60,6 +61,9 @@ class ResponseError(HorizonError):
         super().__init__(
             f"Horizon answered {status} {title} to GET {path}" + (f": {detail}" if detail else "")
         )
+
+
+_ACCOUNT_STREAM = re.compile(r"^/accounts/[A-Z0-9]{56}/(operations|transactions|effects|payments|trades|offers)$")
 
 
 class NotFound(ResponseError):
@@ -508,6 +512,12 @@ class HorizonClient:
                 missing = NotFound(label, status, problem)
             if missing is not None:
                 body = self._resource_missing(path, query, missing)
+                if body is None and missing.status == 404 and _ACCOUNT_STREAM.fullmatch(path):
+                    # Nobody else to ask, and no server knows any history of this
+                    # account. Horizon answers 404 for an account it has nothing
+                    # of, where an account with nothing after the cursor gets an
+                    # empty page. Either way there is nothing: an empty page.
+                    body = {"_embedded": {"records": []}}
                 if body is None:
                     raise missing
                 self._note_answered(label)

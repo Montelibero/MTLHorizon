@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -273,13 +273,16 @@ def test_a_trustline_opened_on_the_asset_adds_the_account(shop: Shop) -> None:
     # The notification came for an asset subscription this installation manages.
     shop.receive(shop.notice(operation, subscription="asset-sub"))
     assert shop.worker.once() is True and shop.job().state == "done"
-    changes = events.find_and_add(shop.engine, [EUR])
+    # Looked at an hour after the worker finished, on the shop's clock: the wall
+    # clock has nothing to do with a shop whose time stands still.
+    looked_at = shop.job().finished_at + timedelta(hours=1)
+    changes = events.find_and_add(shop.engine, [EUR], now=looked_at)
     assert [change.outcome for change in changes] == [watched.ADDED] and changes[0].account_id == D
     row = tracked(shop, D)
     assert row is not None and row.origin == "discovery" and row.discovered_by == EUR and row.boundary_due
     assert "opened a trustline" in row.reason
     # Looked at again: nothing happens twice.
-    assert events.find_and_add(shop.engine, [EUR]) == []
+    assert events.find_and_add(shop.engine, [EUR], now=looked_at) == []
 
 
 def test_only_a_created_trustline_counts(shop: Shop) -> None:

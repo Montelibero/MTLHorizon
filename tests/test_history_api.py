@@ -1345,8 +1345,8 @@ def live_paths() -> list[str]:
 
 
 def test_no_link_names_the_server_the_history_came_from(loaded: Pilot, live_archive: Engine) -> None:
-    """The stored answers carry the links of the server that gave them; none
-    of those links is served."""
+    """A stored answer may carry the links of the server that gave it (rows
+    written before links were left out do); none of those links is served."""
     archives = (
         (loaded.engine, list(every_path(loaded).values()), "horizon.test"),
         (live_archive, live_paths(), "horizon.stellar.org"),
@@ -1354,10 +1354,20 @@ def test_no_link_names_the_server_the_history_came_from(loaded: Pilot, live_arch
     for engine, paths, origin in archives:
         if engine is live_archive:
             with engine.connect() as connection:
-                stored_links = connection.execute(
+                # Links are not stored any more: one is put back into a row on purpose,
+                # as an older row has it, so that there is something to prove.
+                given = connection.execute(
+                    text(
+                        "WITH one AS (SELECT id FROM history_transactions WHERE raw IS NOT NULL LIMIT 1) "
+                        "UPDATE history_transactions SET raw = raw || jsonb_build_object('_links', jsonb_build_object('self', jsonb_build_object('href', CAST(:href AS text))))"
+                        " WHERE id IN (SELECT id FROM one) RETURNING id"
+                    ),
+                    {"href": f"{origin}/transactions/abc"},
+                ).all()
+                assert len(given) == 1, "no row to put a link into; the test would prove nothing"
+                assert connection.execute(
                     text("SELECT count(*) FROM history_transactions WHERE raw::text LIKE :origin"), {"origin": f"%{origin}%"}
-                ).scalar()
-            assert stored_links, "the archive holds no link of the source; the test would prove nothing"
+                ).scalar() == 1
         api = mounted(engine, api_access="open")
         for path in paths:
             response = api.get(path)

@@ -393,7 +393,13 @@ def assets_in(*records: Record) -> set[str]:
                 found.add(value)
             elif key.endswith("asset_type"):
                 prefix = key[: -len("asset_type")]
-                found.add(_asset(mapping, prefix))
+                try:
+                    found.add(_asset(mapping, prefix))
+                except RecordError:
+                    # A share of a liquidity pool is named by its pool, not by a
+                    # code and an issuer; an asset Horizon wrote without both has
+                    # no name to track it by. The record itself is stored as it came.
+                    continue
     return found
 
 

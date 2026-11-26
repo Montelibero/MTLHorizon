@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.backfill import config as watch_lists
 from app.backfill.jobs import stream_jobs
 from app.backfill.loader import Backfill, StreamReport, Window
-from app.sources.horizon_records import RecordError, assets_in
+from app.sources.horizon_records import assets_in
 from app.stats import activity
 from app.stats.dashboard import TtlCache
 from app.storage import coverage
@@ -520,11 +520,14 @@ def test_the_assets_an_operation_names_are_what_the_record_reader_names(yard: Ya
     with yard.engine.connect() as connection:
         for body in bodies:
             assert set(connection.execute(named, {"body": json.dumps(body)}).scalars()) == assets_in(body), body
-        # An asset without its issuer is refused by the reader, and is NULL here.
+        # An asset without its issuer is left out by the reader (nothing to track it by), and is NULL here.
         broken = {"asset_type": "credit_alphanum4", "asset_code": "EUR"}
         assert connection.execute(named, {"body": json.dumps(broken)}).scalars().all() == [None]
-    with pytest.raises(RecordError):
-        assets_in(broken)
+        assert assets_in(broken) == set()
+        # A share of a liquidity pool is named by its pool: left out the same way.
+        share = {"asset_type": "liquidity_pool_shares", "liquidity_pool_id": "a" * 64}
+        assert connection.execute(named, {"body": json.dumps(share)}).scalars().all() == [None]
+        assert assets_in(share) == set()
 
 
 def test_own_foreign_and_no_asset_where_the_database_proves_it(yard: Yard) -> None:

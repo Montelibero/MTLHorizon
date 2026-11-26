@@ -40,10 +40,13 @@ def test_five_thousand_subjects_are_planned_served_in_turn_and_ask_for_nothing_w
         assert tuple(queued) == (5000, 5000)
 
         served: list[str] = []
-        # The fake Horizon answers only for its own six accounts: to these
-        # five thousand it says 404, so what is measured is the queue's own
-        # cost — taking a job, a slice, the failure and the pause — and not
-        # the reading.
+        # The fake Horizon fails on every stream of these five thousand (a
+        # server error; an unknown account would be an empty history now),
+        # so what is measured is the queue's own cost — taking a job, a
+        # slice, the failure and the pause — and not the reading.
+        from tests.fake_horizon import Fault
+
+        life.fake.faults.append(Fault(path_part="/accounts/", status=503, times=10**9))
         with HistoryWorker(life.pool, life.engine, name="scale", slice_requests=1, max_attempts=3, retry_base=1, retry_cap=2, clock=life.wall) as history:
             started = time.monotonic()
             for number in range(100):
