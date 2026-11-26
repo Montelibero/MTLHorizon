@@ -1,10 +1,18 @@
-# Continuous integration on GitHub: the images build.
+# Continuous integration on GitHub: the images build, and the image of the
+# application is published.
 #
 # What `docker compose build` and `docker compose --profile test build tests`
-# build on a developer's machine — the image of the application and the image
-# of the tests — are built here from a clean checkout on every push, on every
-# pull request and by hand. Nothing is pushed to a registry: the point is
-# that both images build, and that each one starts.
+# build on a developer's machine are built here from a clean checkout on every
+# push, on every pull request and by hand, and checked.
+#
+# On main the image of the application is published to GitHub Packages once
+# every check has passed:
+#
+#   ghcr.io/montelibero/mtlhorizon:<hash of the commit>   that build, and no other
+#   ghcr.io/montelibero/mtlhorizon:main                   the last build on main
+#
+# It is pushed with the token of the workflow itself: there is no secret to
+# keep. A pull request or another branch is built and checked, not published.
 #
 # The test suite itself is not run here. It needs a real PostgreSQL and runs
 # with `docker compose --profile test run --rm tests`.
@@ -24,6 +32,7 @@ concurrency:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   images:
@@ -38,6 +47,8 @@ jobs:
       # Compose refuses to read its file without a password for the database.
       # Nothing is started here, so any value will do.
       POSTGRES_PASSWORD: ci-only
+      # Written in lower case: the registry takes no other.
+      IMAGE: ghcr.io/montelibero/mtlhorizon
     steps:
       - uses: actions/checkout@v7
 
@@ -53,7 +64,9 @@ jobs:
         with:
           context: .
           target: runtime
-          tags: mtl-horizon:ci
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
           load: true
           push: false
           cache-from: type=gha
@@ -72,17 +85,17 @@ jobs:
 
       - name: Every command of the application answers --help in its image
         run: |
-          mains=$(docker run --rm mtl-horizon:ci sh -c 'ls app/*/__main__.py')
+          mains=$(docker run --rm "${IMAGE}:${GITHUB_SHA}" sh -c 'ls app/*/__main__.py')
           test -n "$mains"
           for main in $mains; do
             module=${main%/__main__.py}
-            docker run --rm mtl-horizon:ci python -m "${module//\//.}" --help > /dev/null
+            docker run --rm "${IMAGE}:${GITHUB_SHA}" python -m "${module//\//.}" --help > /dev/null
           done
           echo "$(echo "$mains" | wc -l) commands answered"
 
       - name: The API starts in its image and passes its health check
         run: |
-          docker run -d --name ci-api -p 8000:8000 mtl-horizon:ci
+          docker run -d --name ci-api -p 8000:8000 "${IMAGE}:${GITHUB_SHA}"
           healthy=no
           for wait in $(seq 1 60); do
             if [ "$(docker inspect --format '{{.State.Running}}' ci-api)" != true ]; then break; fi
@@ -108,3 +121,17 @@ jobs:
           docker run --rm mtl-horizon:ci-test pytest --collect-only -qq \
             | grep -E '^tests/.*: [0-9]+$' \
             | awk -F': ' '{ tests += $2 } END { print tests " tests collected"; exit(tests > 0 ? 0 : 1) }'
+
+      - name: Login to GitHub Packages
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the image to GitHub Packages
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:main"
